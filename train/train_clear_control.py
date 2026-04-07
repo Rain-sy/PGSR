@@ -1,69 +1,114 @@
 #!/usr/bin/env python
 """
-FLUX SR Training with CLEAR + ControlNet (Direct Image Training)
+Dual-Stream FLUX SR ControlNet Training with CLEAR Acceleration
+
+修复内容：
+1. ✅ VAE shift_factor：只用 scaling_factor
+2. ✅ HR/LR 裁剪对齐：先在 LR 上采样，再乘以 scale
+3. ✅ Scheduler 步进：只在 sync_gradients 时调用
+4. ✅ Loss 使用 float32 计算
+5. ✅ 数据集预检查：启动时验证文件存在
 
 Usage:
-    accelerate launch --num_processes=8 train_clear_control.py \
-        --hr_dir Data/Mix10K_HR \
-        --lr_dir Data/Mix10K_LR_bicubic_X4 \
+    accelerate launch --num_processes=8 \
+        --gradient_accumulation_steps=8 \
+        train_clear_control.py \
+        --hr_dir Data/DIV2K/DIV2K_train_HR \
+        --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --resolution 512 \
-        --batch_size 2 \
-        --epochs 60 \
-        --lr 1e-5 \
+        --batch_size 4 --epochs 120 --lr 1e-5 \
         --clear_ckpt ckpt/clear_local_16_down_4.safetensors
 """
 
 import os
-# 🚀 Suppress Triton autotuning logs
-os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
-# 🚀 限制 Triton shared memory 使用，避免 OutOfResources
+import warnings
+
+# 🌟 必须在 import torch 之前设置
 os.environ["TRITON_NUM_STAGES"] = "2"
+os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
+os.environ["TORCHINDUCTOR_LOG_LEVEL"] = "ERROR"
+
+import gc
+import math
+import argparse
+import numpy as np
+from datetime import datetime
+from PIL import Image
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+
+# 🌟 Inductor 配置
 import torch._inductor.config as inductor_config
 inductor_config.max_autotune = True
 inductor_config.coordinate_descent_tuning = True
-inductor_config.verbose_progress = False  # 🚀 禁用详细输出
+inductor_config.verbose_progress = False
 
-from PIL import Image
-import numpy as np
-import argparse
-import time
-import gc
-from datetime import datetime
-from tqdm import tqdm
-from accelerate import Accelerator
-from diffusers import FluxTransformer2DModel, FluxControlNetModel, AutoencoderKL
-from diffusers import FlowMatchEulerDiscreteScheduler
-from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+# 🌟 禁用日志
 import logging
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor.select_algorithm").setLevel(logging.ERROR)
+logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*out of resource.*")
+warnings.filterwarnings("ignore", message=".*shared memory.*")
 
-# Suppress verbose logging
-logging.getLogger("torch").setLevel(logging.ERROR)
-logging.getLogger("triton").setLevel(logging.ERROR)
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+from tqdm import tqdm
 
 
 # ============================================================================
-# FLUX Scheduler Helper
+# Pixel Feature Extractor (带 GroupNorm，稳定输出)
 # ============================================================================
 
-def calculate_shift(
-    image_seq_len,
-    base_seq_len: int = 256,
-    max_seq_len: int = 4096,
-    base_shift: float = 0.5,
-    max_shift: float = 1.16,
-):
-    """计算 FLUX scheduler 的动态 mu 参数"""
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
-    return mu
+class PixelFeatureExtractor(nn.Module):
+    """
+    从原始像素空间提取高频特征，映射到 Latent 空间维度。
+    使用 GroupNorm 确保输出稳定，Zero Conv 确保初始化时不破坏预训练模型。
+    
+    Input: RGB image [B, 3, H, W] (H, W = 512)
+    Output: Latent-space features [B, 16, H/8, W/8] (64x64)
+    """
+    def __init__(self, latent_channels=16):
+        super().__init__()
+        
+        self.encoder = nn.Sequential(
+            # 512 → 256
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 32),
+            nn.SiLU(),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(8, 32),
+            nn.SiLU(),
+            
+            # 256 → 128
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            
+            # 128 → 64
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 128),
+            nn.SiLU(),
+            nn.Conv2d(128, latent_channels, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(4, latent_channels),
+            nn.SiLU(),
+        )
+        
+        # Zero Conv: 初始化权重为 0，训练初期不影响 ControlNet
+        self.zero_conv = nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
+        nn.init.zeros_(self.zero_conv.weight)
+        nn.init.zeros_(self.zero_conv.bias)
+    
+    def forward(self, x):
+        feat = self.encoder(x)
+        return self.zero_conv(feat)
 
 
 # ============================================================================
@@ -71,194 +116,90 @@ def calculate_shift(
 # ============================================================================
 
 class SRDataset(Dataset):
-    """SR Dataset - directly loads images
+    """Super-Resolution Dataset with random cropping - 修复版"""
     
-    Args:
-        hr_dir: HR images directory
-        lr_dir: LR images directory  
-        resolution: Target resolution (default 512)
-        num_crops: Number of random crops per image (default 5)
-        full_image: If True, resize whole image instead of cropping (default False)
-    """
-    
-    def __init__(self, hr_dir, lr_dir, resolution=512, num_crops=5, full_image=False):
+    def __init__(self, hr_dir, lr_dir, resolution=512, num_crops=1, is_val=False):
         self.hr_dir = hr_dir
         self.lr_dir = lr_dir
         self.resolution = resolution
-        self.num_crops = num_crops if not full_image else 1  # 整图模式只有 1 个 sample
-        self.full_image = full_image
+        self.num_crops = num_crops
+        self.scale = 4
+        self.is_val = is_val
         
-        # Find all images
-        self.hr_files = sorted([
-            f for f in os.listdir(hr_dir) 
-            if f.lower().endswith(('.png', '.jpg', '.jpeg'))
-        ])
+        # 预先检查文件是否存在
+        all_hr = sorted([f for f in os.listdir(hr_dir) 
+                         if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
         
-        if full_image:
-            print(f"[Dataset] Found {len(self.hr_files)} images (full image mode, resize to {resolution})")
-        else:
-            print(f"[Dataset] Found {len(self.hr_files)} images, {num_crops} crops each = {len(self.hr_files) * num_crops} samples")
+        self.hr_files = []
+        self.lr_files = []
+        skipped = 0
+        
+        for hr_name in all_hr:
+            lr_path = self._find_lr_file(hr_name)
+            if os.path.exists(lr_path):
+                self.hr_files.append(hr_name)
+                self.lr_files.append(lr_path)
+            else:
+                skipped += 1
+        
+        if len(self.hr_files) == 0:
+            raise ValueError(f"No valid HR-LR pairs found!\n  HR dir: {hr_dir}\n  LR dir: {lr_dir}")
     
     def __len__(self):
         return len(self.hr_files) * self.num_crops
     
+    def _find_lr_file(self, hr_name):
+        """查找对应的 LR 文件"""
+        base = os.path.splitext(hr_name)[0]
+        for suffix in ['', 'x4', 'x2', '_x4', '_x2']:
+            for ext in ['.png', '.jpg', '.jpeg']:
+                candidate = os.path.join(self.lr_dir, base + suffix + ext)
+                if os.path.exists(candidate):
+                    return candidate
+        return os.path.join(self.lr_dir, hr_name)
+    
     def __getitem__(self, idx):
         img_idx = idx // self.num_crops
-        crop_idx = idx % self.num_crops
-        
         hr_name = self.hr_files[img_idx]
-        base_name = os.path.splitext(hr_name)[0]
+        lr_path = self.lr_files[img_idx]
         
-        # Load HR image
-        hr_path = os.path.join(self.hr_dir, hr_name)
-        hr_img = Image.open(hr_path).convert('RGB')
-        
-        # Find LR image
-        lr_path = None
-        for suffix in ['', 'x4', 'x2', '_x4', '_x2']:  # 支持多种命名格式
-            for ext in ['.png', '.jpg', '.jpeg']:
-                candidate = os.path.join(self.lr_dir, base_name + suffix + ext)
-                if os.path.exists(candidate):
-                    lr_path = candidate
-                    break
-            if lr_path:
-                break
-        
-        if lr_path is None:
-            lr_path = os.path.join(self.lr_dir, hr_name)
-        
+        hr_img = Image.open(os.path.join(self.hr_dir, hr_name)).convert('RGB')
         lr_img = Image.open(lr_path).convert('RGB')
         
-        if self.full_image:
-            # 🚀 整图模式：直接 resize 到目标分辨率
-            hr_resized = hr_img.resize((self.resolution, self.resolution), Image.BICUBIC)
-            lr_up = lr_img.resize((self.resolution, self.resolution), Image.BICUBIC)
+        # 🌟 修复：先在 LR 上计算裁剪位置，再乘以 scale 得到 HR 位置
+        lr_w, lr_h = lr_img.size
+        lr_crop_size = self.resolution // self.scale  # 128 for 512 resolution
+        hr_crop_size = self.resolution  # 512
+        
+        if lr_w >= lr_crop_size and lr_h >= lr_crop_size:
+            if self.is_val:
+                # 验证集使用中心裁剪
+                lr_x = (lr_w - lr_crop_size) // 2
+                lr_y = (lr_h - lr_crop_size) // 2
+            else:
+                # 训练集使用随机裁剪（在 LR 上采样）
+                lr_x = np.random.randint(0, lr_w - lr_crop_size + 1)
+                lr_y = np.random.randint(0, lr_h - lr_crop_size + 1)
             
-            # To tensor [-1, 1]
-            hr_t = torch.from_numpy(np.array(hr_resized)).permute(2, 0, 1).float() / 127.5 - 1
-            lr_t = torch.from_numpy(np.array(lr_up)).permute(2, 0, 1).float() / 127.5 - 1
+            # HR 位置 = LR 位置 × scale
+            hr_x = lr_x * self.scale
+            hr_y = lr_y * self.scale
+            
+            lr_crop = lr_img.crop((lr_x, lr_y, lr_x + lr_crop_size, lr_y + lr_crop_size))
+            hr_crop = hr_img.crop((hr_x, hr_y, hr_x + hr_crop_size, hr_y + hr_crop_size))
         else:
-            # Random crop from HR, corresponding crop from LR
-            crop_hr = self.resolution
-            crop_lr = self.resolution // 4
-            
-            W, H = hr_img.size
-            max_x = max(0, W - crop_hr)
-            max_y = max(0, H - crop_hr)
-            
-            # Use crop_idx for reproducibility within same image
-            torch.manual_seed(idx)
-            x = torch.randint(0, max_x + 1, (1,)).item() if max_x > 0 else 0
-            y = torch.randint(0, max_y + 1, (1,)).item() if max_y > 0 else 0
-            
-            # Crop HR
-            hr_crop = hr_img.crop((x, y, x + crop_hr, y + crop_hr))
-            
-            # Corresponding LR crop (4x downscale)
-            lr_x, lr_y = x // 4, y // 4
-            lr_crop = lr_img.crop((lr_x, lr_y, lr_x + crop_lr, lr_y + crop_lr))
-            
-            # Upsample LR to match HR resolution (bicubic)
-            lr_up = lr_crop.resize((self.resolution, self.resolution), Image.BICUBIC)
-            
-            # To tensor [-1, 1]
-            hr_t = torch.from_numpy(np.array(hr_crop)).permute(2, 0, 1).float() / 127.5 - 1
-            lr_t = torch.from_numpy(np.array(lr_up)).permute(2, 0, 1).float() / 127.5 - 1
+            # 图像太小，直接 resize
+            lr_crop = lr_img.resize((lr_crop_size, lr_crop_size), Image.BICUBIC)
+            hr_crop = hr_img.resize((hr_crop_size, hr_crop_size), Image.BICUBIC)
         
-        return {'hr': hr_t, 'lr': lr_t}
-
-
-class ValDataset(Dataset):
-    """Validation Dataset - center crop only"""
-    
-    def __init__(self, hr_dir, lr_dir, resolution=512):
-        self.hr_dir = hr_dir
-        self.lr_dir = lr_dir
-        self.resolution = resolution
+        # LR 上采样到 HR 尺寸
+        lr_up = lr_crop.resize((hr_crop_size, hr_crop_size), Image.BICUBIC)
         
-        self.hr_files = sorted([
-            f for f in os.listdir(hr_dir)
-            if f.lower().endswith(('.png', '.jpg', '.jpeg'))
-        ])
-    
-    def __len__(self):
-        return len(self.hr_files)
-    
-    def __getitem__(self, idx):
-        hr_name = self.hr_files[idx]
-        base_name = os.path.splitext(hr_name)[0]
-        
-        hr_path = os.path.join(self.hr_dir, hr_name)
-        hr_img = Image.open(hr_path).convert('RGB')
-        
-        lr_path = None
-        for suffix in ['', 'x4', 'x2', '_x4', '_x2']:  # 支持多种命名格式
-            for ext in ['.png', '.jpg', '.jpeg']:
-                candidate = os.path.join(self.lr_dir, base_name + suffix + ext)
-                if os.path.exists(candidate):
-                    lr_path = candidate
-                    break
-            if lr_path:
-                break
-        if lr_path is None:
-            lr_path = os.path.join(self.lr_dir, hr_name)
-        
-        lr_img = Image.open(lr_path).convert('RGB')
-        
-        # Center crop
-        W, H = hr_img.size
-        crop_hr = self.resolution
-        crop_lr = self.resolution // 4
-        
-        x = (W - crop_hr) // 2
-        y = (H - crop_hr) // 2
-        
-        hr_crop = hr_img.crop((x, y, x + crop_hr, y + crop_hr))
-        
-        lr_x, lr_y = x // 4, y // 4
-        lr_crop = lr_img.crop((lr_x, lr_y, lr_x + crop_lr, lr_y + crop_lr))
-        lr_up = lr_crop.resize((self.resolution, self.resolution), Image.BICUBIC)
-        
+        # 转换为 tensor，范围 [-1, 1]
         hr_t = torch.from_numpy(np.array(hr_crop)).permute(2, 0, 1).float() / 127.5 - 1
         lr_t = torch.from_numpy(np.array(lr_up)).permute(2, 0, 1).float() / 127.5 - 1
         
         return {'hr': hr_t, 'lr': lr_t}
-
-
-# ============================================================================
-# Pixel Feature Extractor
-# ============================================================================
-
-class PixelFeatureExtractor(nn.Module):
-    """Lightweight CNN to extract pixel-level features from LR image"""
-    
-    def __init__(self, in_channels=3, latent_channels=16):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 64, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),  # /2
-            nn.SiLU(),
-            nn.Conv2d(128, 128, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(128, 256, 3, stride=2, padding=1),  # /4
-            nn.SiLU(),
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(256, 256, 3, stride=2, padding=1),  # /8
-            nn.SiLU(),
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(256, latent_channels, 3, stride=2, padding=1),  # /16
-        )
-        # Zero conv for stable training
-        self.zero_conv = nn.Conv2d(latent_channels, latent_channels, 1)
-        nn.init.zeros_(self.zero_conv.weight)
-        nn.init.zeros_(self.zero_conv.bias)
-    
-    def forward(self, x):
-        feat = self.net(x)
-        return self.zero_conv(feat)
 
 
 # ============================================================================
@@ -268,36 +209,32 @@ class PixelFeatureExtractor(nn.Module):
 class DualStreamFLUXSR(nn.Module):
     """Dual Stream FLUX SR with CLEAR acceleration"""
     
-    def __init__(self, model_name, device, pretrained_controlnet,
-                 train_controlnet=True, pixel_weight=1.0,
-                 window_size=16, down_factor=4, clear_ckpt=None, resolution=512):
+    def __init__(self, model_name, device, pixel_weight=1.0,
+                 window_size=16, down_factor=4, clear_ckpt=None):
         super().__init__()
         self.model_name = model_name
         self.device = device
-        self.pretrained_controlnet = pretrained_controlnet
-        self.train_controlnet = train_controlnet
         self.pixel_weight = pixel_weight
         self.window_size = window_size
         self.down_factor = down_factor
         self.clear_ckpt = clear_ckpt
-        self.resolution = resolution
         
-        self.vae = None
-        self.transformer = None
-        self.controlnet = None
-        self.pixel_extractor = None
-        self.text_embeds = None
+        self._load_models()
     
-    def setup(self, local_rank):
-        """Setup models (called after DDP)"""
+    def _load_models(self):
+        from diffusers import AutoencoderKL, FluxTransformer2DModel, FluxControlNetModel
+        from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+        
         dtype = torch.bfloat16
+        
+        # VAE
         self.vae = AutoencoderKL.from_pretrained(
             self.model_name, subfolder="vae", torch_dtype=dtype
         ).to(self.device)
         self.vae.requires_grad_(False)
-        # 🌟 加上这一行！极大地节省高分辨率下的 VAE 显存
-        self.vae.enable_tiling()
-        # Pre-compute empty text embeddings
+        self.vae.eval()
+        
+        # Text Encoders (只用于生成 empty prompt embedding，然后释放)
         text_enc = CLIPTextModel.from_pretrained(
             self.model_name, subfolder="text_encoder", torch_dtype=dtype
         ).to(self.device)
@@ -309,11 +246,11 @@ class DualStreamFLUXSR(nn.Module):
         
         with torch.no_grad():
             clip_ids = tokenizer("", padding="max_length", max_length=77,
-                                truncation=True, return_tensors="pt").input_ids.to(self.device)
+                                 return_tensors="pt").input_ids.to(self.device)
             clip_out = text_enc(clip_ids, output_hidden_states=False)
             
             t5_ids = tokenizer_2("", padding="max_length", max_length=512,
-                                truncation=True, return_tensors="pt").input_ids.to(self.device)
+                                 return_tensors="pt").input_ids.to(self.device)
             t5_out = text_enc_2(t5_ids)
             
             self.text_embeds = {
@@ -322,151 +259,119 @@ class DualStreamFLUXSR(nn.Module):
                 'text_ids': torch.zeros(t5_out[0].shape[1], 3, device=self.device, dtype=dtype),
             }
         
-        del text_enc, text_enc_2
+        # 释放 text encoders
+        del text_enc, text_enc_2, tokenizer, tokenizer_2
         torch.cuda.empty_cache()
         gc.collect()
         
-        # Load Transformer
+        # Transformer (FLUX) - 冻结但不启用 gradient_checkpointing
+        # 🌟 关键：enable_gradient_checkpointing 会导致梯度链条被切断！
         self.transformer = FluxTransformer2DModel.from_pretrained(
             self.model_name, subfolder="transformer", torch_dtype=dtype
         ).to(self.device)
         self.transformer.requires_grad_(False)
+        # 删除了 enable_gradient_checkpointing()
         
-        # Enable gradient checkpointing for memory efficiency
-        try:
-            self.transformer.enable_gradient_checkpointing()
-        except:
-            pass
-        
-        if self.clear_ckpt:
-            self._enable_clear(local_rank, dtype)
-        
-        # Load ControlNet
+        # ControlNet
         self.controlnet = FluxControlNetModel.from_pretrained(
-            self.pretrained_controlnet, torch_dtype=dtype
+            "jasperai/Flux.1-dev-Controlnet-Upscaler", torch_dtype=dtype
         ).to(self.device)
+        self.controlnet.enable_gradient_checkpointing()
         
-        if self.train_controlnet:
-            self.controlnet.requires_grad_(True)
-            try:
-                self.controlnet.enable_xformers_memory_efficient_attention()
-            except:
-                pass
-            try:
-                self.controlnet.enable_gradient_checkpointing()
-            except:
-                pass
-        else:
-            self.controlnet.requires_grad_(False)
-        
-        # Pixel Extractor
+        # Pixel Feature Extractor
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
-        self.pixel_extractor.requires_grad_(True)
         
-        print(f"[Rank {local_rank}] GPU memory: {torch.cuda.memory_allocated(self.device)/1e9:.2f} GB")
+        # 初始化 CLEAR
+        self._init_clear()
     
-    def _enable_clear(self, local_rank, dtype):
-        from safetensors.torch import load_file
+    def _init_clear(self):
+        """初始化 CLEAR 注意力"""
+        import attention_processor
         from attention_processor import (
-            LocalDownsampleFlexAttnProcessor,
-            LocalFlexAttnProcessor,
-            init_local_downsample_mask_flex,
-            init_local_mask_flex
+            LocalDownsampleFlexAttnProcessor, LocalFlexAttnProcessor,
+            init_local_downsample_mask_flex, init_local_mask_flex
         )
         
-        latent_size = self.resolution // 16
-        text_length = 512
+        dtype = torch.bfloat16
+        
+        # 初始化 mask（固定 512x512 分辨率，对应 32x32 patches）
+        patch_size = 32  # 512 / 16 = 32
         device_str = str(self.device)
         
         if self.down_factor > 1:
             init_local_downsample_mask_flex(
-                height=latent_size, width=latent_size, text_length=text_length,
+                height=patch_size, width=patch_size, text_length=512,
                 window_size=self.window_size, down_factor=self.down_factor, device=device_str
             )
         else:
             init_local_mask_flex(
-                height=latent_size, width=latent_size, text_length=text_length,
+                height=patch_size, width=patch_size, text_length=512,
                 window_size=self.window_size, device=device_str
             )
         
-        clear_weights = load_file(self.clear_ckpt)
+        # 设置全局变量
+        attention_processor.HEIGHT = patch_size
+        attention_processor.WIDTH = patch_size
         
-        # CLEAR only for transformer_blocks (19 dual-stream blocks)
-        for name, module in self.transformer.named_modules():
-            if hasattr(module, 'set_processor') and 'transformer_blocks.' in name and 'single' not in name:
-                block_idx = int(name.split('transformer_blocks.')[1].split('.')[0])
-                prefix = f"transformer_blocks.{block_idx}.attn."
-                
-                block_weights = {
-                    k.replace(prefix, ''): v.to(dtype)
-                    for k, v in clear_weights.items()
-                    if k.startswith(prefix)
-                }
-                
-                if block_weights:
-                    if self.down_factor > 1:
-                        processor = LocalDownsampleFlexAttnProcessor(
-                            down_factor=self.down_factor
-                        )
-                    else:
-                        processor = LocalFlexAttnProcessor()
-                    processor.load_state_dict(block_weights, strict=False)
-                    processor = processor.to(self.device, dtype)
-                    module.set_processor(processor)
-    
-    def get_trainable_params(self):
-        params = list(self.pixel_extractor.parameters())
-        if self.train_controlnet:
-            params += list(self.controlnet.parameters())
-        return params
-    
-    @torch.no_grad()
-    def encode(self, img):
-        """Encode image to latent"""
-        img = img.to(self.vae.dtype).to(self.device)
-        lat = self.vae.encode(img).latent_dist.sample()
-        
-        # 🌟 FLUX VAE 需要 shift_factor
-        if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor is not None:
-            lat = (lat - self.vae.config.shift_factor) * self.vae.config.scaling_factor
-        else:
-            lat = lat * self.vae.config.scaling_factor
-        return lat
-    
-    @torch.no_grad()
-    def decode(self, lat):
-        """Decode latent to image"""
-        lat = lat.to(self.device)
-        
-        # 🌟 解码时加回 shift_factor
-        if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor is not None:
-            lat = (lat / self.vae.config.scaling_factor) + self.vae.config.shift_factor
-        else:
-            lat = lat / self.vae.config.scaling_factor
+        # 加载 CLEAR 权重
+        if self.clear_ckpt and os.path.exists(self.clear_ckpt):
+            from safetensors.torch import load_file
+            clear_weights = load_file(self.clear_ckpt)
             
-        sample = self.vae.decode(lat).sample
-        return sample
+            # 只对 transformer_blocks（不是 single_transformer_blocks）应用 CLEAR
+            for name, module in self.transformer.named_modules():
+                if hasattr(module, 'set_processor') and 'transformer_blocks.' in name and 'single' not in name:
+                    block_idx = int(name.split('transformer_blocks.')[1].split('.')[0])
+                    prefix = f"transformer_blocks.{block_idx}.attn."
+                    
+                    block_weights = {
+                        k.replace(prefix, ''): v.to(dtype)
+                        for k, v in clear_weights.items()
+                        if k.startswith(prefix)
+                    }
+                    
+                    if block_weights:
+                        if self.down_factor > 1:
+                            processor = LocalDownsampleFlexAttnProcessor(down_factor=self.down_factor)
+                        else:
+                            processor = LocalFlexAttnProcessor()
+                        
+                        processor.load_state_dict(block_weights, strict=False)
+                        processor = processor.to(self.device, dtype)
+                        processor.requires_grad_(False)  # 🌟 确保 CLEAR 权重不被误更新
+                        module.set_processor(processor)
     
     def _pack(self, x):
+        """Pack latent for transformer: [B, C, H, W] -> [B, H*W/4, C*4]"""
         B, C, H, W = x.shape
-        x = x.view(B, C, H//2, 2, W//2, 2).permute(0, 2, 4, 1, 3, 5)
-        return x.reshape(B, (H//2)*(W//2), C*4)
+        x = x.view(B, C, H // 2, 2, W // 2, 2).permute(0, 2, 4, 1, 3, 5)
+        return x.reshape(B, (H // 2) * (W // 2), C * 4)
     
     def _unpack(self, x, H, W):
+        """Unpack transformer output: [B, H*W/4, C*4] -> [B, C, H, W]"""
         B, _, D = x.shape
         C = D // 4
-        x = x.view(B, H//2, W//2, C, 2, 2).permute(0, 3, 1, 4, 2, 5)
+        x = x.view(B, H // 2, W // 2, C, 2, 2).permute(0, 3, 1, 4, 2, 5)
         return x.reshape(B, C, H, W)
     
     def _img_ids(self, H, W, device, dtype):
-        h, w = H//2, W//2
+        """Generate image position IDs"""
+        h, w = H // 2, W // 2
         ids = torch.zeros(h, w, 3, device=device, dtype=dtype)
         ids[..., 1] = torch.arange(h, device=device, dtype=dtype)[:, None]
         ids[..., 2] = torch.arange(w, device=device, dtype=dtype)[None, :]
-        return ids.reshape(h*w, 3)
+        return ids.reshape(h * w, 3)
+    
+    def encode(self, img):
+        """Encode image to latent - 修复版（不手动处理 shift_factor）"""
+        return self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample() * self.vae.config.scaling_factor
+    
+    def decode(self, lat):
+        """Decode latent to image - 修复版"""
+        return self.vae.decode((lat / self.vae.config.scaling_factor).to(self.vae.dtype)).sample
     
     def forward(self, noisy, lr_lat, lr_pixel, t, guidance=3.5):
-        """Forward pass"""
+        """Forward pass: predict velocity"""
         B, C, H, W = noisy.shape
         device = noisy.device
         dtype = torch.bfloat16
@@ -474,8 +379,7 @@ class DualStreamFLUXSR(nn.Module):
         # Pixel features
         pixel_feat = self.pixel_extractor(lr_pixel)
         
-        # 🚀 修复尺寸不匹配：PixelExtractor 输出 /16，VAE latent 是 /8
-        # 需要 2x 上采样 pixel_feat 以匹配 lr_lat
+        # 尺寸检查
         if pixel_feat.shape[-2:] != lr_lat.shape[-2:]:
             pixel_feat = F.interpolate(
                 pixel_feat, size=lr_lat.shape[-2:], mode='bilinear', align_corners=False
@@ -485,19 +389,19 @@ class DualStreamFLUXSR(nn.Module):
         fused_cond = (lr_lat + self.pixel_weight * pixel_feat).to(dtype)
         
         # Pack for transformer
-        noisy_packed = self._pack(noisy)
+        noisy_packed = self._pack(noisy.to(dtype))
         fused_packed = self._pack(fused_cond)
         img_ids = self._img_ids(H, W, device, dtype)
         
         # Text embeddings
         pooled = self.text_embeds['pooled'].expand(B, -1)
         prompt = self.text_embeds['prompt'].expand(B, -1, -1)
-        text_ids = self.text_embeds['text_ids']  # 2D tensor, 不需要 batch 维度
+        text_ids = self.text_embeds['text_ids']
         
-        # Timestep - FLUX 期望 [0, 1] 范围
+        # Timestep
         t_input = t.to(dtype)
         
-        # Guidance (for ControlNet conditioning strength)
+        # Guidance
         guidance_tensor = torch.full((B,), guidance, device=device, dtype=dtype)
         
         # ControlNet
@@ -530,56 +434,48 @@ class DualStreamFLUXSR(nn.Module):
         
         return self._unpack(out, H, W)
     
-    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, start_t=0.8):
-        """Flow Matching inference with official scheduler"""
+    @torch.no_grad()
+    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, 
+                  start_mode='standard', start_t=1.0):
+        """
+        Euler 推理（支持 SDEdit 截断）
+        
+        Args:
+            start_mode:
+                - 'standard': 从纯噪声开始
+                - 'mean': 从 lr_lat 开始
+                - 'mixed': SDEdit 截断（从 start_t 混合点开始）
+            start_t: 混合模式的起始时间点 (0.0-1.0)
+        """
         B = lr_lat.shape[0]
-        dtype = torch.bfloat16
         device = lr_lat.device
+        dtype = torch.bfloat16
         
         lr_lat = lr_lat.to(dtype)
         lr_pixel = lr_pixel.to(dtype)
         
-        # Load scheduler
-        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            self.model_name, subfolder="scheduler"
-        )
-        
-        # 🌟 动态计算当前分辨率需要的 mu 参数
-        _, _, h_lat, w_lat = lr_lat.shape
-        # FLUX 打包后的序列长度是 (H/2) * (W/2)
-        image_seq_len = (h_lat // 2) * (w_lat // 2)
-        
-        mu = calculate_shift(
-            image_seq_len,
-            scheduler.config.base_image_seq_len,
-            scheduler.config.max_image_seq_len,
-            scheduler.config.base_shift,
-            scheduler.config.max_shift,
-        )
-        
-        # 传入 mu
-        scheduler.set_timesteps(num_steps, device=device, mu=mu)
-        
-        # Start from LR interpolation
         noise = torch.randn_like(lr_lat)
-        if start_t < 1.0:
-            lat = start_t * noise + (1 - start_t) * lr_lat
-            start_idx = int((1.0 - start_t) * num_steps)
-            timesteps = scheduler.timesteps[start_idx:]
-        else:
-            lat = noise * scheduler.init_noise_sigma
-            timesteps = scheduler.timesteps
+        dt = 1.0 / num_steps
         
-        for t in timesteps:
-            # 🌟 安全归一化：确保传入 forward 的 t 永远在 [0, 1] 之间
-            t_val = t.item()
-            if t_val > 1.0:
-                t_val = t_val / scheduler.config.num_train_timesteps
-            
-            t_batch = torch.full((B,), t_val, device=device, dtype=dtype)
-            
-            v = self.forward(lat, lr_lat, lr_pixel, t_batch, guidance)
-            lat = scheduler.step(v, t, lat, return_dict=False)[0]
+        if start_mode == 'standard':
+            lat = noise
+            start_step = 0
+        elif start_mode == 'mean':
+            lat = lr_lat.clone()
+            start_step = 0
+        elif start_mode == 'mixed':
+            # SDEdit: 从 start_t 混合点开始
+            lat = start_t * noise + (1 - start_t) * lr_lat
+            start_step = round((1.0 - start_t) * num_steps)
+        else:
+            lat = noise
+            start_step = 0
+        
+        for i in range(start_step, num_steps):
+            t_val = 1.0 - i * dt
+            t = torch.full((B,), t_val, device=device, dtype=dtype)
+            v = self.forward(lat, lr_lat, lr_pixel, t, guidance)
+            lat = lat - dt * v
         
         return lat
 
@@ -588,58 +484,66 @@ class DualStreamFLUXSR(nn.Module):
 # Training Functions
 # ============================================================================
 
-def compute_flow_matching_loss(system, hr, lr, device, scheduler, debug=False):
-    """Flow Matching Loss"""
-    dtype = torch.bfloat16
-    
-    hr = hr.to(device).to(dtype)
-    lr = lr.to(device).to(dtype)
-    
-    # Encode
-    with torch.no_grad():
-        hr_lat = system.encode(hr)
-        lr_lat = system.encode(lr)
-    
-    B = hr_lat.shape[0]
-    
-    # Flow matching
-    timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (B,), device=device)
-    # 映射到 [0, 1] 之间的浮点数 t
-    t = (timesteps.float() / scheduler.config.num_train_timesteps).to(dtype)
-    noise = torch.randn_like(hr_lat)
-    
-    x_t = t.view(B, 1, 1, 1) * noise + (1 - t.view(B, 1, 1, 1)) * hr_lat
-    target_v = noise - hr_lat
-    
-    pred_v = system(x_t, lr_lat, lr, t)
-    
-    # 🔍 调试信息
-    if debug:
-        print(f"  [DEBUG] hr_lat range: [{hr_lat.min():.2f}, {hr_lat.max():.2f}]")
-        print(f"  [DEBUG] noise range: [{noise.min():.2f}, {noise.max():.2f}]")
-        print(f"  [DEBUG] target_v range: [{target_v.min():.2f}, {target_v.max():.2f}]")
-        print(f"  [DEBUG] pred_v range: [{pred_v.min():.2f}, {pred_v.max():.2f}]")
-        print(f"  [DEBUG] t values: {t.tolist()}")
-    
-    loss = F.mse_loss(pred_v.float(), target_v.float())
-    return loss
-
-
 def calculate_psnr(pred, target):
-    # 🌟 clamp 到 [-1, 1] 避免异常值影响 PSNR
+    """Calculate PSNR between prediction and target"""
     pred = torch.clamp(pred, -1.0, 1.0)
-    
     mse = F.mse_loss(pred, target)
     if mse == 0:
         return float('inf')
-    return 10 * torch.log10(4.0 / mse).item()
+    return 10 * torch.log10(4.0 / mse).item()  # 范围 [-1,1]，max=2
 
 
-def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=20, start_t=0.8):
-    """Validation"""
+def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, flow_mode='mixed', 
+                                mean_noise_scale=0.1, guidance=3.5):
+    """
+    Flow Matching Loss with Mixed Flow for CLEAR
+    
+    Args:
+        flow_mode:
+            - 'standard': noise → hr_lat
+            - 'mean': lr_lat → hr_lat
+            - 'mixed': 无级变速混合（推荐用于 CLEAR）
+    """
+    B = hr_lat.shape[0]
+    device = hr_lat.device
+    dtype = torch.bfloat16
+    
+    t = torch.rand(B, device=device, dtype=dtype)
+    noise = torch.randn_like(hr_lat)
+    
+    if flow_mode == 'standard':
+        source = noise
+    elif flow_mode == 'mean':
+        source = lr_lat + mean_noise_scale * torch.randn_like(lr_lat)
+    elif flow_mode == 'mixed':
+        # 🌟 无级变速：每个样本随机混合 noise 和 lr_lat
+        alpha = torch.rand(B, 1, 1, 1, device=device, dtype=dtype)
+        source = alpha * noise + (1.0 - alpha) * lr_lat
+    else:
+        raise ValueError(f"Unknown flow_mode: {flow_mode}")
+    
+    t_expand = t.view(B, 1, 1, 1)
+    x_t = t_expand * source + (1 - t_expand) * hr_lat
+    target_v = source - hr_lat
+    
+    v_pred = system(x_t, lr_lat, lr_pixel, t, guidance)
+    return F.mse_loss(v_pred.float(), target_v.float())
+
+
+def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=20,
+             flow_mode='mixed', start_t=0.7):
+    """Validation with SDEdit"""
     unwrapped = accelerator.unwrap_model(system)
     unwrapped.pixel_extractor.eval()
     unwrapped.controlnet.eval()
+    
+    # 根据 flow_mode 选择推理模式
+    if flow_mode == 'standard':
+        start_mode = 'standard'
+    elif flow_mode == 'mean':
+        start_mode = 'mean'
+    else:  # mixed
+        start_mode = 'mixed'
     
     psnr_list = []
     for i, batch in enumerate(val_loader):
@@ -651,15 +555,9 @@ def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=2
         with torch.no_grad():
             hr_lat = unwrapped.encode(hr)
             lr_lat = unwrapped.encode(lr)
-            sr_lat = unwrapped.inference(lr_lat, lr, num_steps=num_steps, start_t=start_t)
+            sr_lat = unwrapped.inference(lr_lat, lr, num_steps=num_steps,
+                                         start_mode=start_mode, start_t=start_t)
             sr = unwrapped.decode(sr_lat)
-        
-        # 🔍 调试信息
-        if i == 0:
-            print(f"  [VAL DEBUG] hr range: [{hr.min():.2f}, {hr.max():.2f}]")
-            print(f"  [VAL DEBUG] sr range: [{sr.min():.2f}, {sr.max():.2f}]")
-            print(f"  [VAL DEBUG] hr_lat range: [{hr_lat.min():.2f}, {hr_lat.max():.2f}]")
-            print(f"  [VAL DEBUG] sr_lat range: [{sr_lat.min():.2f}, {sr_lat.max():.2f}]")
         
         psnr_list.append(calculate_psnr(sr.float(), hr.float()))
     
@@ -670,6 +568,7 @@ def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=2
 
 
 def save_checkpoint(system, accelerator, epoch, loss, psnr, args, path):
+    """Save checkpoint"""
     unwrapped = accelerator.unwrap_model(system)
     torch.save({
         'epoch': epoch,
@@ -679,15 +578,80 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, args, path):
         'window_size': args.window_size,
         'down_factor': args.down_factor,
         'resolution': args.resolution,
+        'flow_mode': args.flow_mode,
         'start_t': args.start_t,
         'loss': loss,
         'psnr': psnr,
     }, path)
 
 
-def format_time(seconds):
-    h, m, s = int(seconds // 3600), int((seconds % 3600) // 60), int(seconds % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
+def debug_first_batch(system, batch, device, accelerator):
+    """调试第一个 batch"""
+    if accelerator.is_main_process:
+        print("\n" + "="*60)
+        print("DEBUG: First Batch Check")
+        print("="*60)
+    
+    unwrapped = accelerator.unwrap_model(system)
+    hr = batch['hr'].to(device).to(torch.bfloat16)
+    lr = batch['lr'].to(device).to(torch.bfloat16)
+    
+    with torch.no_grad():
+        if accelerator.is_main_process:
+            print(f"Input:")
+            print(f"  hr shape: {hr.shape}, range: [{hr.min():.2f}, {hr.max():.2f}]")
+            print(f"  lr shape: {lr.shape}, range: [{lr.min():.2f}, {lr.max():.2f}]")
+        
+        hr_lat = unwrapped.encode(hr)
+        lr_lat = unwrapped.encode(lr)
+        
+        if accelerator.is_main_process:
+            print(f"VAE Latents:")
+            print(f"  hr_lat shape: {hr_lat.shape}, range: [{hr_lat.min():.2f}, {hr_lat.max():.2f}]")
+            print(f"  lr_lat shape: {lr_lat.shape}, range: [{lr_lat.min():.2f}, {lr_lat.max():.2f}]")
+        
+        encoder_out = unwrapped.pixel_extractor.encoder(lr)
+        pixel_feat = unwrapped.pixel_extractor(lr)
+        
+        if accelerator.is_main_process:
+            print(f"PixelFeatureExtractor:")
+            print(f"  encoder output: [{encoder_out.min():.2f}, {encoder_out.max():.2f}]")
+            print(f"  pixel_feat (after zero_conv): [{pixel_feat.min():.2f}, {pixel_feat.max():.2f}]")
+        
+        fused = lr_lat + unwrapped.pixel_weight * pixel_feat
+        
+        if accelerator.is_main_process:
+            print(f"Fused Condition:")
+            print(f"  pixel_weight: {unwrapped.pixel_weight}")
+            print(f"  fused range: [{fused.min():.2f}, {fused.max():.2f}]")
+        
+        # 模拟 forward
+        t = torch.rand(hr.shape[0], device=device, dtype=torch.bfloat16)
+        noise = torch.randn_like(hr_lat)
+        x_t = t.view(-1, 1, 1, 1) * noise + (1 - t.view(-1, 1, 1, 1)) * hr_lat
+        
+        v_pred = unwrapped.forward(x_t, lr_lat, lr, t)
+        target_v = noise - hr_lat
+        
+        if accelerator.is_main_process:
+            print(f"Forward Pass:")
+            print(f"  v_pred range: [{v_pred.min():.2f}, {v_pred.max():.2f}]")
+            print(f"  target_v range: [{target_v.min():.2f}, {target_v.max():.2f}]")
+        
+        has_nan = torch.isnan(v_pred).any() or torch.isnan(target_v).any()
+        has_inf = torch.isinf(v_pred).any() or torch.isinf(target_v).any()
+        pixel_feat_ok = pixel_feat.abs().max() < 100
+        
+        if accelerator.is_main_process:
+            print(f"\nHealth Check:")
+            print(f"  NaN: {has_nan}, Inf: {has_inf}, pixel_feat OK: {pixel_feat_ok.item()}")
+            if has_nan or has_inf or not pixel_feat_ok:
+                print("  ⚠️  WARNING: Potential issues!")
+            else:
+                print("  ✅ All checks passed!")
+            print("="*60 + "\n")
+    
+    return not (has_nan or has_inf or not pixel_feat_ok)
 
 
 # ============================================================================
@@ -696,243 +660,219 @@ def format_time(seconds):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--hr_dir', type=str, required=True, help='HR images directory')
-    parser.add_argument('--lr_dir', type=str, required=True, help='LR images directory')
+    parser.add_argument('--hr_dir', type=str, required=True)
+    parser.add_argument('--lr_dir', type=str, required=True)
     parser.add_argument('--val_hr_dir', type=str, default=None)
     parser.add_argument('--val_lr_dir', type=str, default=None)
     parser.add_argument('--model_name', type=str, default='black-forest-labs/FLUX.1-dev')
-    parser.add_argument('--pretrained_controlnet', type=str, default='jasperai/Flux.1-dev-Controlnet-Upscaler')
     
     parser.add_argument('--resolution', type=int, default=512)
-    parser.add_argument('--num_crops', type=int, default=5, help='Number of random crops per image')
-    parser.add_argument('--full_image', action='store_true', default=False, 
-                        help='Use full image resize instead of random crops')
-    parser.add_argument('--train_controlnet', action='store_true', default=True)
-    parser.add_argument('--freeze_controlnet', action='store_true', default=False)
-    parser.add_argument('--pixel_weight', type=float, default=1.0)
+    parser.add_argument('--num_crops', type=int, default=2)
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--epochs', type=int, default=120)
+    parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--warmup_epochs', type=int, default=5)
     
+    parser.add_argument('--pixel_weight', type=float, default=1.0)
+    parser.add_argument('--guidance', type=float, default=3.5)
+    
+    # Flow mode（CLEAR 推荐 mixed）
+    parser.add_argument('--flow_mode', type=str, default='mixed',
+                        choices=['standard', 'mean', 'mixed'],
+                        help='standard=纯噪声, mean=LR起点, mixed=无级变速(推荐)')
+    parser.add_argument('--start_t', type=float, default=0.7,
+                        help='SDEdit 截断点，mixed 模式推理时使用')
+    
+    # CLEAR
     parser.add_argument('--window_size', type=int, default=16)
     parser.add_argument('--down_factor', type=int, default=4)
-    parser.add_argument('--clear_ckpt', type=str, required=True)
-    
-    parser.add_argument('--epochs', type=int, default=80)
-    parser.add_argument('--batch_size', type=int, default=2)
-    parser.add_argument('--lr', type=float, default=1e-5)
-    parser.add_argument('--warmup_epochs', type=int, default=3)
-    parser.add_argument('--val_interval', type=int, default=2)
-    parser.add_argument('--save_interval', type=int, default=5)
-    parser.add_argument('--val_steps', type=int, default=20)
-    parser.add_argument('--start_t', type=float, default=0.8)
+    parser.add_argument('--clear_ckpt', type=str, default='ckpt/clear_local_16_down_4.safetensors')
     
     parser.add_argument('--output_dir', type=str, default='./checkpoints/clear_control')
-    parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--save_every', type=int, default=5)
+    parser.add_argument('--val_every', type=int, default=1)
     parser.add_argument('--seed', type=int, default=42)
     
     args = parser.parse_args()
     
-    if args.freeze_controlnet:
-        args.train_controlnet = False
+    # 初始化 accelerator
+    accelerator = Accelerator(mixed_precision='bf16')
+    set_seed(args.seed)
     
-    accelerator = Accelerator(
-        mixed_precision='bf16', 
-        gradient_accumulation_steps=4  # 🌟 比如 batch_size=1，累积4步相当于 batch=4
-    )
     device = accelerator.device
-    local_rank = accelerator.process_index
     is_main = accelerator.is_main_process
     
-    torch.manual_seed(args.seed + local_rank)
-    
-    # Dataset
-    train_dataset = SRDataset(
-        args.hr_dir, args.lr_dir, args.resolution, 
-        num_crops=args.num_crops, full_image=args.full_image
-    )
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=4, pin_memory=True, drop_last=True
-    )
-    
-    val_loader = None
-    if args.val_hr_dir and args.val_lr_dir:
-        val_dataset = ValDataset(args.val_hr_dir, args.val_lr_dir, args.resolution)
-        val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
-    
-    # Output directory
+    # 创建输出目录
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    mode = "ctrl" if args.train_controlnet else "pix"
-    img_mode = "full" if args.full_image else f"crop{args.num_crops}"
-    save_dir = os.path.join(args.output_dir, f"{timestamp}_{mode}_res{args.resolution}_{img_mode}")
+    exp_name = f"{timestamp}_clear_{args.flow_mode}_res{args.resolution}"
+    output_dir = os.path.join(args.output_dir, exp_name)
+    log_file = None
     
     if is_main:
-        os.makedirs(save_dir, exist_ok=True)
-        log_file = os.path.join(save_dir, 'train.log')
+        os.makedirs(output_dir, exist_ok=True)
+        log_file = os.path.join(output_dir, 'train.log')
         
         with open(log_file, 'w') as f:
             f.write("=" * 70 + "\n")
-            f.write("FLUX SR Training with CLEAR + ControlNet\n")
+            f.write("FLUX SR Training with CLEAR Acceleration\n")
             f.write("=" * 70 + "\n\n")
             f.write(f"HR Dir: {args.hr_dir}\n")
             f.write(f"LR Dir: {args.lr_dir}\n")
             f.write(f"Resolution: {args.resolution}\n")
-            f.write(f"Image Mode: {'Full image resize' if args.full_image else f'{args.num_crops} crops per image'}\n")
-            f.write(f"CLEAR: window={args.window_size}, down={args.down_factor}\n")
+            f.write(f"Num Crops: {args.num_crops}\n")
             f.write(f"Batch Size: {args.batch_size}\n")
+            f.write(f"Flow Mode: {args.flow_mode}, Start T: {args.start_t}\n")
+            f.write(f"CLEAR: window={args.window_size}, down={args.down_factor}\n")
             f.write(f"Pixel Weight: {args.pixel_weight}\n")
-            f.write(f"Start T (inference): {args.start_t}\n\n")
+            f.write(f"Learning Rate: {args.lr} (PixelExtractor: {args.lr * 10})\n")
+            f.write(f"Warmup Epochs: {args.warmup_epochs}\n\n")
         
-        print("=" * 70)
-        print("🚀 FLUX SR with CLEAR + ControlNet")
-        print("=" * 70)
-        print(f"HR Dir: {args.hr_dir}")
-        print(f"LR Dir: {args.lr_dir}")
-        print(f"Resolution: {args.resolution}")
-        print(f"Image Mode: {'Full image resize' if args.full_image else f'{args.num_crops} crops per image'}")
-        print(f"CLEAR: window={args.window_size}, down={args.down_factor}")
-        print(f"Batch Size: {args.batch_size}")
-        print(f"Pixel Weight: {args.pixel_weight}")
-        print(f"Start T (inference): {args.start_t}")
-        print("=" * 70)
+        print(f"\n{'='*70}")
+        print(f"FLUX SR Training with CLEAR Acceleration")
+        print(f"{'='*70}")
+        print(f"Output: {output_dir}")
+        print(f"Resolution: {args.resolution}, Crops: {args.num_crops}")
+        print(f"Flow Mode: {args.flow_mode}, Start T: {args.start_t}")
+        print(f"pixel_weight: {args.pixel_weight}")
+        print(f"LR: {args.lr} (PixelExtractor: {args.lr * 10})")
+        print(f"CLEAR: window={args.window_size}, down_factor={args.down_factor}")
+        print(f"{'='*70}\n")
     
-    # Model
-    train_controlnet = args.train_controlnet
+    # 创建数据集
+    train_dataset = SRDataset(args.hr_dir, args.lr_dir, args.resolution, args.num_crops)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                              num_workers=4, pin_memory=True, drop_last=True)
+    
+    val_loader = None
+    if args.val_hr_dir and args.val_lr_dir:
+        val_dataset = SRDataset(args.val_hr_dir, args.val_lr_dir, args.resolution, num_crops=1, is_val=True)
+        val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=2)
+    
+    # 创建模型
     system = DualStreamFLUXSR(
-        args.model_name, device, args.pretrained_controlnet,
-        train_controlnet=train_controlnet, pixel_weight=args.pixel_weight,
-        window_size=args.window_size, down_factor=args.down_factor,
-        clear_ckpt=args.clear_ckpt, resolution=args.resolution,
+        args.model_name, device, args.pixel_weight,
+        args.window_size, args.down_factor, args.clear_ckpt
     )
-
-    from diffusers import FlowMatchEulerDiscreteScheduler
-    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        args.model_name, subfolder="scheduler"
-    )
-    system.setup(local_rank)
     
-    trainable_params = system.get_trainable_params()
-    total_params = sum(p.numel() for p in trainable_params)
+    # 🌟 V2 修复：分组学习率（PixelExtractor 10x）
+    optimizer_grouped_parameters = [
+        {"params": system.controlnet.parameters(), "lr": args.lr},
+        {"params": system.pixel_extractor.parameters(), "lr": args.lr * 10.0}
+    ]
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01)
     
-    if train_controlnet:
-        optimizer_params = [
-            {"params": system.controlnet.parameters(), "lr": args.lr},
-            {"params": system.pixel_extractor.parameters(), "lr": args.lr * 10},
-        ]
-    else:
-        optimizer_params = [
-            {"params": system.pixel_extractor.parameters(), "lr": args.lr * 10},
-        ]
+    # 获取所有可训练参数（用于 grad clipping）
+    trainable_params = list(system.controlnet.parameters()) + list(system.pixel_extractor.parameters())
     
-    optimizer = torch.optim.AdamW(optimizer_params, weight_decay=0.01)
-    
-    # LR scheduler
+    # LR Scheduler (warmup + cosine)
     total_steps = len(train_loader) * args.epochs
     warmup_steps = len(train_loader) * args.warmup_epochs
     
     def lr_lambda(step):
         if step < warmup_steps:
-            return step / warmup_steps
-        progress = (step - warmup_steps) / (total_steps - warmup_steps)
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
         return 0.5 * (1 + np.cos(np.pi * progress))
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
-    # Accelerate
+    # Prepare
     system, optimizer, train_loader, scheduler = accelerator.prepare(
         system, optimizer, train_loader, scheduler
     )
+    if val_loader:
+        val_loader = accelerator.prepare(val_loader)
     
     if is_main:
+        total_params = sum(p.numel() for p in trainable_params)
         print(f"Trainable params: {total_params/1e6:.2f}M")
-        print(f"Steps/epoch: {len(train_loader)}")
-        print(f"Total steps: {total_steps}")
+        print(f"Steps/epoch: {len(train_loader)}, Total steps: {total_steps}")
+        print(f"Warmup steps: {warmup_steps}")
         print("=" * 70)
     
-    # Resume
-    start_epoch = 0
-    best_psnr = 0.0
+    # 调试第一个 batch
+    first_batch = next(iter(train_loader))
+    debug_ok = debug_first_batch(system, first_batch, device, accelerator)
+    if not debug_ok and is_main:
+        print("⚠️  Debug check failed! Please review the output above.")
     
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        unwrapped = accelerator.unwrap_model(system)
-        unwrapped.controlnet.load_state_dict(ckpt['controlnet'])
-        unwrapped.pixel_extractor.load_state_dict(ckpt['pixel_extractor'])
-        start_epoch = ckpt.get('epoch', 0) + 1
-        best_psnr = ckpt.get('psnr', 0.0)
-        if is_main:
-            print(f"Resumed from epoch {start_epoch}, best PSNR: {best_psnr:.2f}")
+    # 训练循环
+    best_psnr = 0
+    steps_per_epoch = len(train_loader)
     
-    # Training loop
-    for epoch in range(start_epoch, args.epochs):
-        epoch_start = time.time()
-        epoch_losses = []
-        
+    for epoch in range(args.epochs):
         system.train()
+        epoch_loss = 0
         
-        # 🚀 使用 tqdm 进度条
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=not is_main)
+        progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}",
+                        disable=not is_main)
         
-        for step, batch in enumerate(pbar):
-            # 🔍 第一个 epoch 的第一个 batch 打印调试信息
-            debug = (epoch == start_epoch and step == 0 and is_main)
+        for step, batch in enumerate(progress):
+            hr = batch['hr'].to(torch.bfloat16)
+            lr = batch['lr'].to(torch.bfloat16)
             
+            with torch.no_grad():
+                hr_lat = accelerator.unwrap_model(system).encode(hr)
+                lr_lat = accelerator.unwrap_model(system).encode(lr)
+            
+            # 直接计算 loss（不用 accelerator.accumulate，DeepSpeed 自己管理）
             loss = compute_flow_matching_loss(
-                accelerator.unwrap_model(system), batch['hr'], batch['lr'], device, noise_scheduler, debug=debug
+                system, hr_lat, lr_lat, lr, 
+                flow_mode=args.flow_mode, guidance=args.guidance
             )
             
             accelerator.backward(loss)
             
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(trainable_params, 1.0)
+            # DeepSpeed 自动做 grad clipping，不需要手动调用
             
             optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
             
-            epoch_losses.append(loss.item())
+            # 只在梯度同步时更新 scheduler
+            if accelerator.sync_gradients:
+                scheduler.step()
             
-            # 更新进度条
-            if is_main:
-                pbar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'lr': f'{scheduler.get_last_lr()[0]:.2e}'
-                })
+            epoch_loss += loss.item()
+            progress.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+            })
         
-        epoch_time = time.time() - epoch_start
-        avg_loss = np.mean(epoch_losses)
+        avg_loss = epoch_loss / steps_per_epoch
         
+        # 验证只在主进程执行，避免 8 卡重复推理
         if is_main:
-            val_psnr = 0.0
-            if val_loader and (epoch + 1) % args.val_interval == 0:
+            val_psnr = 0
+            if val_loader and (epoch + 1) % args.val_every == 0:
                 val_psnr = validate(system, accelerator, val_loader, device,
-                                   num_samples=5, num_steps=args.val_steps, start_t=args.start_t)
-                print(f"[Epoch {epoch+1}] Loss: {avg_loss:.4f}, Val PSNR: {val_psnr:.2f} dB, Time: {format_time(epoch_time)}")
-            else:
-                print(f"[Epoch {epoch+1}] Loss: {avg_loss:.4f}, Time: {format_time(epoch_time)}")
+                                   num_samples=5, num_steps=20,
+                                   flow_mode=args.flow_mode, start_t=args.start_t)
+            
+            print(f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, lr={scheduler.get_last_lr()[0]:.2e}")
             
             with open(log_file, 'a') as f:
-                f.write(f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, Time={format_time(epoch_time)}\n")
+                f.write(f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, LR={scheduler.get_last_lr()[0]:.2e}\n")
             
-            torch.cuda.empty_cache()
-            
-            if (epoch + 1) % args.save_interval == 0:
-                save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr, args,
-                              os.path.join(save_dir, f'epoch{epoch+1}.pt'))
+            if (epoch + 1) % args.save_every == 0:
+                save_checkpoint(system, accelerator, epoch + 1, avg_loss, val_psnr, args,
+                               os.path.join(output_dir, f'epoch_{epoch+1}.pt'))
             
             if val_psnr > best_psnr:
                 best_psnr = val_psnr
-                save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr, args,
-                              os.path.join(save_dir, 'best_model.pt'))
-                print(f"  ✓ New best PSNR: {best_psnr:.2f} dB")
+                save_checkpoint(system, accelerator, epoch + 1, avg_loss, val_psnr, args,
+                               os.path.join(output_dir, 'best_model.pt'))
+                print(f"  → New best PSNR: {best_psnr:.2f} dB")
         
         accelerator.wait_for_everyone()
     
     if is_main:
-        save_checkpoint(system, accelerator, args.epochs - 1, avg_loss, best_psnr, args,
-                       os.path.join(save_dir, 'final_model.pt'))
-        print("=" * 70)
+        save_checkpoint(system, accelerator, args.epochs, avg_loss, best_psnr, args,
+                       os.path.join(output_dir, 'final_model.pt'))
+        
+        print(f"\n{'='*70}")
         print(f"✅ Training complete! Best PSNR: {best_psnr:.2f} dB")
-        print(f"   Checkpoints saved to: {save_dir}")
-        print("=" * 70)
+        print(f"   Checkpoints saved to: {output_dir}")
+        print(f"{'='*70}")
 
 
 if __name__ == '__main__':

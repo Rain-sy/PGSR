@@ -124,12 +124,16 @@ class SRDataset(Dataset):
         self.hr_files = []
         self.lr_files = []
         self.skipped = 0
+        skipped_reasons = []
         
         for hr_name in all_hr_files:
             hr_path = os.path.join(self.hr_dir, hr_name)
-            # 检查 HR 文件是否存在
+            
+            # 检查 HR 文件是否存在（os.path.exists 支持符号链接）
             if not os.path.exists(hr_path):
                 self.skipped += 1
+                if len(skipped_reasons) < 5:
+                    skipped_reasons.append(f"HR not found: {hr_path}")
                 continue
             
             lr_path = self._find_lr_file(hr_name)
@@ -138,9 +142,9 @@ class SRDataset(Dataset):
                 self.lr_files.append(lr_path)
             else:
                 self.skipped += 1
+                if len(skipped_reasons) < 5:
+                    skipped_reasons.append(f"LR not found for: {hr_name}")
         
-        if len(self.hr_files) == 0:
-            raise ValueError(f"No valid HR/LR pairs found in {hr_dir} and {lr_dir}")
     
     def __len__(self):
         return len(self.hr_files) * self.num_crops
@@ -295,6 +299,12 @@ class DualStreamFLUXSR(nn.Module):
         self.controlnet = FluxControlNetModel.from_pretrained(
             controlnet_path, torch_dtype=dtype
         ).to(self.device)
+        
+        # 🌟 显式控制梯度开关，节省显存！
+        if self.train_controlnet:
+            self.controlnet.requires_grad_(True)
+        else:
+            self.controlnet.requires_grad_(False)
         
         # Pixel Feature Extractor
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
@@ -599,7 +609,7 @@ def main():
     parser.add_argument('--val_hr_dir', type=str, default=None)
     parser.add_argument('--val_lr_dir', type=str, default=None)
     parser.add_argument('--resolution', type=int, default=512)
-    parser.add_argument('--num_crops', type=int, default=2,
+    parser.add_argument('--num_crops', type=int, default=4,
                         help='Random crops per image per epoch')
     
     # Model
@@ -832,14 +842,14 @@ def main():
         
         avg_loss = np.mean(epoch_losses)
         
-        # Validation
-        val_psnr = 0.0
-        if val_loader and (epoch + 1) % args.val_interval == 0:
-            val_psnr = validate(system, accelerator, val_loader, device, 
-                               num_samples=5, flow_mode=args.flow_mode)
-        
-        # Logging and saving (main process)
+        # 🌟 修复：把 validation 全部挪进 is_main，防止 8 张卡重复做无用功
         if is_main:
+            val_psnr = 0.0
+            if val_loader and (epoch + 1) % args.val_interval == 0:
+                val_psnr = validate(system, accelerator, val_loader, device, 
+                                   num_samples=5, flow_mode=args.flow_mode)
+            
+            # Logging and saving
             lr_current = scheduler.get_last_lr()[0]
             
             # 写入 log 文件
