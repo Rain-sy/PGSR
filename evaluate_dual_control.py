@@ -274,7 +274,16 @@ class DualStreamEvaluator(nn.Module):
         prompt = self._cached_embeds['prompt'].expand(B, -1, -1)
         text_ids = self._cached_embeds['text_ids']
         
-        t_input = timestep.to(dtype) if isinstance(timestep, torch.Tensor) else torch.tensor([timestep], device=device, dtype=dtype).expand(B)
+        if isinstance(timestep, torch.Tensor):
+            t_input = timestep.to(device=device, dtype=dtype)
+            if t_input.ndim == 0:
+                t_input = t_input.expand(B)
+            elif t_input.ndim == 1 and t_input.shape[0] == 1 and B > 1:
+                t_input = t_input.expand(B)
+            elif t_input.ndim != 1:
+                raise ValueError(f"Expected 1D timestep tensor, got shape {tuple(t_input.shape)}")
+        else:
+            t_input = torch.full((B,), float(timestep), device=device, dtype=dtype)
         controlnet_guidance = None
         transformer_guidance = None
         if getattr(self.controlnet.config, "guidance_embeds", False):
