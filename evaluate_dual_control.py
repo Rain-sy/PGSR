@@ -118,6 +118,9 @@ class DualStreamEvaluator(nn.Module):
         self.pixel_extractor = None
         self.scheduler = None
         self._cached_embeds = None
+        self.strength = 0.7
+        self.control_guidance_start = 0.0
+        self.control_guidance_end = 1.0
     
     def load(self):
         from diffusers import FluxTransformer2DModel, AutoencoderKL, FluxControlNetModel
@@ -169,9 +172,12 @@ class DualStreamEvaluator(nn.Module):
             self.pixel_weight = ckpt['pixel_weight']
         
         self.strength = ckpt.get('strength', 0.7)
+        self.control_guidance_start = ckpt.get('control_guidance_start', 0.0)
+        self.control_guidance_end = ckpt.get('control_guidance_end', 1.0)
         
         print(f"Checkpoint: epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', 0):.2f}")
         print(f"Pixel Weight: {self.pixel_weight}, Strength: {self.strength}")
+        print(f"Control Guidance Window: [{self.control_guidance_start}, {self.control_guidance_end}]")
         
         # Cache text embeddings
         print("Caching text embeddings...")
@@ -269,13 +275,18 @@ class DualStreamEvaluator(nn.Module):
         text_ids = self._cached_embeds['text_ids']
         
         t_input = timestep.to(dtype) if isinstance(timestep, torch.Tensor) else torch.tensor([timestep], device=device, dtype=dtype).expand(B)
-        guidance_tensor = torch.full((B,), guidance, device=device, dtype=dtype)
+        controlnet_guidance = None
+        transformer_guidance = None
+        if getattr(self.controlnet.config, "guidance_embeds", False):
+            controlnet_guidance = torch.full((B,), guidance, device=device, dtype=dtype)
+        if getattr(self.transformer.config, "guidance_embeds", False):
+            transformer_guidance = torch.full((B,), guidance, device=device, dtype=dtype)
         
         ctrl_out = self.controlnet(
             hidden_states=noisy_packed,
             controlnet_cond=fused_packed,
             timestep=t_input,
-            guidance=guidance_tensor,
+            guidance=controlnet_guidance,
             pooled_projections=pooled,
             encoder_hidden_states=prompt,
             txt_ids=text_ids,
@@ -286,7 +297,7 @@ class DualStreamEvaluator(nn.Module):
         out = self.transformer(
             hidden_states=noisy_packed,
             timestep=t_input,
-            guidance=guidance_tensor,
+            guidance=transformer_guidance,
             pooled_projections=pooled,
             encoder_hidden_states=prompt,
             txt_ids=text_ids,
@@ -316,11 +327,21 @@ class DualStreamEvaluator(nn.Module):
         init_timestep = min(int(num_steps * strength), num_steps)
         t_start = max(num_steps - init_timestep, 0)
         timesteps = timesteps[t_start:]
-        
+
+        if len(timesteps) == 0:
+            raise ValueError(
+                f"No timesteps left after applying strength={strength}. "
+                f"Please increase num_steps (current: {num_steps}) or strength."
+            )
+
+        # 和官方 img2img 对齐：显式设置 begin_index，再调用 scale_noise
+        self.scheduler.set_begin_index(t_start)
+
         noise = torch.randn_like(lr_lat)
-        
+
         # 使用官方 scale_noise
-        latents = self.scheduler.scale_noise(lr_lat, timesteps[0], noise)
+        timestep_batch = timesteps[:1].expand(B)
+        latents = self.scheduler.scale_noise(lr_lat, timestep_batch, noise)
         
         # 去噪循环
         for i, t in enumerate(timesteps):
@@ -428,6 +449,8 @@ def main():
     parser.add_argument('--pixel_weight', type=float, default=None)
     parser.add_argument('--strength', type=float, default=None,
                         help='推理起点 (1.0=从纯噪声，0.7=跳过30%)')
+    parser.add_argument('--control_guidance_start', type=float, default=None)
+    parser.add_argument('--control_guidance_end', type=float, default=None)
     
     parser.add_argument('--tile_size', type=int, default=512)
     parser.add_argument('--overlap', type=int, default=64)
@@ -467,6 +490,16 @@ def main():
         evaluator.pixel_weight = args.pixel_weight
     
     strength = args.strength if args.strength is not None else evaluator.strength
+    control_guidance_start = (
+        args.control_guidance_start
+        if args.control_guidance_start is not None
+        else evaluator.control_guidance_start
+    )
+    control_guidance_end = (
+        args.control_guidance_end
+        if args.control_guidance_end is not None
+        else evaluator.control_guidance_end
+    )
     
     # Experiment name
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -488,6 +521,7 @@ def main():
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Dataset: {args.dataset}")
     print(f"Strength: {strength}")
+    print(f"Control Guidance Window: [{control_guidance_start}, {control_guidance_end}]")
     print(f"Pixel Weight: {evaluator.pixel_weight}")
     print(f"Steps: {args.num_steps}, Guidance: {args.guidance}")
     print(f"Output: {output_dir}")
@@ -612,6 +646,7 @@ def main():
         f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Checkpoint: {args.checkpoint}\n")
         f.write(f"Strength: {strength}\n")
+        f.write(f"Control Guidance Window: [{control_guidance_start}, {control_guidance_end}]\n")
         f.write(f"Pixel Weight: {evaluator.pixel_weight}\n")
         f.write(f"Dataset: {args.dataset}\n")
         f.write(f"Images: {len(psnr_list)}\n")

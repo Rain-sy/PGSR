@@ -356,14 +356,19 @@ class DualStreamFLUXSR(nn.Module):
         
         # 🌟 timestep 已经是 / 1000 后的值，直接使用
         t_input = timestep.to(dtype) if isinstance(timestep, torch.Tensor) else torch.tensor([timestep], device=device, dtype=dtype).expand(B)
-        guidance_tensor = torch.full((B,), guidance, device=device, dtype=dtype)
+        controlnet_guidance = None
+        transformer_guidance = None
+        if getattr(self.controlnet.config, "guidance_embeds", False):
+            controlnet_guidance = torch.full((B,), guidance, device=device, dtype=dtype)
+        if getattr(self.transformer.config, "guidance_embeds", False):
+            transformer_guidance = torch.full((B,), guidance, device=device, dtype=dtype)
         
         # ControlNet
         ctrl_out = self.controlnet(
             hidden_states=noisy_packed,
             controlnet_cond=fused_packed,
             timestep=t_input,
-            guidance=guidance_tensor,
+            guidance=controlnet_guidance,
             pooled_projections=pooled,
             encoder_hidden_states=prompt,
             txt_ids=text_ids,
@@ -375,7 +380,7 @@ class DualStreamFLUXSR(nn.Module):
         out = self.transformer(
             hidden_states=noisy_packed,
             timestep=t_input,
-            guidance=guidance_tensor,
+            guidance=transformer_guidance,
             pooled_projections=pooled,
             encoder_hidden_states=prompt,
             txt_ids=text_ids,
@@ -412,13 +417,23 @@ class DualStreamFLUXSR(nn.Module):
         init_timestep = min(int(num_steps * strength), num_steps)
         t_start = max(num_steps - init_timestep, 0)
         timesteps = timesteps[t_start:]
-        
+
+        if len(timesteps) == 0:
+            raise ValueError(
+                f"No timesteps left after applying strength={strength}. "
+                f"Please increase num_steps (current: {num_steps}) or strength."
+            )
+
+        # 和官方 img2img 对齐：显式设置 begin_index，再调用 scale_noise
+        self.scheduler.set_begin_index(t_start)
+
         # 生成噪声
         noise = torch.randn_like(lr_lat)
-        
+
         # 🌟 使用官方 scale_noise 加噪
         # scale_noise: sample = sigma * noise + (1 - sigma) * sample
-        latents = self.scheduler.scale_noise(lr_lat, timesteps[0], noise)
+        timestep_batch = timesteps[:1].expand(B)
+        latents = self.scheduler.scale_noise(lr_lat, timestep_batch, noise)
         
         # 去噪循环
         for i, t in enumerate(timesteps):
@@ -463,8 +478,12 @@ def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, num_train_times
     device = hr_lat.device
     dtype = torch.bfloat16
     
-    # 采样 sigma（对应官方的 sigmas）
-    sigma = torch.rand(B, device=device, dtype=dtype)
+    # 采样 sigma（对应官方 scheduler.sigmas，而不是手工 U[0,1]）
+    # 这样能保留 shift / dynamic shifting 等配置语义
+    unwrapped = system.module if hasattr(system, 'module') else system
+    sched_sigmas = unwrapped.scheduler.sigmas[:-1] if unwrapped.scheduler.sigmas.shape[0] > 1 else unwrapped.scheduler.sigmas
+    sigma_idx = torch.randint(0, sched_sigmas.shape[0], (B,), device=device)
+    sigma = sched_sigmas.to(device=device, dtype=dtype)[sigma_idx]
     noise = torch.randn_like(hr_lat)
     
     # 🌟 官方加噪: noisy = sigma * noise + (1 - sigma) * sample
@@ -475,7 +494,6 @@ def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, num_train_times
     target_v = noise - hr_lat
     
     # 🌟 传给模型的 timestep = sigma（因为官方是 timestep / 1000，而 timestep = sigma * 1000）
-    unwrapped = system.module if hasattr(system, 'module') else system
     v_pred = unwrapped.forward(noisy, lr_lat, lr_pixel, sigma)
     
     # Loss
@@ -526,7 +544,8 @@ def validate(system, accelerator, val_loader, device, num_samples=5,
     return np.mean(psnr_list) if psnr_list else 0.0
 
 
-def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, strength, path):
+def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, strength,
+                    control_guidance_start, control_guidance_end, path):
     unwrapped = accelerator.unwrap_model(system)
     torch.save({
         'epoch': epoch,
@@ -534,6 +553,8 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
         'psnr': psnr,
         'pixel_weight': pixel_weight,
         'strength': strength,
+        'control_guidance_start': control_guidance_start,
+        'control_guidance_end': control_guidance_end,
         'pixel_extractor': unwrapped.pixel_extractor.state_dict(),
         'controlnet': unwrapped.controlnet.state_dict(),
     }, path)
@@ -565,6 +586,8 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--warmup_epochs', type=int, default=5)
     parser.add_argument('--guidance', type=float, default=3.5)
+    parser.add_argument('--control_guidance_start', type=float, default=0.0)
+    parser.add_argument('--control_guidance_end', type=float, default=1.0)
     
     # 🌟 Strength (官方 img2img 语义)
     parser.add_argument('--strength', type=float, default=0.7,
@@ -610,6 +633,7 @@ def main():
         print(f"Batch Size: {args.batch_size}")
         print(f"Pixel Weight: {args.pixel_weight}")
         print(f"Strength: {args.strength} (推理时跳过 {(1-args.strength)*100:.0f}% 步数)")
+        print(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]")
         print(f"Learning Rate: {args.lr} (PixelExtractor: {args.lr * 10})")
         print(f"Save Dir: {save_dir}")
         print("=" * 70 + "\n")
@@ -699,6 +723,10 @@ def main():
         
         start_epoch = ckpt.get('epoch', 0) + 1
         best_psnr = ckpt.get('psnr', 0.0)
+        if 'control_guidance_start' in ckpt:
+            args.control_guidance_start = ckpt['control_guidance_start']
+        if 'control_guidance_end' in ckpt:
+            args.control_guidance_end = ckpt['control_guidance_end']
         if is_main:
             print(f"[Resume] Starting from epoch {start_epoch}, best PSNR: {best_psnr:.2f}")
     
@@ -710,6 +738,7 @@ def main():
             f.write("=" * 60 + "\n")
             f.write(f"Strength: {args.strength}\n")
             f.write(f"Pixel Weight: {args.pixel_weight}\n\n")
+            f.write(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]\n\n")
     
     # Training loop
     if is_main:
@@ -765,12 +794,14 @@ def main():
                 best_psnr = val_psnr
                 save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr,
                                args.pixel_weight, args.strength,
+                               args.control_guidance_start, args.control_guidance_end,
                                os.path.join(save_dir, 'best_model.pt'))
                 print(f"  → New best PSNR: {best_psnr:.2f} dB")
             
             if (epoch + 1) % args.save_interval == 0:
                 save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr,
                                args.pixel_weight, args.strength,
+                               args.control_guidance_start, args.control_guidance_end,
                                os.path.join(save_dir, f'epoch{epoch+1}.pt'))
             
             torch.cuda.empty_cache()
@@ -781,6 +812,7 @@ def main():
     if is_main:
         save_checkpoint(system, accelerator, args.epochs - 1, avg_loss, best_psnr,
                        args.pixel_weight, args.strength,
+                       args.control_guidance_start, args.control_guidance_end,
                        os.path.join(save_dir, 'final_model.pt'))
         
         print("\n" + "=" * 70)
