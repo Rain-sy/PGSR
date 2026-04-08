@@ -105,12 +105,13 @@ def calculate_ssim(img1, img2):
 # ============================================================================
 
 class DualStreamEvaluator(nn.Module):
-    def __init__(self, model_name, device, checkpoint_path, pixel_weight=1.0):
+    def __init__(self, model_name, device, checkpoint_path, pixel_weight=1.0, conditioning_scale=1.0):
         super().__init__()
         self.model_name = model_name
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.pixel_weight = pixel_weight
+        self.conditioning_scale = conditioning_scale  # 🌟 新增
         
         self.vae = None
         self.transformer = None
@@ -118,6 +119,7 @@ class DualStreamEvaluator(nn.Module):
         self.pixel_extractor = None
         self.scheduler = None
         self._cached_embeds = None
+        self.strength = 0.7  # 默认值
     
     def load(self):
         from diffusers import FluxTransformer2DModel, AutoencoderKL, FluxControlNetModel
@@ -168,10 +170,14 @@ class DualStreamEvaluator(nn.Module):
         if 'pixel_weight' in ckpt:
             self.pixel_weight = ckpt['pixel_weight']
         
+        # 🌟 读取 conditioning_scale
+        if 'conditioning_scale' in ckpt:
+            self.conditioning_scale = ckpt['conditioning_scale']
+        
         self.strength = ckpt.get('strength', 0.7)
         
         print(f"Checkpoint: epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', 0):.2f}")
-        print(f"Pixel Weight: {self.pixel_weight}, Strength: {self.strength}")
+        print(f"Pixel Weight: {self.pixel_weight}, Conditioning Scale: {self.conditioning_scale}, Strength: {self.strength}")
         
         # Cache text embeddings
         print("Caching text embeddings...")
@@ -247,7 +253,10 @@ class DualStreamEvaluator(nn.Module):
         return ids.reshape(h * w, 3)
     
     @torch.no_grad()
-    def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5):
+    def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5, conditioning_scale=None):
+        if conditioning_scale is None:
+            conditioning_scale = self.conditioning_scale
+            
         B, C, H, W = noisy.shape
         device = noisy.device
         dtype = torch.bfloat16
@@ -271,9 +280,11 @@ class DualStreamEvaluator(nn.Module):
         t_input = timestep.to(dtype) if isinstance(timestep, torch.Tensor) else torch.tensor([timestep], device=device, dtype=dtype).expand(B)
         guidance_tensor = torch.full((B,), guidance, device=device, dtype=dtype)
         
+        # 🌟 添加 conditioning_scale
         ctrl_out = self.controlnet(
             hidden_states=noisy_packed,
             controlnet_cond=fused_packed,
+            conditioning_scale=conditioning_scale,  # 🌟 官方参数
             timestep=t_input,
             guidance=guidance_tensor,
             pooled_projections=pooled,
@@ -299,8 +310,12 @@ class DualStreamEvaluator(nn.Module):
         return self._unpack(out, H, W)
     
     @torch.no_grad()
-    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, strength=0.7):
-        """使用官方 Scheduler 的推理"""
+    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, strength=0.7,
+                  conditioning_scale=None, control_guidance_start=0.0, control_guidance_end=1.0):
+        """使用官方 Scheduler 的推理，支持 control_guidance_start/end"""
+        if conditioning_scale is None:
+            conditioning_scale = self.conditioning_scale
+            
         B = lr_lat.shape[0]
         device = lr_lat.device
         dtype = torch.bfloat16
@@ -308,24 +323,42 @@ class DualStreamEvaluator(nn.Module):
         lr_lat = lr_lat.to(dtype)
         lr_pixel = lr_pixel.to(dtype)
         
-        # 设置 timesteps
+        # 🌟 设置 timesteps（严格照搬官方 get_timesteps 逻辑）
         self.scheduler.set_timesteps(num_steps, device=device)
         timesteps = self.scheduler.timesteps
         
-        # 根据 strength 计算起始点
+        # 官方 get_timesteps 逻辑
         init_timestep = min(int(num_steps * strength), num_steps)
         t_start = max(num_steps - init_timestep, 0)
-        timesteps = timesteps[t_start:]
+        timesteps = timesteps[t_start * self.scheduler.order:]
+        
+        # 🌟 设置 scheduler 的 begin_index（如果支持）
+        if hasattr(self.scheduler, 'set_begin_index'):
+            self.scheduler.set_begin_index(t_start * self.scheduler.order)
         
         noise = torch.randn_like(lr_lat)
         
         # 使用官方 scale_noise
         latents = self.scheduler.scale_noise(lr_lat, timesteps[0], noise)
         
+        # 🌟 计算 controlnet_keep（官方 control_guidance_start/end 逻辑）
+        controlnet_keep = []
+        for i, t in enumerate(timesteps):
+            keeps = 1.0 - float(i / len(timesteps) < control_guidance_start or 
+                                (i + 1) / len(timesteps) > control_guidance_end)
+            controlnet_keep.append(keeps)
+        
         # 去噪循环
         for i, t in enumerate(timesteps):
+            # 🌟 当前步的 ControlNet 强度
+            cond_scale = conditioning_scale * controlnet_keep[i]
+            
             timestep_model = t / 1000.0
-            model_output = self.forward(latents, lr_lat, lr_pixel, timestep_model, guidance)
+            model_output = self.forward(
+                latents, lr_lat, lr_pixel, timestep_model, 
+                guidance=guidance, 
+                conditioning_scale=cond_scale
+            )
             latents = self.scheduler.step(model_output, t, latents, return_dict=False)[0]
         
         return latents
@@ -336,13 +369,19 @@ class DualStreamEvaluator(nn.Module):
 # ============================================================================
 
 def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
-                 tile_size=512, overlap=64, blend_mode='linear', strength=0.7):
+                 tile_size=512, overlap=64, blend_mode='linear', strength=0.7,
+                 conditioning_scale=1.0, control_guidance_start=0.0, control_guidance_end=1.0):
     _, _, H, W = lr_t.shape
     
     if H <= tile_size and W <= tile_size:
         lr_lat = evaluator.encode(lr_t)
-        sr_lat = evaluator.inference(lr_lat, lr_t, num_steps=num_steps, 
-                                     guidance=guidance, strength=strength)
+        sr_lat = evaluator.inference(
+            lr_lat, lr_t, num_steps=num_steps, 
+            guidance=guidance, strength=strength,
+            conditioning_scale=conditioning_scale,
+            control_guidance_start=control_guidance_start,
+            control_guidance_end=control_guidance_end
+        )
         return evaluator.decode(sr_lat)
     
     stride = tile_size - overlap
@@ -385,8 +424,13 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
                     tile = padded
                 
                 tile_lat = evaluator.encode(tile)
-                sr_lat = evaluator.inference(tile_lat, tile, num_steps=num_steps, 
-                                            guidance=guidance, strength=strength)
+                sr_lat = evaluator.inference(
+                    tile_lat, tile, num_steps=num_steps, 
+                    guidance=guidance, strength=strength,
+                    conditioning_scale=conditioning_scale,
+                    control_guidance_start=control_guidance_start,
+                    control_guidance_end=control_guidance_end
+                )
                 sr_tile = evaluator.decode(sr_lat)
                 
                 sr_tile = sr_tile[:, :, :tile_h, :tile_w]
@@ -429,6 +473,14 @@ def main():
     parser.add_argument('--strength', type=float, default=None,
                         help='推理起点 (1.0=从纯噪声，0.7=跳过30%)')
     
+    # 🌟 新增 ControlNet 参数
+    parser.add_argument('--conditioning_scale', type=float, default=None,
+                        help='ControlNet 条件强度')
+    parser.add_argument('--control_guidance_start', type=float, default=0.0,
+                        help='ControlNet 开始生效的比例')
+    parser.add_argument('--control_guidance_end', type=float, default=1.0,
+                        help='ControlNet 结束生效的比例')
+    
     parser.add_argument('--tile_size', type=int, default=512)
     parser.add_argument('--overlap', type=int, default=64)
     parser.add_argument('--blend_mode', type=str, default='linear')
@@ -460,20 +512,26 @@ def main():
     
     # Load model
     initial_pixel_weight = args.pixel_weight if args.pixel_weight is not None else 1.0
-    evaluator = DualStreamEvaluator(args.model_name, device, args.checkpoint, initial_pixel_weight)
+    initial_cond_scale = args.conditioning_scale if args.conditioning_scale is not None else 1.0
+    evaluator = DualStreamEvaluator(args.model_name, device, args.checkpoint, 
+                                    initial_pixel_weight, initial_cond_scale)
     evaluator.load()
     
+    # 覆盖参数（如果命令行指定了）
     if args.pixel_weight is not None:
         evaluator.pixel_weight = args.pixel_weight
+    if args.conditioning_scale is not None:
+        evaluator.conditioning_scale = args.conditioning_scale
     
     strength = args.strength if args.strength is not None else evaluator.strength
+    conditioning_scale = evaluator.conditioning_scale
     
     # Experiment name
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if args.exp_name:
         exp_name = args.exp_name
     else:
-        exp_name = f"{ts}_str{strength}_{args.num_steps}step"
+        exp_name = f"{ts}_str{strength}_cond{conditioning_scale}_{args.num_steps}step"
     
     output_dir = os.path.join(args.output_base, args.dataset, 'DualOfficial', exp_name)
     os.makedirs(output_dir, exist_ok=True)
@@ -488,6 +546,8 @@ def main():
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Dataset: {args.dataset}")
     print(f"Strength: {strength}")
+    print(f"Conditioning Scale: {conditioning_scale}")  # 🌟 新增
+    print(f"Control Guidance: [{args.control_guidance_start}, {args.control_guidance_end}]")  # 🌟 新增
     print(f"Pixel Weight: {evaluator.pixel_weight}")
     print(f"Steps: {args.num_steps}, Guidance: {args.guidance}")
     print(f"Output: {output_dir}")
@@ -538,6 +598,7 @@ def main():
         lr_t = torch.from_numpy(lr_bicubic_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
         lr_t = lr_t.to(device).to(torch.bfloat16)
         
+        # 🌟 传入所有参数
         sr_t = run_sr_tiled(
             evaluator, lr_t, device,
             num_steps=args.num_steps,
@@ -545,7 +606,10 @@ def main():
             tile_size=args.tile_size,
             overlap=args.overlap,
             blend_mode=args.blend_mode,
-            strength=strength
+            strength=strength,
+            conditioning_scale=conditioning_scale,
+            control_guidance_start=args.control_guidance_start,
+            control_guidance_end=args.control_guidance_end
         )
         
         sr_np = ((sr_t[0].float().cpu().clamp(-1, 1) + 1) * 127.5).permute(1, 2, 0).numpy().astype(np.uint8)
@@ -595,6 +659,7 @@ def main():
     print("Results")
     print("=" * 70)
     print(f"Strength: {strength}")
+    print(f"Conditioning Scale: {conditioning_scale}")  # 🌟 新增
     print(f"Pixel Weight: {evaluator.pixel_weight}")
     if LPIPS_AVAILABLE:
         print(f"Bicubic:  PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}")
@@ -612,6 +677,8 @@ def main():
         f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Checkpoint: {args.checkpoint}\n")
         f.write(f"Strength: {strength}\n")
+        f.write(f"Conditioning Scale: {conditioning_scale}\n")  # 🌟 新增
+        f.write(f"Control Guidance: [{args.control_guidance_start}, {args.control_guidance_end}]\n")  # 🌟 新增
         f.write(f"Pixel Weight: {evaluator.pixel_weight}\n")
         f.write(f"Dataset: {args.dataset}\n")
         f.write(f"Images: {len(psnr_list)}\n")

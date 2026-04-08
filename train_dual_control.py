@@ -164,12 +164,13 @@ class DualStreamFLUXSR(nn.Module):
     """
     
     def __init__(self, model_name, device, pretrained_controlnet=None, 
-                 train_controlnet=True, pixel_weight=1.0):
+                 train_controlnet=True, pixel_weight=1.0, conditioning_scale=1.0):
         super().__init__()
         self.model_name = model_name
         self.device = device
         self.train_controlnet = train_controlnet
         self.pixel_weight = pixel_weight
+        self.conditioning_scale = conditioning_scale  # 🌟 ControlNet 条件强度
         
         self.vae = None
         self.transformer = None
@@ -319,7 +320,7 @@ class DualStreamFLUXSR(nn.Module):
         ids[..., 2] = torch.arange(w, device=device, dtype=dtype)[None, :]
         return ids.reshape(h * w, 3)
     
-    def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5):
+    def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5, conditioning_scale=None):
         """
         Forward pass: predict velocity
         
@@ -329,7 +330,11 @@ class DualStreamFLUXSR(nn.Module):
             lr_pixel: LR 图像的 pixel tensor
             timestep: 🌟 官方格式的 timestep（已经 / 1000）
             guidance: CFG guidance scale
+            conditioning_scale: 🌟 ControlNet 条件强度（官方参数）
         """
+        if conditioning_scale is None:
+            conditioning_scale = self.conditioning_scale
+            
         B, C, H, W = noisy.shape
         device = noisy.device
         dtype = torch.bfloat16
@@ -358,10 +363,11 @@ class DualStreamFLUXSR(nn.Module):
         t_input = timestep.to(dtype) if isinstance(timestep, torch.Tensor) else torch.tensor([timestep], device=device, dtype=dtype).expand(B)
         guidance_tensor = torch.full((B,), guidance, device=device, dtype=dtype)
         
-        # ControlNet
+        # ControlNet（🌟 添加 conditioning_scale）
         ctrl_out = self.controlnet(
             hidden_states=noisy_packed,
             controlnet_cond=fused_packed,
+            conditioning_scale=conditioning_scale,  # 🌟 官方参数
             timestep=t_input,
             guidance=guidance_tensor,
             pooled_projections=pooled,
@@ -388,15 +394,20 @@ class DualStreamFLUXSR(nn.Module):
         return self._unpack(out, H, W)
     
     @torch.no_grad()
-    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, strength=0.7):
+    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, strength=0.7,
+                  conditioning_scale=None, control_guidance_start=0.0, control_guidance_end=1.0):
         """
         使用官方 Scheduler 的推理
         
         Args:
-            strength: 官方 img2img 语义
-                     1.0 = 从纯噪声开始（完整去噪）
-                     0.7 = 跳过前 30% 步数
+            strength: 官方 img2img 语义 (1.0 = 从纯噪声, 0.7 = 跳过前 30%)
+            conditioning_scale: ControlNet 条件强度
+            control_guidance_start: ControlNet 开始生效的比例 (0.0 = 从头开始)
+            control_guidance_end: ControlNet 结束生效的比例 (1.0 = 到最后)
         """
+        if conditioning_scale is None:
+            conditioning_scale = self.conditioning_scale
+            
         B = lr_lat.shape[0]
         device = lr_lat.device
         dtype = torch.bfloat16
@@ -404,29 +415,47 @@ class DualStreamFLUXSR(nn.Module):
         lr_lat = lr_lat.to(dtype)
         lr_pixel = lr_pixel.to(dtype)
         
-        # 设置 timesteps
+        # 🌟 设置 timesteps（严格照搬官方 get_timesteps 逻辑）
         self.scheduler.set_timesteps(num_steps, device=device)
         timesteps = self.scheduler.timesteps
         
-        # 🌟 根据 strength 计算起始点（官方 img2img 方式）
+        # 官方 get_timesteps 逻辑
         init_timestep = min(int(num_steps * strength), num_steps)
         t_start = max(num_steps - init_timestep, 0)
-        timesteps = timesteps[t_start:]
+        timesteps = timesteps[t_start * self.scheduler.order:]
+        num_inference_steps = len(timesteps)
+        
+        # 🌟 设置 scheduler 的 begin_index（如果支持）
+        if hasattr(self.scheduler, 'set_begin_index'):
+            self.scheduler.set_begin_index(t_start * self.scheduler.order)
         
         # 生成噪声
         noise = torch.randn_like(lr_lat)
         
         # 🌟 使用官方 scale_noise 加噪
-        # scale_noise: sample = sigma * noise + (1 - sigma) * sample
         latents = self.scheduler.scale_noise(lr_lat, timesteps[0], noise)
+        
+        # 🌟 计算 controlnet_keep（官方 control_guidance_start/end 逻辑）
+        controlnet_keep = []
+        for i, t in enumerate(timesteps):
+            keeps = 1.0 - float(i / len(timesteps) < control_guidance_start or 
+                                (i + 1) / len(timesteps) > control_guidance_end)
+            controlnet_keep.append(keeps)
         
         # 去噪循环
         for i, t in enumerate(timesteps):
+            # 🌟 当前步的 ControlNet 强度
+            cond_scale = conditioning_scale * controlnet_keep[i]
+            
             # 🌟 传给模型的 timestep 需要 / 1000
             timestep_model = t / 1000.0
             
             # 预测 velocity
-            model_output = self.forward(latents, lr_lat, lr_pixel, timestep_model, guidance)
+            model_output = self.forward(
+                latents, lr_lat, lr_pixel, timestep_model, 
+                guidance=guidance, 
+                conditioning_scale=cond_scale
+            )
             
             # 🌟 使用官方 scheduler.step 更新
             latents = self.scheduler.step(model_output, t, latents, return_dict=False)[0]
@@ -444,27 +473,33 @@ class DualStreamFLUXSR(nn.Module):
 # Training Functions - 对齐官方 Scheduler
 # ============================================================================
 
-def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, num_train_timesteps=1000):
+def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, guidance=3.5,
+                                conditioning_scale=1.0, num_train_timesteps=1000):
     """
-    Flow Matching Loss - 对齐官方 Scheduler 的 timestep 格式
+    Flow Matching Loss - 对齐官方 Scheduler 的 timestep 分布
     
-    官方 FlowMatchEulerDiscreteScheduler:
-    - sigmas 从 1.0 到 ~0
-    - timestep = sigma * num_train_timesteps
-    - 传给模型: timestep / 1000
-    
-    所以训练时:
-    1. 采样 sigma ~ U[0, 1]
-    2. noisy = sigma * noise + (1 - sigma) * hr_lat
-    3. target_v = noise - hr_lat
-    4. 传给模型: sigma（因为 sigma = timestep / 1000）
+    🌟 改进：从 scheduler.sigmas 采样，而不是均匀采样
+    这样训练时 timestep 分布更接近推理时的分布
     """
     B = hr_lat.shape[0]
     device = hr_lat.device
     dtype = torch.bfloat16
     
-    # 采样 sigma（对应官方的 sigmas）
-    sigma = torch.rand(B, device=device, dtype=dtype)
+    unwrapped = system.module if hasattr(system, 'module') else system
+    
+    # 🌟 从 scheduler.sigmas 采样（如果 scheduler 已初始化）
+    if hasattr(unwrapped, 'scheduler') and unwrapped.scheduler is not None:
+        # 设置一个合理的 num_steps 来获取 sigmas
+        unwrapped.scheduler.set_timesteps(num_train_timesteps, device=device)
+        sigmas = unwrapped.scheduler.sigmas[:-1]  # 排除最后的 0
+        
+        # 随机选择 B 个 sigma
+        indices = torch.randint(0, len(sigmas), (B,), device=device)
+        sigma = sigmas[indices].to(dtype)
+    else:
+        # 回退到均匀采样
+        sigma = torch.rand(B, device=device, dtype=dtype)
+    
     noise = torch.randn_like(hr_lat)
     
     # 🌟 官方加噪: noisy = sigma * noise + (1 - sigma) * sample
@@ -474,9 +509,12 @@ def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, num_train_times
     # 目标: v = noise - hr_lat（flow matching velocity）
     target_v = noise - hr_lat
     
-    # 🌟 传给模型的 timestep = sigma（因为官方是 timestep / 1000，而 timestep = sigma * 1000）
-    unwrapped = system.module if hasattr(system, 'module') else system
-    v_pred = unwrapped.forward(noisy, lr_lat, lr_pixel, sigma)
+    # 🌟 传给模型 sigma，同时传入 guidance 和 conditioning_scale
+    v_pred = unwrapped.forward(
+        noisy, lr_lat, lr_pixel, sigma,
+        guidance=guidance,
+        conditioning_scale=conditioning_scale
+    )
     
     # Loss
     loss = F.mse_loss(v_pred.float(), target_v.float())
@@ -495,8 +533,9 @@ def calculate_psnr(pred, target):
 
 @torch.no_grad()
 def validate(system, accelerator, val_loader, device, num_samples=5, 
-             num_steps=20, strength=0.7):
-    """验证（使用官方 scheduler）"""
+             num_steps=20, guidance=3.5, strength=0.7, conditioning_scale=1.0,
+             control_guidance_start=0.0, control_guidance_end=1.0):
+    """验证（使用官方 scheduler，传入所有参数）"""
     unwrapped = accelerator.unwrap_model(system)
     unwrapped.pixel_extractor.eval()
     unwrapped.controlnet.eval()
@@ -513,7 +552,16 @@ def validate(system, accelerator, val_loader, device, num_samples=5,
         hr_lat = unwrapped.encode(hr)
         lr_lat = unwrapped.encode(lr)
         
-        sr_lat = unwrapped.inference(lr_lat, lr, num_steps=num_steps, strength=strength)
+        # 🌟 传入所有参数
+        sr_lat = unwrapped.inference(
+            lr_lat, lr, 
+            num_steps=num_steps, 
+            guidance=guidance,
+            strength=strength,
+            conditioning_scale=conditioning_scale,
+            control_guidance_start=control_guidance_start,
+            control_guidance_end=control_guidance_end
+        )
         sr = unwrapped.decode(sr_lat)
         
         psnr_list.append(calculate_psnr(sr.float(), hr.float()))
@@ -526,13 +574,16 @@ def validate(system, accelerator, val_loader, device, num_samples=5,
     return np.mean(psnr_list) if psnr_list else 0.0
 
 
-def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, strength, path):
+def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, 
+                    conditioning_scale, strength, path):
+    """保存 checkpoint（包含所有关键参数）"""
     unwrapped = accelerator.unwrap_model(system)
     torch.save({
         'epoch': epoch,
         'loss': loss,
         'psnr': psnr,
         'pixel_weight': pixel_weight,
+        'conditioning_scale': conditioning_scale,  # 🌟 新增
         'strength': strength,
         'pixel_extractor': unwrapped.pixel_extractor.state_dict(),
         'controlnet': unwrapped.controlnet.state_dict(),
@@ -559,12 +610,21 @@ def main():
     parser.add_argument('--pretrained_controlnet', type=str, default=None)
     parser.add_argument('--pixel_weight', type=float, default=1.0)
     
+    # 🌟 ControlNet 参数（官方参数）
+    parser.add_argument('--conditioning_scale', type=float, default=1.0,
+                        help='ControlNet 条件强度')
+    parser.add_argument('--control_guidance_start', type=float, default=0.0,
+                        help='ControlNet 开始生效的比例 (0.0 = 从头开始)')
+    parser.add_argument('--control_guidance_end', type=float, default=1.0,
+                        help='ControlNet 结束生效的比例 (1.0 = 到最后)')
+    
     # Training
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=150)
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--warmup_epochs', type=int, default=5)
-    parser.add_argument('--guidance', type=float, default=3.5)
+    parser.add_argument('--guidance', type=float, default=3.5,
+                        help='CFG guidance scale')
     
     # 🌟 Strength (官方 img2img 语义)
     parser.add_argument('--strength', type=float, default=0.7,
@@ -594,7 +654,7 @@ def main():
     
     # Create save directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_name = f"{timestamp}_official_res{args.resolution}_str{args.strength}"
+    exp_name = f"{timestamp}_official_res{args.resolution}_str{args.strength}_cond{args.conditioning_scale}"
     save_dir = os.path.join(args.save_dir, exp_name)
     
     if is_main:
@@ -609,15 +669,20 @@ def main():
         print(f"Num Crops: {args.num_crops}")
         print(f"Batch Size: {args.batch_size}")
         print(f"Pixel Weight: {args.pixel_weight}")
+        print(f"Conditioning Scale: {args.conditioning_scale}")  # 🌟 新增
+        print(f"Control Guidance: [{args.control_guidance_start}, {args.control_guidance_end}]")  # 🌟 新增
+        print(f"Guidance: {args.guidance}")  # 🌟 新增
         print(f"Strength: {args.strength} (推理时跳过 {(1-args.strength)*100:.0f}% 步数)")
         print(f"Learning Rate: {args.lr} (PixelExtractor: {args.lr * 10})")
         print(f"Save Dir: {save_dir}")
         print("=" * 70 + "\n")
     
-    # Create model
+    # Create model（🌟 传入 conditioning_scale）
     system = DualStreamFLUXSR(
         args.model_name, device, args.pretrained_controlnet,
-        train_controlnet=args.train_controlnet, pixel_weight=args.pixel_weight
+        train_controlnet=args.train_controlnet, 
+        pixel_weight=args.pixel_weight,
+        conditioning_scale=args.conditioning_scale  # 🌟 新增
     )
     
     # Enable gradient checkpointing
@@ -733,7 +798,12 @@ def main():
                 lr_lat = unwrapped.encode(lr)
             
             with accelerator.accumulate(system):
-                loss = compute_flow_matching_loss(system, hr_lat, lr_lat, lr)
+                # 🌟 传入 guidance 和 conditioning_scale
+                loss = compute_flow_matching_loss(
+                    system, hr_lat, lr_lat, lr,
+                    guidance=args.guidance,
+                    conditioning_scale=args.conditioning_scale
+                )
                 
                 accelerator.backward(loss)
                 optimizer.step()
@@ -747,11 +817,19 @@ def main():
         
         avg_loss = np.mean(epoch_losses)
         
-        # Validation
+        # Validation（🌟 传入所有参数）
         val_psnr = 0.0
         if val_loader and (epoch + 1) % args.val_interval == 0:
-            val_psnr = validate(system, accelerator, val_loader, device,
-                               num_samples=5, num_steps=args.val_num_steps, strength=args.strength)
+            val_psnr = validate(
+                system, accelerator, val_loader, device,
+                num_samples=5, 
+                num_steps=args.val_num_steps, 
+                guidance=args.guidance,
+                strength=args.strength,
+                conditioning_scale=args.conditioning_scale,
+                control_guidance_start=args.control_guidance_start,
+                control_guidance_end=args.control_guidance_end
+            )
         
         if is_main:
             lr_current = lr_scheduler.get_last_lr()[0]
@@ -763,14 +841,15 @@ def main():
             
             if val_psnr > best_psnr:
                 best_psnr = val_psnr
+                # 🌟 传入 conditioning_scale
                 save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr,
-                               args.pixel_weight, args.strength,
+                               args.pixel_weight, args.conditioning_scale, args.strength,
                                os.path.join(save_dir, 'best_model.pt'))
                 print(f"  → New best PSNR: {best_psnr:.2f} dB")
             
             if (epoch + 1) % args.save_interval == 0:
                 save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr,
-                               args.pixel_weight, args.strength,
+                               args.pixel_weight, args.conditioning_scale, args.strength,
                                os.path.join(save_dir, f'epoch{epoch+1}.pt'))
             
             torch.cuda.empty_cache()
@@ -780,7 +859,7 @@ def main():
     # Final save
     if is_main:
         save_checkpoint(system, accelerator, args.epochs - 1, avg_loss, best_psnr,
-                       args.pixel_weight, args.strength,
+                       args.pixel_weight, args.conditioning_scale, args.strength,
                        os.path.join(save_dir, 'final_model.pt'))
         
         print("\n" + "=" * 70)
