@@ -1,31 +1,27 @@
 #!/usr/bin/env python
 """
 ======================================================================
-Dual-Stream FLUX SR ControlNet Training - V4
+Dual-Stream FLUX SR ControlNet Training - 对齐官方 Diffusers 流程
 ======================================================================
 
-V4 设计理念：
-- 训练：统一从纯 noise 开始（standard flow matching）
-- 推理：从 noise 和 lr_lat 的插值开始（加速推理）
+核心改动（对比之前版本）：
+1. 使用 FlowMatchEulerDiscreteScheduler 而非自定义 flow matching
+2. 训练时用 scheduler.sigmas 采样，timestep 传入 sigma * 1000
+3. 推理时用 scheduler.scale_noise() 和 scheduler.step()
+4. strength 参数控制推理起点（官方语义）
 
-这样可以利用预训练模型学到的完整去噪轨迹，同时在推理时跳过早期步骤。
-
-基于 V2 的所有修复：
-1. PixelExtractor 学习率 10x 放大
-2. 梯度累积正确使用 accelerator.accumulate() 上下文
-3. Scheduler 只在 sync_gradients 时 step
-4. num_crops 支持
-5. 验证集中心裁剪
+这样确保 frozen FLUX transformer 和预训练 ControlNet 接收的
+timestep/scheduler 语义与官方一致。
 
 Usage:
-    accelerate launch --num_processes=8 \
-        --gradient_accumulation_steps=8 \
-        train_dual_control_v4.py \
+    accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
+        train_dual_control.py \
         --hr_dir Data/DIV2K/DIV2K_train_HR \
         --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --batch_size 4 --epochs 120 --lr 1e-5
+        --batch_size 4 --epochs 120 --lr 1e-5 \
+        --strength 0.7
 """
 
 import os
@@ -45,6 +41,8 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 from tqdm import tqdm
 
+from diffusers import FlowMatchEulerDiscreteScheduler
+
 
 # ============================================================================
 # Pixel Feature Extractor
@@ -54,9 +52,6 @@ class PixelFeatureExtractor(nn.Module):
     """
     从原始像素空间提取高频特征，映射到 Latent 空间维度
     使用 Zero Conv 确保初始化时不破坏预训练 ControlNet
-    
-    Input: RGB image [B, 3, H, W] (H, W = 512)
-    Output: Latent-space features [B, 16, H/8, W/8] (64x64)
     """
     def __init__(self, latent_channels=16):
         super().__init__()
@@ -87,7 +82,7 @@ class PixelFeatureExtractor(nn.Module):
             nn.SiLU(),
         )
         
-        # Zero Conv: 初始化权重为 0
+        # Zero Conv
         self.zero_conv = nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
         nn.init.zeros_(self.zero_conv.weight)
         nn.init.zeros_(self.zero_conv.bias)
@@ -102,15 +97,6 @@ class PixelFeatureExtractor(nn.Module):
 # ============================================================================
 
 class SRDataset(Dataset):
-    """
-    Super-Resolution Dataset
-    
-    Features:
-    - num_crops: 每张图像随机裁剪次数
-    - is_val: 验证集使用中心裁剪
-    - 自动匹配 LR 文件名
-    """
-    
     def __init__(self, hr_dir, lr_dir, resolution=512, num_crops=1, is_val=False):
         self.hr_dir = hr_dir
         self.lr_dir = lr_dir
@@ -126,17 +112,12 @@ class SRDataset(Dataset):
         return len(self.hr_files) * self.num_crops
     
     def _find_lr_file(self, hr_name):
-        """自动查找对应的 LR 文件（适配 DIV2K 等数据集）"""
         base = os.path.splitext(hr_name)[0]
-        
-        # 尝试多种后缀
         for suffix in ['', 'x4', 'x2', '_x4', '_x2']:
             for ext in ['.png', '.jpg', '.jpeg']:
                 candidate = os.path.join(self.lr_dir, base + suffix + ext)
                 if os.path.exists(candidate):
                     return candidate
-        
-        # 回退：直接使用相同文件名
         return os.path.join(self.lr_dir, hr_name)
     
     def __getitem__(self, idx):
@@ -146,35 +127,27 @@ class SRDataset(Dataset):
         hr_img = Image.open(os.path.join(self.hr_dir, hr_name)).convert('RGB')
         lr_img = Image.open(self._find_lr_file(hr_name)).convert('RGB')
         
-        # 裁剪逻辑
         hr_w, hr_h = hr_img.size
         crop_size = self.resolution
         lr_crop_size = crop_size // self.scale
         
         if hr_w >= crop_size and hr_h >= crop_size:
             if self.is_val:
-                # 验证集使用中心裁剪
                 x = (hr_w - crop_size) // 2
                 y = (hr_h - crop_size) // 2
             else:
-                # 训练集使用随机裁剪
                 x = np.random.randint(0, hr_w - crop_size + 1)
                 y = np.random.randint(0, hr_h - crop_size + 1)
             
             hr_crop = hr_img.crop((x, y, x + crop_size, y + crop_size))
-            
-            # 对应 LR 区域
             lr_x, lr_y = x // self.scale, y // self.scale
             lr_crop = lr_img.crop((lr_x, lr_y, lr_x + lr_crop_size, lr_y + lr_crop_size))
         else:
-            # 图像太小，直接 resize
             hr_crop = hr_img.resize((crop_size, crop_size), Image.BICUBIC)
             lr_crop = lr_img.resize((lr_crop_size, lr_crop_size), Image.BICUBIC)
         
-        # Bicubic upsample LR to match HR size
         lr_up = lr_crop.resize((crop_size, crop_size), Image.BICUBIC)
         
-        # To tensor [-1, 1]
         hr_t = torch.from_numpy(np.array(hr_crop)).float().permute(2, 0, 1) / 127.5 - 1
         lr_t = torch.from_numpy(np.array(lr_up)).float().permute(2, 0, 1) / 127.5 - 1
         
@@ -182,14 +155,12 @@ class SRDataset(Dataset):
 
 
 # ============================================================================
-# Dual-Stream FLUX SR System
+# Dual-Stream FLUX SR System - 对齐官方流程
 # ============================================================================
 
 class DualStreamFLUXSR(nn.Module):
     """
-    Dual-Stream FLUX SR System
-    
-    V4: 训练统一从纯 noise 开始（standard flow matching）
+    Dual-Stream FLUX SR System - 使用官方 Scheduler
     """
     
     def __init__(self, model_name, device, pretrained_controlnet=None, 
@@ -204,6 +175,7 @@ class DualStreamFLUXSR(nn.Module):
         self.transformer = None
         self.controlnet = None
         self.pixel_extractor = None
+        self.scheduler = None
         self._cached_embeds = None
         
         self._load_models(pretrained_controlnet)
@@ -214,32 +186,36 @@ class DualStreamFLUXSR(nn.Module):
         import time
         
         dtype = torch.bfloat16
-        
-        # 错峰加载
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         if local_rank > 0:
             time.sleep(local_rank * 5)
+        
+        # Load Scheduler（关键！）
+        print(f"[Rank {local_rank}] Loading Scheduler...")
+        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            self.model_name, subfolder="scheduler"
+        )
         
         # Load VAE
         print(f"[Rank {local_rank}] Loading VAE...")
         self.vae = AutoencoderKL.from_pretrained(
             self.model_name, subfolder="vae", torch_dtype=dtype
         ).to(self.device)
-        self.vae.eval()
         self.vae.requires_grad_(False)
+        self.vae.eval()
         self.vae.enable_tiling()
         
-        # Load Transformer
-        print(f"[Rank {local_rank}] Loading Transformer...")
+        # Load Transformer (frozen)
+        print(f"[Rank {local_rank}] Loading FLUX Transformer...")
         self.transformer = FluxTransformer2DModel.from_pretrained(
             self.model_name, subfolder="transformer", torch_dtype=dtype
         ).to(self.device)
-        self.transformer.eval()
         self.transformer.requires_grad_(False)
+        self.transformer.eval()
         
         # Load ControlNet
-        print(f"[Rank {local_rank}] Loading ControlNet...")
         controlnet_path = pretrained_controlnet or "jasperai/Flux.1-dev-Controlnet-Upscaler"
+        print(f"[Rank {local_rank}] Loading ControlNet from {controlnet_path}...")
         self.controlnet = FluxControlNetModel.from_pretrained(
             controlnet_path, torch_dtype=dtype
         ).to(self.device)
@@ -251,112 +227,121 @@ class DualStreamFLUXSR(nn.Module):
             self.controlnet.eval()
             self.controlnet.requires_grad_(False)
         
-        # Create Pixel Extractor
-        print(f"[Rank {local_rank}] Creating Pixel Extractor...")
+        # Pixel Feature Extractor
+        print(f"[Rank {local_rank}] Initializing Pixel Feature Extractor...")
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         self.pixel_extractor.train()
         
-        # Cache text embeddings
-        print(f"[Rank {local_rank}] Encoding text embeddings...")
+        # Cache text embeddings (空字符串)
+        print(f"[Rank {local_rank}] Caching text embeddings...")
         self._cache_text_embeddings()
         
-        # Memory optimization
+        # Enable Flash Attention
         try:
             self.transformer.enable_xformers_memory_efficient_attention()
             self.controlnet.enable_xformers_memory_efficient_attention()
-        except:
-            pass  # Fall back to PyTorch 2.0 SDPA
+            if local_rank == 0:
+                print("[Flash] ✓ Enabled xformers memory efficient attention")
+        except Exception:
+            if local_rank == 0:
+                print("[Flash] Using PyTorch 2.0 SDPA")
         
-        print(f"[Rank {local_rank}] Models loaded!")
+        print(f"[Rank {local_rank}] ✓ All models loaded")
     
     def _cache_text_embeddings(self):
+        """缓存空文本的 embeddings"""
         from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
         
         dtype = torch.bfloat16
-        prompt = "high resolution, 4K, detailed, sharp"
         
         # CLIP
-        clip_tok = CLIPTokenizer.from_pretrained(self.model_name, subfolder="tokenizer")
-        clip_model = CLIPTextModel.from_pretrained(
+        text_enc = CLIPTextModel.from_pretrained(
             self.model_name, subfolder="text_encoder", torch_dtype=dtype
         ).to(self.device)
-        clip_model.eval()
-        
-        clip_ids = clip_tok(prompt, max_length=77, padding="max_length",
-                            truncation=True, return_tensors="pt").input_ids.to(self.device)
-        pooled = clip_model(clip_ids).pooler_output
-        
-        del clip_model, clip_tok
-        gc.collect()
-        torch.cuda.empty_cache()
+        tok = CLIPTokenizer.from_pretrained(self.model_name, subfolder="tokenizer")
         
         # T5
-        t5_tok = T5TokenizerFast.from_pretrained(self.model_name, subfolder="tokenizer_2")
-        t5_model = T5EncoderModel.from_pretrained(
+        text_enc_2 = T5EncoderModel.from_pretrained(
             self.model_name, subfolder="text_encoder_2", torch_dtype=dtype
         ).to(self.device)
-        t5_model.eval()
+        tok_2 = T5TokenizerFast.from_pretrained(self.model_name, subfolder="tokenizer_2")
         
-        t5_ids = t5_tok(prompt, max_length=512, padding="max_length",
-                        truncation=True, return_tensors="pt").input_ids.to(self.device)
-        t5_out = t5_model(t5_ids).last_hidden_state
+        with torch.no_grad():
+            clip_out = text_enc(tok([""], padding="max_length", max_length=77,
+                                    truncation=True, return_tensors="pt").input_ids.to(self.device))
+            t5_out = text_enc_2(tok_2([""], padding="max_length", max_length=512,
+                                      truncation=True, return_tensors="pt").input_ids.to(self.device))
+            self._cached_embeds = {
+                'pooled': clip_out.pooler_output.to(dtype),
+                'prompt': t5_out[0].to(dtype),
+                'text_ids': torch.zeros(t5_out[0].shape[1], 3, device=self.device, dtype=dtype),
+            }
         
-        del t5_model, t5_tok
-        gc.collect()
+        del text_enc, text_enc_2
         torch.cuda.empty_cache()
-        
-        self._cached_embeds = {
-            'pooled': pooled.detach(),
-            'prompt': t5_out.detach(),
-            'text_ids': torch.zeros(512, 3, device=self.device, dtype=dtype)
-        }
+        gc.collect()
     
     def encode(self, img):
-        """Encode image to latent (with shift_factor correction)"""
-        raw = self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample()
-        # FLUX VAE 需要 shift_factor 校正
-        shift = getattr(self.vae.config, 'shift_factor', 0.0)
-        return (raw - shift) * self.vae.config.scaling_factor
+        """Encode image to latent (FLUX VAE with shift_factor)"""
+        lat = self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample()
+        if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
+            lat = (lat - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+        else:
+            lat = lat * self.vae.config.scaling_factor
+        return lat
     
     def decode(self, lat):
-        """Decode latent to image (with shift_factor correction)"""
-        shift = getattr(self.vae.config, 'shift_factor', 0.0)
-        lat_unscaled = lat / self.vae.config.scaling_factor + shift
-        return self.vae.decode(lat_unscaled.to(self.vae.dtype)).sample
+        """Decode latent to image"""
+        if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
+            lat = (lat / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+        else:
+            lat = lat / self.vae.config.scaling_factor
+        return self.vae.decode(lat.to(self.vae.dtype)).sample
     
     def _pack(self, x):
+        """Pack latent: [B, C, H, W] -> [B, H*W/4, C*4]"""
         B, C, H, W = x.shape
         x = x.view(B, C, H // 2, 2, W // 2, 2).permute(0, 2, 4, 1, 3, 5)
         return x.reshape(B, (H // 2) * (W // 2), C * 4)
     
     def _unpack(self, x, H, W):
+        """Unpack transformer output"""
         B, _, D = x.shape
         C = D // 4
         x = x.view(B, H // 2, W // 2, C, 2, 2).permute(0, 3, 1, 4, 2, 5)
         return x.reshape(B, C, H, W)
     
     def _img_ids(self, H, W, device, dtype):
+        """Generate image position IDs"""
         h, w = H // 2, W // 2
         ids = torch.zeros(h, w, 3, device=device, dtype=dtype)
         ids[..., 1] = torch.arange(h, device=device, dtype=dtype)[:, None]
         ids[..., 2] = torch.arange(w, device=device, dtype=dtype)[None, :]
         return ids.reshape(h * w, 3)
     
-    def forward(self, noisy, lr_lat, lr_pixel, t, guidance=3.5):
-        """Forward pass: predict velocity"""
+    def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5):
+        """
+        Forward pass: predict velocity
+        
+        Args:
+            noisy: 当前 noisy latent
+            lr_lat: LR 图像的 latent
+            lr_pixel: LR 图像的 pixel tensor
+            timestep: 🌟 官方格式的 timestep（已经 / 1000）
+            guidance: CFG guidance scale
+        """
         B, C, H, W = noisy.shape
         device = noisy.device
         dtype = torch.bfloat16
         
         # Pixel features
         pixel_feat = self.pixel_extractor(lr_pixel)
-        
         if pixel_feat.shape[-2:] != lr_lat.shape[-2:]:
             pixel_feat = F.interpolate(
                 pixel_feat, size=lr_lat.shape[-2:], mode='bilinear', align_corners=False
             )
         
-        # Fuse
+        # Fuse: lr_lat + pixel features
         fused_cond = (lr_lat + self.pixel_weight * pixel_feat).to(dtype)
         
         # Pack
@@ -369,7 +354,8 @@ class DualStreamFLUXSR(nn.Module):
         prompt = self._cached_embeds['prompt'].expand(B, -1, -1)
         text_ids = self._cached_embeds['text_ids']
         
-        t_input = t.to(dtype)
+        # 🌟 timestep 已经是 / 1000 后的值，直接使用
+        t_input = timestep.to(dtype) if isinstance(timestep, torch.Tensor) else torch.tensor([timestep], device=device, dtype=dtype).expand(B)
         guidance_tensor = torch.full((B,), guidance, device=device, dtype=dtype)
         
         # ControlNet
@@ -402,15 +388,14 @@ class DualStreamFLUXSR(nn.Module):
         return self._unpack(out, H, W)
     
     @torch.no_grad()
-    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, start_t=0.7):
+    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, strength=0.7):
         """
-        V4 推理：从 noise 和 lr_lat 的插值开始
-        
-        训练时从纯 noise 开始，但推理时可以从中间点开始加速。
+        使用官方 Scheduler 的推理
         
         Args:
-            start_t: 起点的噪声比例 (0=lr_lat, 1=noise)
-                     默认 0.7 表示 70% noise + 30% lr_lat
+            strength: 官方 img2img 语义
+                     1.0 = 从纯噪声开始（完整去噪）
+                     0.7 = 跳过前 30% 步数
         """
         B = lr_lat.shape[0]
         device = lr_lat.device
@@ -419,27 +404,36 @@ class DualStreamFLUXSR(nn.Module):
         lr_lat = lr_lat.to(dtype)
         lr_pixel = lr_pixel.to(dtype)
         
+        # 设置 timesteps
+        self.scheduler.set_timesteps(num_steps, device=device)
+        timesteps = self.scheduler.timesteps
+        
+        # 🌟 根据 strength 计算起始点（官方 img2img 方式）
+        init_timestep = min(int(num_steps * strength), num_steps)
+        t_start = max(num_steps - init_timestep, 0)
+        timesteps = timesteps[t_start:]
+        
+        # 生成噪声
         noise = torch.randn_like(lr_lat)
         
-        # 🌟 V4 核心：从插值点开始
-        # lat = start_t * noise + (1 - start_t) * lr_lat
-        lat = start_t * noise + (1 - start_t) * lr_lat
+        # 🌟 使用官方 scale_noise 加噪
+        # scale_noise: sample = sigma * noise + (1 - sigma) * sample
+        latents = self.scheduler.scale_noise(lr_lat, timesteps[0], noise)
         
-        # 跳过前 (1 - start_t) 比例的步数
-        start_step = round((1.0 - start_t) * num_steps)
-        dt = 1.0 / num_steps
+        # 去噪循环
+        for i, t in enumerate(timesteps):
+            # 🌟 传给模型的 timestep 需要 / 1000
+            timestep_model = t / 1000.0
+            
+            # 预测 velocity
+            model_output = self.forward(latents, lr_lat, lr_pixel, timestep_model, guidance)
+            
+            # 🌟 使用官方 scheduler.step 更新
+            latents = self.scheduler.step(model_output, t, latents, return_dict=False)[0]
         
-        # 从 start_step 开始积分
-        for i in range(start_step, num_steps):
-            t_val = 1.0 - i * dt
-            t = torch.full((B,), t_val, device=device, dtype=dtype)
-            v = self.forward(lat, lr_lat, lr_pixel, t, guidance)
-            lat = lat - dt * v
-        
-        return lat
+        return latents
     
     def get_trainable_params(self):
-        """Get trainable parameters"""
         params = list(self.pixel_extractor.parameters())
         if self.train_controlnet:
             params += list(self.controlnet.parameters())
@@ -447,41 +441,50 @@ class DualStreamFLUXSR(nn.Module):
 
 
 # ============================================================================
-# Training Functions
+# Training Functions - 对齐官方 Scheduler
 # ============================================================================
 
-def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel):
+def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, num_train_timesteps=1000):
     """
-    V4: Standard Flow Matching Loss（统一从纯 noise 开始）
+    Flow Matching Loss - 对齐官方 Scheduler 的 timestep 格式
     
-    轨迹：noise (t=1) → hr_lat (t=0)
+    官方 FlowMatchEulerDiscreteScheduler:
+    - sigmas 从 1.0 到 ~0
+    - timestep = sigma * num_train_timesteps
+    - 传给模型: timestep / 1000
+    
+    所以训练时:
+    1. 采样 sigma ~ U[0, 1]
+    2. noisy = sigma * noise + (1 - sigma) * hr_lat
+    3. target_v = noise - hr_lat
+    4. 传给模型: sigma（因为 sigma = timestep / 1000）
     """
     B = hr_lat.shape[0]
     device = hr_lat.device
     dtype = torch.bfloat16
     
-    t = torch.rand(B, device=device, dtype=dtype)
+    # 采样 sigma（对应官方的 sigmas）
+    sigma = torch.rand(B, device=device, dtype=dtype)
     noise = torch.randn_like(hr_lat)
     
-    # 插值：x_t = t * noise + (1 - t) * hr_lat
-    t_expand = t.view(B, 1, 1, 1)
-    x_t = t_expand * noise + (1 - t_expand) * hr_lat
+    # 🌟 官方加噪: noisy = sigma * noise + (1 - sigma) * sample
+    sigma_expand = sigma.view(B, 1, 1, 1)
+    noisy = sigma_expand * noise + (1 - sigma_expand) * hr_lat
     
-    # 目标速度：v = noise - hr_lat
+    # 目标: v = noise - hr_lat（flow matching velocity）
     target_v = noise - hr_lat
     
-    # 预测
+    # 🌟 传给模型的 timestep = sigma（因为官方是 timestep / 1000，而 timestep = sigma * 1000）
     unwrapped = system.module if hasattr(system, 'module') else system
-    v_pred = unwrapped.forward(x_t, lr_lat, lr_pixel, t)
+    v_pred = unwrapped.forward(noisy, lr_lat, lr_pixel, sigma)
     
-    # Loss (float32 计算)
+    # Loss
     loss = F.mse_loss(v_pred.float(), target_v.float())
     
     return loss
 
 
 def calculate_psnr(pred, target):
-    """Calculate PSNR between tensors in [-1, 1]"""
     pred = (pred.clamp(-1, 1) + 1) / 2
     target = (target + 1) / 2
     mse = F.mse_loss(pred, target)
@@ -491,10 +494,9 @@ def calculate_psnr(pred, target):
 
 
 @torch.no_grad()
-def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=20, start_t=0.7):
-    """
-    V4 验证：推理时从插值点开始
-    """
+def validate(system, accelerator, val_loader, device, num_samples=5, 
+             num_steps=20, strength=0.7):
+    """验证（使用官方 scheduler）"""
     unwrapped = accelerator.unwrap_model(system)
     unwrapped.pixel_extractor.eval()
     unwrapped.controlnet.eval()
@@ -511,8 +513,7 @@ def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=2
         hr_lat = unwrapped.encode(hr)
         lr_lat = unwrapped.encode(lr)
         
-        # 🌟 V4：推理从插值点开始
-        sr_lat = unwrapped.inference(lr_lat, lr, num_steps=num_steps, start_t=start_t)
+        sr_lat = unwrapped.inference(lr_lat, lr, num_steps=num_steps, strength=strength)
         sr = unwrapped.decode(sr_lat)
         
         psnr_list.append(calculate_psnr(sr.float(), hr.float()))
@@ -525,14 +526,14 @@ def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=2
     return np.mean(psnr_list) if psnr_list else 0.0
 
 
-def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, path):
-    """Save checkpoint"""
+def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, strength, path):
     unwrapped = accelerator.unwrap_model(system)
     torch.save({
         'epoch': epoch,
         'loss': loss,
         'psnr': psnr,
         'pixel_weight': pixel_weight,
+        'strength': strength,
         'pixel_extractor': unwrapped.pixel_extractor.state_dict(),
         'controlnet': unwrapped.controlnet.state_dict(),
     }, path)
@@ -543,7 +544,7 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, path):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Dual-Stream FLUX SR Training V4')
+    parser = argparse.ArgumentParser(description='Dual-Stream FLUX SR Training (Official Scheduler)')
     
     # Data
     parser.add_argument('--hr_dir', type=str, required=True)
@@ -551,8 +552,7 @@ def main():
     parser.add_argument('--val_hr_dir', type=str, default=None)
     parser.add_argument('--val_lr_dir', type=str, default=None)
     parser.add_argument('--resolution', type=int, default=512)
-    parser.add_argument('--num_crops', type=int, default=2,
-                        help='Random crops per image per epoch')
+    parser.add_argument('--num_crops', type=int, default=2)
     
     # Model
     parser.add_argument('--model_name', type=str, default='black-forest-labs/FLUX.1-dev')
@@ -566,14 +566,13 @@ def main():
     parser.add_argument('--warmup_epochs', type=int, default=5)
     parser.add_argument('--guidance', type=float, default=3.5)
     
-    # V4: 推理起点参数
-    parser.add_argument('--start_t', type=float, default=0.7,
-                        help='推理起点的噪声比例 (0=lr_lat, 1=noise)')
-    parser.add_argument('--val_num_steps', type=int, default=20,
-                        help='验证时的推理步数')
+    # 🌟 Strength (官方 img2img 语义)
+    parser.add_argument('--strength', type=float, default=0.7,
+                        help='推理时的 strength (1.0=从纯噪声开始，0.7=跳过前30%步数)')
+    parser.add_argument('--val_num_steps', type=int, default=20)
     
     # Checkpointing
-    parser.add_argument('--save_dir', type=str, default='./checkpoints/dual_control_v4')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints/dual_control')
     parser.add_argument('--save_interval', type=int, default=10)
     parser.add_argument('--val_interval', type=int, default=1)
     parser.add_argument('--resume', type=str, default=None)
@@ -588,26 +587,21 @@ def main():
     if args.freeze_controlnet:
         args.train_controlnet = False
     
-    # Initialize accelerator
-    accelerator = Accelerator(
-        mixed_precision='bf16',
-    )
-    
+    accelerator = Accelerator(mixed_precision='bf16')
     device = accelerator.device
     is_main = accelerator.is_main_process
     set_seed(args.seed)
     
     # Create save directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_name = f"{timestamp}_dual_v4_res{args.resolution}_crop{args.num_crops}"
+    exp_name = f"{timestamp}_official_res{args.resolution}_str{args.strength}"
     save_dir = os.path.join(args.save_dir, exp_name)
     
     if is_main:
         os.makedirs(save_dir, exist_ok=True)
         
-        # 打印配置
         print("\n" + "=" * 70)
-        print("FLUX SR Training with Dual-Stream ControlNet - V4")
+        print("FLUX SR Training - 对齐官方 Diffusers 流程")
         print("=" * 70)
         print(f"\nHR Dir: {args.hr_dir}")
         print(f"LR Dir: {args.lr_dir}")
@@ -615,18 +609,15 @@ def main():
         print(f"Num Crops: {args.num_crops}")
         print(f"Batch Size: {args.batch_size}")
         print(f"Pixel Weight: {args.pixel_weight}")
-        print(f"Training: Standard Flow (noise → hr)")
-        print(f"Inference: start_t={args.start_t} ({args.start_t*100:.0f}% noise + {(1-args.start_t)*100:.0f}% lr)")
+        print(f"Strength: {args.strength} (推理时跳过 {(1-args.strength)*100:.0f}% 步数)")
         print(f"Learning Rate: {args.lr} (PixelExtractor: {args.lr * 10})")
-        print(f"Warmup Epochs: {args.warmup_epochs}")
         print(f"Save Dir: {save_dir}")
         print("=" * 70 + "\n")
     
     # Create model
-    train_controlnet = args.train_controlnet
     system = DualStreamFLUXSR(
         args.model_name, device, args.pretrained_controlnet,
-        train_controlnet=train_controlnet, pixel_weight=args.pixel_weight
+        train_controlnet=args.train_controlnet, pixel_weight=args.pixel_weight
     )
     
     # Enable gradient checkpointing
@@ -636,7 +627,7 @@ def main():
         system.controlnet.enable_gradient_checkpointing()
     
     # Optimizer groups (PixelExtractor 10x LR)
-    if train_controlnet:
+    if args.train_controlnet:
         optimizer_grouped_parameters = [
             {"params": system.controlnet.parameters(), "lr": args.lr},
             {"params": system.pixel_extractor.parameters(), "lr": args.lr * 10.0}
@@ -646,13 +637,11 @@ def main():
             {"params": system.pixel_extractor.parameters(), "lr": args.lr * 10.0}
         ]
     
-    trainable_params = system.get_trainable_params()
-    
     if is_main:
-        total_params = sum(p.numel() for p in trainable_params)
+        total_params = sum(p.numel() for p in system.get_trainable_params())
         print(f"[Training] Trainable parameters: {total_params:,}")
     
-    # Create datasets
+    # Datasets
     train_dataset = SRDataset(
         args.hr_dir, args.lr_dir, args.resolution,
         num_crops=args.num_crops, is_val=False
@@ -671,9 +660,6 @@ def main():
         val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
         if is_main:
             print(f"[Data] Training: {len(train_dataset)}, Validation: {len(val_dataset)}")
-    else:
-        if is_main:
-            print(f"[Data] Training: {len(train_dataset)}")
     
     # Optimizer and scheduler
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01)
@@ -687,11 +673,11 @@ def main():
         progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
     
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
-    # Prepare with Accelerator
-    system, optimizer, train_loader, scheduler = accelerator.prepare(
-        system, optimizer, train_loader, scheduler
+    # Prepare
+    system, optimizer, train_loader, lr_scheduler = accelerator.prepare(
+        system, optimizer, train_loader, lr_scheduler
     )
     
     # Resume
@@ -704,52 +690,38 @@ def main():
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         
         unwrapped = accelerator.unwrap_model(system)
-        
         if 'pixel_extractor' in ckpt:
             state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
             unwrapped.pixel_extractor.load_state_dict(state)
-        
-        if train_controlnet and 'controlnet' in ckpt:
+        if args.train_controlnet and 'controlnet' in ckpt:
             state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
             unwrapped.controlnet.load_state_dict(state)
         
         start_epoch = ckpt.get('epoch', 0) + 1
         best_psnr = ckpt.get('psnr', 0.0)
-        
         if is_main:
             print(f"[Resume] Starting from epoch {start_epoch}, best PSNR: {best_psnr:.2f}")
     
-    # 初始化 log 文件
+    # Log file
     log_path = os.path.join(save_dir, 'training_log.txt')
     if is_main:
         with open(log_path, 'w') as f:
-            f.write("=" * 70 + "\n")
-            f.write("FLUX SR Training with Dual-Stream ControlNet - V4\n")
-            f.write("=" * 70 + "\n\n")
-            f.write(f"HR Dir: {args.hr_dir}\n")
-            f.write(f"LR Dir: {args.lr_dir}\n")
-            f.write(f"Resolution: {args.resolution}\n")
-            f.write(f"Num Crops: {args.num_crops}\n")
-            f.write(f"Batch Size: {args.batch_size}\n")
-            f.write(f"Pixel Weight: {args.pixel_weight}\n")
-            f.write(f"Training: Standard Flow (noise → hr)\n")
-            f.write(f"Inference: start_t={args.start_t}\n")
-            f.write(f"Learning Rate: {args.lr} (PixelExtractor: {args.lr * 10})\n")
-            f.write(f"Warmup Epochs: {args.warmup_epochs}\n\n")
+            f.write("FLUX SR Training - Official Scheduler\n")
+            f.write("=" * 60 + "\n")
+            f.write(f"Strength: {args.strength}\n")
+            f.write(f"Pixel Weight: {args.pixel_weight}\n\n")
     
     # Training loop
     if is_main:
         print("\n[Training] Starting...\n")
     
     for epoch in range(start_epoch, args.epochs):
-        # Set train mode
         unwrapped = accelerator.unwrap_model(system)
         unwrapped.pixel_extractor.train()
-        if train_controlnet:
+        if args.train_controlnet:
             unwrapped.controlnet.train()
         
         epoch_losses = []
-        
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=not is_main)
         
         for batch in pbar:
@@ -760,7 +732,6 @@ def main():
                 hr_lat = unwrapped.encode(hr)
                 lr_lat = unwrapped.encode(lr)
             
-            # V4: 只用 standard flow matching
             with accelerator.accumulate(system):
                 loss = compute_flow_matching_loss(system, hr_lat, lr_lat, lr)
                 
@@ -768,50 +739,39 @@ def main():
                 optimizer.step()
                 optimizer.zero_grad()
             
-            # 只在梯度同步时更新学习率
             if accelerator.sync_gradients:
-                scheduler.step()
+                lr_scheduler.step()
             
             epoch_losses.append(loss.item())
-            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{scheduler.get_last_lr()[0]:.2e}'})
+            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{lr_scheduler.get_last_lr()[0]:.2e}'})
         
         avg_loss = np.mean(epoch_losses)
         
         # Validation
         val_psnr = 0.0
         if val_loader and (epoch + 1) % args.val_interval == 0:
-            val_psnr = validate(system, accelerator, val_loader, device, 
-                               num_samples=5, num_steps=args.val_num_steps, start_t=args.start_t)
+            val_psnr = validate(system, accelerator, val_loader, device,
+                               num_samples=5, num_steps=args.val_num_steps, strength=args.strength)
         
-        # Logging and saving (main process)
         if is_main:
-            lr_current = scheduler.get_last_lr()[0]
-            
-            # 写入 log 文件
+            lr_current = lr_scheduler.get_last_lr()[0]
             log_line = f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, LR={lr_current:.2e}\n"
             with open(log_path, 'a') as f:
                 f.write(log_line)
             
-            # 打印
             print(f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, lr={lr_current:.2e}")
             
-            # Save best
             if val_psnr > best_psnr:
                 best_psnr = val_psnr
-                save_checkpoint(
-                    system, accelerator, epoch, avg_loss, val_psnr, 
-                    args.pixel_weight,
-                    os.path.join(save_dir, 'best_model.pt')
-                )
+                save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr,
+                               args.pixel_weight, args.strength,
+                               os.path.join(save_dir, 'best_model.pt'))
                 print(f"  → New best PSNR: {best_psnr:.2f} dB")
             
-            # Periodic save
             if (epoch + 1) % args.save_interval == 0:
-                save_checkpoint(
-                    system, accelerator, epoch, avg_loss, val_psnr, 
-                    args.pixel_weight,
-                    os.path.join(save_dir, f'epoch{epoch+1}.pt')
-                )
+                save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr,
+                               args.pixel_weight, args.strength,
+                               os.path.join(save_dir, f'epoch{epoch+1}.pt'))
             
             torch.cuda.empty_cache()
         
@@ -819,11 +779,9 @@ def main():
     
     # Final save
     if is_main:
-        save_checkpoint(
-            system, accelerator, args.epochs - 1, avg_loss, best_psnr, 
-            args.pixel_weight,
-            os.path.join(save_dir, 'final_model.pt')
-        )
+        save_checkpoint(system, accelerator, args.epochs - 1, avg_loss, best_psnr,
+                       args.pixel_weight, args.strength,
+                       os.path.join(save_dir, 'final_model.pt'))
         
         print("\n" + "=" * 70)
         print("Training Complete!")
