@@ -497,7 +497,7 @@ class DualStreamFLUXSR(nn.Module):
 # Training Functions - Aligned with Official Scheduler
 # ============================================================================
 
-def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel):
+def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, num_train_timesteps=None):
     """
     Flow Matching Loss - Aligned with official Scheduler timestep format
     
@@ -519,7 +519,12 @@ def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel):
     # Sample sigma from scheduler.sigmas (not manual U[0,1])
     # This preserves shift / dynamic shifting config semantics
     unwrapped = system.module if hasattr(system, 'module') else system
-    
+    if num_train_timesteps is None:
+        num_train_timesteps = getattr(unwrapped.scheduler.config, "num_train_timesteps", 1000)
+
+    set_scheduler_timesteps_for_latent(
+        unwrapped.scheduler, hr_lat, num_train_timesteps, hr_lat.device
+    )
     # Initialize sigmas using the current latent shape so dynamic shifting receives mu when required
     set_scheduler_timesteps_for_latent(unwrapped.scheduler, hr_lat, num_train_timesteps, device)
 
