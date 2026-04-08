@@ -1,16 +1,21 @@
 #!/usr/bin/env python
 """
 ======================================================================
-Dual-Stream FLUX SR Evaluation - V2
+Dual-Stream FLUX SR Evaluation - V4
 ======================================================================
 
-与 train_dual_control_v2.py 完全匹配
+V4 设计理念：
+- 训练：统一从纯 noise 开始（standard flow matching）
+- 推理：从 noise 和 lr_lat 的插值开始（加速推理）
+
+与 train_dual_control_v4.py 配套使用
 
 Usage:
-    python evaluate_dual_control_v2.py \
+    python evaluate_dual_control_v4.py \
+        --checkpoint checkpoints/dual_control_v4/xxx/best_model.pt \
         --hr_dir Data/DIV2K/DIV2K_valid_HR \
         --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --tile_size 1024 --overlap 128  --checkpoint checkpoints/dual_control/xxx/best_model.pt
+        --start_t 0.7 --num_steps 20
 """
 
 import os
@@ -103,20 +108,21 @@ def calculate_ssim(img1, img2):
 # Evaluator
 # ============================================================================
 
-class DualStreamEvaluator:
-    def __init__(self, model_name, device, checkpoint_path=None, pixel_weight=1.0):
+class DualStreamEvaluator(nn.Module):
+    """V4 Evaluator: 推理从 noise 和 lr_lat 插值开始"""
+    
+    def __init__(self, model_name, device, checkpoint_path, pixel_weight=1.0):
+        super().__init__()
         self.model_name = model_name
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.pixel_weight = pixel_weight
-        self.flow_mode = 'standard'  # 默认
         
         self.vae = None
         self.transformer = None
         self.controlnet = None
         self.pixel_extractor = None
         self._cached_embeds = None
-        self.ckpt_info = {}
     
     def load(self):
         from diffusers import FluxTransformer2DModel, AutoencoderKL, FluxControlNetModel
@@ -124,92 +130,113 @@ class DualStreamEvaluator:
         
         dtype = torch.bfloat16
         
-        # Load VAE
+        print("Loading VAE...")
         self.vae = AutoencoderKL.from_pretrained(
             self.model_name, subfolder="vae", torch_dtype=dtype
         ).to(self.device)
-        self.vae.requires_grad_(False)
+        self.vae.eval()
+        self.vae.enable_tiling()
         
-        # Cache embeddings
-        text_enc = CLIPTextModel.from_pretrained(
-            self.model_name, subfolder="text_encoder", torch_dtype=dtype
-        ).to(self.device)
-        text_enc_2 = T5EncoderModel.from_pretrained(
-            self.model_name, subfolder="text_encoder_2", torch_dtype=dtype
-        ).to(self.device)
-        tok = CLIPTokenizer.from_pretrained(self.model_name, subfolder="tokenizer")
-        tok_2 = T5TokenizerFast.from_pretrained(self.model_name, subfolder="tokenizer_2")
-        
-        with torch.no_grad():
-            clip_out = text_enc(tok([""], padding="max_length", max_length=77,
-                                    truncation=True, return_tensors="pt").input_ids.to(self.device))
-            t5_out = text_enc_2(tok_2([""], padding="max_length", max_length=512,
-                                      truncation=True, return_tensors="pt").input_ids.to(self.device))
-            self._cached_embeds = {
-                'pooled': clip_out.pooler_output.to(dtype),
-                'prompt': t5_out[0].to(dtype),
-                'text_ids': torch.zeros(t5_out[0].shape[1], 3, device=self.device, dtype=dtype),
-            }
-        
-        del text_enc, text_enc_2
-        torch.cuda.empty_cache()
-        gc.collect()
-        
-        # Load Transformer
+        print("Loading Transformer...")
         self.transformer = FluxTransformer2DModel.from_pretrained(
             self.model_name, subfolder="transformer", torch_dtype=dtype
         ).to(self.device)
-        self.transformer.requires_grad_(False)
+        self.transformer.eval()
         
-        # Load ControlNet
+        print("Loading ControlNet...")
         self.controlnet = FluxControlNetModel.from_pretrained(
             "jasperai/Flux.1-dev-Controlnet-Upscaler", torch_dtype=dtype
         ).to(self.device)
-        
-        # Pixel Extractor
-        self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
-        
-        # Load checkpoint
-        if self.checkpoint_path and os.path.exists(self.checkpoint_path):
-            ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
-            self.ckpt_info = ckpt
-            
-            if 'pixel_weight' in ckpt:
-                self.pixel_weight = ckpt['pixel_weight']
-            
-            if 'flow_mode' in ckpt:
-                self.flow_mode = ckpt['flow_mode']
-            
-            if 'pixel_extractor' in ckpt:
-                state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
-                self.pixel_extractor.load_state_dict(state)
-            
-            if 'controlnet' in ckpt:
-                state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
-                self.controlnet.load_state_dict(state)
-        
-        # 启用 Flash Attention
-        self._enable_flash_attention()
-        
         self.controlnet.eval()
+        
+        print("Creating Pixel Extractor...")
+        self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         self.pixel_extractor.eval()
-        self.transformer.eval()
-    
-    def _enable_flash_attention(self):
-        """启用 Flash Attention 加速"""
+        
+        print("Loading checkpoint...")
+        ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
+        
+        # Load pixel_extractor
+        if 'pixel_extractor' in ckpt:
+            state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
+            self.pixel_extractor.load_state_dict(state)
+        
+        # Load controlnet
+        if 'controlnet' in ckpt:
+            state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
+            self.controlnet.load_state_dict(state)
+        
+        # Load pixel_weight from checkpoint if available
+        if 'pixel_weight' in ckpt:
+            self.pixel_weight = ckpt['pixel_weight']
+        
+        print(f"Checkpoint loaded: epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', '?'):.2f}")
+        print(f"Pixel Weight: {self.pixel_weight}")
+        
+        # Cache text embeddings
+        print("Encoding text embeddings...")
+        self._cache_text_embeddings()
+        
+        # Memory optimization
         try:
             self.transformer.enable_xformers_memory_efficient_attention()
             self.controlnet.enable_xformers_memory_efficient_attention()
         except Exception:
             pass  # 默认使用 PyTorch 2.0 SDPA
     
+    def _cache_text_embeddings(self):
+        from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+        
+        dtype = torch.bfloat16
+        prompt = "high resolution, 4K, detailed, sharp"
+        
+        clip_tok = CLIPTokenizer.from_pretrained(self.model_name, subfolder="tokenizer")
+        clip_model = CLIPTextModel.from_pretrained(
+            self.model_name, subfolder="text_encoder", torch_dtype=dtype
+        ).to(self.device)
+        clip_model.eval()
+        
+        clip_ids = clip_tok(prompt, max_length=77, padding="max_length",
+                            truncation=True, return_tensors="pt").input_ids.to(self.device)
+        with torch.no_grad():
+            pooled = clip_model(clip_ids).pooler_output
+        
+        del clip_model, clip_tok
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        t5_tok = T5TokenizerFast.from_pretrained(self.model_name, subfolder="tokenizer_2")
+        t5_model = T5EncoderModel.from_pretrained(
+            self.model_name, subfolder="text_encoder_2", torch_dtype=dtype
+        ).to(self.device)
+        t5_model.eval()
+        
+        t5_ids = t5_tok(prompt, max_length=512, padding="max_length",
+                        truncation=True, return_tensors="pt").input_ids.to(self.device)
+        with torch.no_grad():
+            t5_out = t5_model(t5_ids).last_hidden_state
+        
+        del t5_model, t5_tok
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        self._cached_embeds = {
+            'pooled': pooled.detach(),
+            'prompt': t5_out.detach(),
+            'text_ids': torch.zeros(512, 3, device=self.device, dtype=dtype)
+        }
+    
     def encode(self, img):
-        """Encode image to latent"""
-        return self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample() * self.vae.config.scaling_factor
+        """Encode image to latent (with shift_factor correction)"""
+        raw = self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample()
+        shift = getattr(self.vae.config, 'shift_factor', 0.0)
+        return (raw - shift) * self.vae.config.scaling_factor
     
     def decode(self, lat):
-        """Decode latent to image"""
-        return self.vae.decode((lat / self.vae.config.scaling_factor).to(self.vae.dtype)).sample
+        """Decode latent to image (with shift_factor correction)"""
+        shift = getattr(self.vae.config, 'shift_factor', 0.0)
+        lat_unscaled = lat / self.vae.config.scaling_factor + shift
+        return self.vae.decode(lat_unscaled.to(self.vae.dtype)).sample
     
     def _pack(self, x):
         B, C, H, W = x.shape
@@ -290,17 +317,13 @@ class DualStreamEvaluator:
         return self._unpack(out, H, W)
     
     @torch.no_grad()
-    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5,
-                  start_mode='standard', start_t=1.0):
+    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, start_t=0.7):
         """
-        Euler 推理 (已修复 SDEdit 时间步截断)
+        V4 推理：从 noise 和 lr_lat 的插值开始
         
         Args:
-            start_mode:
-                - 'standard': 从纯噪声开始
-                - 'mean': 从 lr_lat 开始
-                - 'mixed': 从 start_t*noise + (1-start_t)*lr_lat 开始
-            start_t: mixed 模式下的混合比例
+            start_t: 起点的噪声比例 (0=lr_lat, 1=noise)
+                     默认 0.7 表示 70% noise + 30% lr_lat
         """
         B = lr_lat.shape[0]
         device = lr_lat.device
@@ -310,24 +333,15 @@ class DualStreamEvaluator:
         lr_pixel = lr_pixel.to(dtype)
         
         noise = torch.randn_like(lr_lat)
+        
+        # 🌟 V4 核心：从插值点开始
+        lat = start_t * noise + (1 - start_t) * lr_lat
+        
+        # 跳过前 (1 - start_t) 比例的步数
+        start_step = round((1.0 - start_t) * num_steps)
         dt = 1.0 / num_steps
         
-        # 🌟 根据起点模式计算 start_step
-        if start_mode == 'standard':
-            lat = noise
-            start_step = 0  # 从 t=1.0 开始
-        elif start_mode == 'mean':
-            lat = lr_lat.clone()
-            start_step = 0  # Mean Flow 的 t=1.0 就是 lr_lat
-        elif start_mode == 'mixed':
-            lat = start_t * noise + (1 - start_t) * lr_lat
-            # 🌟 关键：跳过前 (1-start_t) 比例的步数
-            start_step = round((1.0 - start_t) * num_steps)
-        else:
-            lat = noise
-            start_step = 0
-        
-        # 🌟 从正确的时间步开始积分
+        # 从 start_step 开始积分
         for i in range(start_step, num_steps):
             t_val = 1.0 - i * dt
             t = torch.full((B,), t_val, device=device, dtype=dtype)
@@ -342,16 +356,15 @@ class DualStreamEvaluator:
 # ============================================================================
 
 def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
-                 tile_size=512, overlap=64, blend_mode='linear',
-                 start_mode='standard', start_t=1.0):
+                 tile_size=512, overlap=64, blend_mode='linear', start_t=0.7):
     """Run SR with tiling for large images"""
     _, _, H, W = lr_t.shape
     
     # 如果图像足够小，直接处理
     if H <= tile_size and W <= tile_size:
         lr_lat = evaluator.encode(lr_t)
-        sr_lat = evaluator.inference(lr_lat, lr_t, num_steps=num_steps, guidance=guidance,
-                                     start_mode=start_mode, start_t=start_t)
+        sr_lat = evaluator.inference(lr_lat, lr_t, num_steps=num_steps, 
+                                     guidance=guidance, start_t=start_t)
         return evaluator.decode(sr_lat)
     
     stride = tile_size - overlap
@@ -382,7 +395,7 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
     with tqdm(total=total_tiles, desc="Tiled SR", leave=False) as pbar:
         for y in y_positions:
             for x in x_positions:
-                # 计算实际 tile 边界（处理边缘情况）
+                # 计算实际 tile 边界
                 y_end = min(y + tile_size, H)
                 x_end = min(x + tile_size, W)
                 tile_h = y_end - y
@@ -397,14 +410,14 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
                     tile = padded
                 
                 tile_lat = evaluator.encode(tile)
-                sr_lat = evaluator.inference(tile_lat, tile, num_steps=num_steps, guidance=guidance,
-                                            start_mode=start_mode, start_t=start_t)
+                sr_lat = evaluator.inference(tile_lat, tile, num_steps=num_steps, 
+                                            guidance=guidance, start_t=start_t)
                 sr_tile = evaluator.decode(sr_lat)
                 
                 # 只取有效部分
                 sr_tile = sr_tile[:, :, :tile_h, :tile_w]
                 
-                # 创建对应大小的 blend mask
+                # 创建 blend mask
                 if tile_h == tile_size and tile_w == tile_size:
                     tile_blend = torch.ones((1, 1, tile_size, tile_size), device=device)
                     if blend_mode == 'linear':
@@ -430,7 +443,7 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Dual-Stream FLUX SR Evaluation V2')
+    parser = argparse.ArgumentParser(description='Dual-Stream FLUX SR Evaluation V4')
     
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--hr_dir', type=str, required=True)
@@ -441,11 +454,10 @@ def main():
     parser.add_argument('--guidance', type=float, default=3.5)
     parser.add_argument('--pixel_weight', type=float, default=None,
                         help='Override pixel_weight from checkpoint')
-    parser.add_argument('--start_mode', type=str, default=None,
-                        choices=['standard', 'mean', 'mixed'],
-                        help='Inference start mode (auto-detected from checkpoint if not specified)')
-    parser.add_argument('--start_t', type=float, default=0.8,
-                        help='Mixed mode: noise ratio (1.0=pure noise, 0.0=pure lr_lat)')
+    
+    # V4 核心参数
+    parser.add_argument('--start_t', type=float, default=0.7,
+                        help='推理起点的噪声比例 (0=lr_lat, 1=noise). 默认 0.7')
     
     parser.add_argument('--tile_size', type=int, default=512)
     parser.add_argument('--overlap', type=int, default=64)
@@ -477,13 +489,14 @@ def main():
             args.dataset = 'BSD100'
         elif 'manga' in hr_lower:
             args.dataset = 'Manga109'
+        elif 'realsr' in hr_lower:
+            args.dataset = 'RealSR'
+        elif 'drealsr' in hr_lower:
+            args.dataset = 'DRealSR'
         else:
             args.dataset = 'Unknown'
     
-    # Experiment name (会在加载模型后更新以包含 flow_mode)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Load model first to get flow_mode
+    # Load model
     initial_pixel_weight = args.pixel_weight if args.pixel_weight is not None else 1.0
     evaluator = DualStreamEvaluator(args.model_name, device, args.checkpoint, initial_pixel_weight)
     evaluator.load()
@@ -492,30 +505,15 @@ def main():
     if args.pixel_weight is not None:
         evaluator.pixel_weight = args.pixel_weight
     
-    # 确定 start_mode（必须与训练时的 validate 一致！）
-    if args.start_mode is not None:
-        start_mode = args.start_mode
-    else:
-        # 根据 flow_mode 自动选择（与 train validate 一致）
-        if evaluator.flow_mode == 'mean':
-            start_mode = 'mean'
-        elif evaluator.flow_mode == 'mixed':
-            start_mode = 'mixed'  # 🌟 mixed 训练就用 mixed 推理
-        else:
-            start_mode = 'standard'
-    
-    # 🌟 Mixed 模式默认 start_t=0.5（与 train validate 一致）
-    if start_mode == 'mixed' and args.start_t == 0.8:  # 如果用户没改默认值
-        args.start_t = 0.5
-    
-    # 现在可以生成包含 flow_mode 的 exp_name
+    # Experiment name
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if args.exp_name:
         exp_name = args.exp_name
     else:
-        exp_name = f"{ts}_{evaluator.flow_mode}_{args.num_steps}step"
+        exp_name = f"{ts}_v4_t{args.start_t}_{args.num_steps}step"
     
     # Output directory
-    output_dir = os.path.join(args.output_base, args.dataset, 'DualV2', exp_name)
+    output_dir = os.path.join(args.output_base, args.dataset, 'DualV4', exp_name)
     os.makedirs(output_dir, exist_ok=True)
     if args.save_images:
         os.makedirs(os.path.join(output_dir, 'predictions'), exist_ok=True)
@@ -523,12 +521,11 @@ def main():
         os.makedirs(os.path.join(output_dir, 'comparisons'), exist_ok=True)
     
     print("=" * 70)
-    print("Dual-Stream FLUX SR Evaluation - V2")
+    print("Dual-Stream FLUX SR Evaluation - V4")
     print("=" * 70)
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Dataset: {args.dataset}")
-    print(f"Flow Mode: {evaluator.flow_mode}, Start Mode: {start_mode}" + 
-          (f", start_t: {args.start_t}" if start_mode == 'mixed' else ""))
+    print(f"Start T: {args.start_t} ({args.start_t*100:.0f}% noise + {(1-args.start_t)*100:.0f}% lr)")
     print(f"Pixel Weight: {evaluator.pixel_weight}")
     print(f"Steps: {args.num_steps}, Guidance: {args.guidance}")
     print(f"Tile: {args.tile_size}, Overlap: {args.overlap}")
@@ -554,31 +551,24 @@ def main():
     
     for hf in tqdm(hr_files, desc="Evaluating"):
         base_name = os.path.splitext(hf)[0]
-        ext = os.path.splitext(hf)[1]
         
-        # Find matching LR file（支持多种数据集格式）
+        # Find matching LR file (支持多种命名格式)
         lf = None
-        lr_candidates = [
-            # 1. 整理后的格式：同名匹配
-            hf,
-            # 2. DIV2K 格式: 0001.png -> 0001x4.png
-            base_name + 'x4' + ext,
-            base_name + '_x4' + ext,
-            # 3. RealSR 原始格式: Canon_001_HR.png -> Canon_001_LR4.png
-            base_name.replace('_HR', '_LR4') + ext,
-            base_name.replace('_HR', '') + '_LR4' + ext,
-            # 4. DRealSR 原始格式: Canon_10_x4.png -> Canon_10_x1.png
-            base_name.replace('_x4', '_x1') + ext,
-            base_name.replace('_x4', '') + '_x1' + ext,
-        ]
-        
-        for candidate in lr_candidates:
-            if candidate in lr_files:
-                lf = candidate
+        # 格式1: 相同名称 (reorganized datasets)
+        # 格式2: DIV2K 格式 (0001x4.png)
+        # 格式3: RealSR 原始格式 (Canon_001_LR4.png)
+        # 格式4: DRealSR 原始格式 (Canon_10_x1.png)
+        for suffix in ['', 'x4', 'x2', '_x4', '_x2', '_LR4', '_LR2']:
+            for ext in ['.png', '.jpg', '.jpeg']:
+                candidate = base_name + suffix + ext
+                if candidate in lr_files:
+                    lf = candidate
+                    break
+            if lf:
                 break
         
         if lf is None:
-            tqdm.write(f"  警告: 找不到 {hf} 对应的 LR 文件，跳过")
+            print(f"Warning: No LR file found for {hf}, skipping...")
             continue
         
         filenames.append(base_name)
@@ -602,7 +592,6 @@ def main():
             tile_size=args.tile_size,
             overlap=args.overlap,
             blend_mode=args.blend_mode,
-            start_mode=start_mode,
             start_t=args.start_t
         )
         
@@ -658,25 +647,24 @@ def main():
     print("Results")
     print("=" * 70)
     print(f"Pixel Weight: {evaluator.pixel_weight}")
+    print(f"Start T: {args.start_t}")
     if LPIPS_AVAILABLE:
         print(f"Bicubic:  PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}")
-        print(f"Dual-V2:  PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
+        print(f"Dual-V4:  PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
         print(f"Δ:        {avg_psnr - avg_psnr_bic:+.4f} dB, {avg_ssim - avg_ssim_bic:+.4f}, {avg_lpips_bic - avg_lpips:+.4f}")
     else:
         print(f"Bicubic:  PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}")
-        print(f"Dual-V2:  PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}")
+        print(f"Dual-V4:  PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}")
     print("=" * 70)
     
     # Save results
     results_path = os.path.join(output_dir, 'results.txt')
     with open(results_path, 'w') as f:
-        f.write("Dual-Stream FLUX SR Evaluation - V2\n")
+        f.write("Dual-Stream FLUX SR Evaluation - V4\n")
         f.write("=" * 60 + "\n")
         f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Checkpoint: {args.checkpoint}\n")
-        f.write(f"Flow Mode: {evaluator.flow_mode}\n")
-        f.write(f"Start Mode: {start_mode}" + 
-                (f", start_t: {args.start_t}" if start_mode == 'mixed' else "") + "\n")
+        f.write(f"Start T: {args.start_t} ({args.start_t*100:.0f}% noise + {(1-args.start_t)*100:.0f}% lr)\n")
         f.write(f"Pixel Weight: {evaluator.pixel_weight}\n")
         f.write(f"Dataset: {args.dataset}\n")
         f.write(f"Images: {len(psnr_list)}\n")
@@ -687,11 +675,11 @@ def main():
         f.write("=" * 60 + "\n")
         if LPIPS_AVAILABLE:
             f.write(f"Bicubic:  PSNR={avg_psnr_bic:.4f}, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}\n")
-            f.write(f"Dual-V2:  PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}\n")
+            f.write(f"Dual-V4:  PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}\n")
             f.write(f"Δ:        {avg_psnr - avg_psnr_bic:+.4f}, {avg_ssim - avg_ssim_bic:+.4f}, {avg_lpips_bic - avg_lpips:+.4f}\n")
         else:
             f.write(f"Bicubic:  PSNR={avg_psnr_bic:.4f}, SSIM={avg_ssim_bic:.4f}\n")
-            f.write(f"Dual-V2:  PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}\n")
+            f.write(f"Dual-V4:  PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}\n")
         f.write("\n" + "=" * 60 + "\n")
         f.write("Per-image results:\n")
         f.write("=" * 60 + "\n")
