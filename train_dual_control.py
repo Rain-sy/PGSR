@@ -29,6 +29,7 @@ import gc
 import math
 import argparse
 import numpy as np
+from contextlib import nullcontext
 from datetime import datetime
 from PIL import Image
 
@@ -38,7 +39,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import set_seed, DistributedType
 from tqdm import tqdm
 
 from diffusers import FlowMatchEulerDiscreteScheduler
@@ -712,6 +713,12 @@ def main():
     system, optimizer, train_loader, lr_scheduler = accelerator.prepare(
         system, optimizer, train_loader, lr_scheduler
     )
+
+    # DeepSpeed ZeRO-2 与 accelerate.accumulate(no_sync) 不兼容
+    # 这种情况下交给 DeepSpeed 自己管理 grad accumulation
+    use_accumulate = accelerator.distributed_type != DistributedType.DEEPSPEED
+    if is_main and not use_accumulate:
+        print("[Training] DeepSpeed detected: disable accelerator.accumulate() to avoid no_sync assertion.")
     
     # Resume
     start_epoch = 0
@@ -770,14 +777,15 @@ def main():
                 hr_lat = unwrapped.encode(hr)
                 lr_lat = unwrapped.encode(lr)
             
-            with accelerator.accumulate(system):
+            accumulate_ctx = accelerator.accumulate(system) if use_accumulate else nullcontext()
+            with accumulate_ctx:
                 loss = compute_flow_matching_loss(system, hr_lat, lr_lat, lr)
                 
                 accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
             
-            if accelerator.sync_gradients:
+            if (use_accumulate and accelerator.sync_gradients) or (not use_accumulate):
                 lr_scheduler.step()
             
             epoch_losses.append(loss.item())
