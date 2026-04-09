@@ -565,8 +565,8 @@ def main():
     parser.add_argument('--num_steps', type=int, default=20)
     parser.add_argument('--guidance', type=float, default=3.5)
     parser.add_argument('--pixel_weight', type=float, default=None)
-    parser.add_argument('--strength', type=float, default=None,
-                        help='Inference start strength (1.0 = pure noise start, 0.7 = skip first 30% steps)')
+    parser.add_argument('--strength', type=float, default=0.8,
+                        help='Inference start strength (1.0 = pure noise start, 0.8 = skip first 20% steps)')
     parser.add_argument('--control_guidance_start', type=float, default=None)
     parser.add_argument('--control_guidance_end', type=float, default=None)
     

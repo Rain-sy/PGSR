@@ -129,16 +129,23 @@ class SRDataset(Dataset):
         lr_img = Image.open(self._find_lr_file(hr_name)).convert('RGB')
         
         hr_w, hr_h = hr_img.size
+        lr_w, lr_h = lr_img.size
         crop_size = self.resolution
         lr_crop_size = crop_size // self.scale
         
         if hr_w >= crop_size and hr_h >= crop_size:
             if self.is_val:
+                # Center crop aligned to scale to keep HR/LR perfectly matched
                 x = (hr_w - crop_size) // 2
                 y = (hr_h - crop_size) // 2
+                x = x - (x % self.scale)
+                y = y - (y % self.scale)
             else:
-                x = np.random.randint(0, hr_w - crop_size + 1)
-                y = np.random.randint(0, hr_h - crop_size + 1)
+                # Sample on LR grid first, then map to HR grid
+                lr_x = np.random.randint(0, lr_w - lr_crop_size + 1)
+                lr_y = np.random.randint(0, lr_h - lr_crop_size + 1)
+                x = lr_x * self.scale
+                y = lr_y * self.scale
             
             hr_crop = hr_img.crop((x, y, x + crop_size, y + crop_size))
             lr_x, lr_y = x // self.scale, y // self.scale
@@ -650,9 +657,9 @@ def main():
     parser.add_argument('--control_guidance_start', type=float, default=0.0)
     parser.add_argument('--control_guidance_end', type=float, default=1.0)
     
-    # 🌟 Strength (官方 img2img 语义)
-    parser.add_argument('--strength', type=float, default=0.7,
-                        help='推理时的 strength (1.0=从纯噪声开始，0.7=跳过前30%步数)')
+    # Validation/eval start point (img2img-style interpolation from LR + noise)
+    parser.add_argument('--strength', type=float, default=0.8,
+                        help='Validation/eval strength (1.0 = pure noise start, 0.8 = skip first 20% steps)')
     parser.add_argument('--val_num_steps', type=int, default=20)
     
     # Checkpointing
