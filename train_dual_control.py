@@ -30,6 +30,7 @@ import math
 import argparse
 from contextlib import nullcontext
 import numpy as np
+from contextlib import nullcontext
 from datetime import datetime
 from PIL import Image
 
@@ -187,13 +188,18 @@ class DualStreamFLUXSR(nn.Module):
     Dual-Stream FLUX SR System - Using Official Scheduler
     """
     
-    def __init__(self, model_name, device, pretrained_controlnet=None, 
-                 train_controlnet=True, pixel_weight=1.0):
+    def __init__(self, model_name, device, pretrained_controlnet=None,
+                 train_controlnet=True, pixel_weight=1.0,
+                 control_guidance_start=0.0, control_guidance_end=1.0,
+                 conditioning_scale=1.0):
         super().__init__()
         self.model_name = model_name
         self.device = device
         self.train_controlnet = train_controlnet
         self.pixel_weight = pixel_weight
+        self.control_guidance_start = control_guidance_start
+        self.control_guidance_end = control_guidance_end
+        self.conditioning_scale = conditioning_scale
         
         self.vae = None
         self.transformer = None
@@ -230,6 +236,10 @@ class DualStreamFLUXSR(nn.Module):
         self.vae.eval()
         self.vae.enable_tiling()
         
+        # Cache text embeddings (空字符串) - 提前做，避免初始化显存峰值
+        print(f"[Rank {local_rank}] Caching text embeddings...")
+        self._cache_text_embeddings()
+
         # Load Transformer (frozen)
         print(f"[Rank {local_rank}] Loading FLUX Transformer...")
         self.transformer = FluxTransformer2DModel.from_pretrained(
@@ -237,30 +247,36 @@ class DualStreamFLUXSR(nn.Module):
         ).to(self.device)
         self.transformer.requires_grad_(False)
         self.transformer.eval()
-        
+
         # Load ControlNet
         controlnet_path = pretrained_controlnet or "jasperai/Flux.1-dev-Controlnet-Upscaler"
         print(f"[Rank {local_rank}] Loading ControlNet from {controlnet_path}...")
         self.controlnet = FluxControlNetModel.from_pretrained(
             controlnet_path, torch_dtype=dtype
         ).to(self.device)
-        
+
         if self.train_controlnet:
             self.controlnet.train()
             self.controlnet.requires_grad_(True)
         else:
             self.controlnet.eval()
             self.controlnet.requires_grad_(False)
-        
+
         # Pixel Feature Extractor
         print(f"[Rank {local_rank}] Initializing Pixel Feature Extractor...")
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         self.pixel_extractor.train()
         
+<<<<<<< ours
+<<<<<<< ours
         # Cache text embeddings (empty string)
         print(f"[Rank {local_rank}] Caching text embeddings...")
         self._cache_text_embeddings()
         
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
         # Enable Flash Attention
         try:
             self.transformer.enable_xformers_memory_efficient_attention()
@@ -343,8 +359,40 @@ class DualStreamFLUXSR(nn.Module):
         ids[..., 1] = torch.arange(h, device=device, dtype=dtype)[:, None]
         ids[..., 2] = torch.arange(w, device=device, dtype=dtype)[None, :]
         return ids.reshape(h * w, 3)
+
+    def _compute_scheduler_mu(self, latent):
+        """Compute `mu` for FlowMatch dynamic shifting when required."""
+        if not getattr(self.scheduler.config, "use_dynamic_shifting", False):
+            return None
+
+        base_shift = float(getattr(self.scheduler.config, "base_shift", 0.5))
+        max_shift = float(getattr(self.scheduler.config, "max_shift", 1.15))
+        base_seq = int(getattr(self.scheduler.config, "base_image_seq_len", 256))
+        max_seq = int(getattr(self.scheduler.config, "max_image_seq_len", 4096))
+
+        h, w = latent.shape[-2:]
+        image_seq_len = int((h // 2) * (w // 2))
+
+        if max_seq == base_seq:
+            return base_shift
+
+        slope = (max_shift - base_shift) / (max_seq - base_seq)
+        mu = slope * image_seq_len + (base_shift - slope * base_seq)
+        return float(mu)
+
+    def _set_scheduler_timesteps(self, num_steps, device, latent_for_mu):
+        """Set scheduler timesteps with backward-compatible `mu` handling."""
+        mu = self._compute_scheduler_mu(latent_for_mu)
+        if mu is not None:
+            try:
+                self.scheduler.set_timesteps(num_steps, device=device, mu=mu)
+                return
+            except TypeError:
+                # Older diffusers may not accept `mu` in set_timesteps
+                pass
+        self.scheduler.set_timesteps(num_steps, device=device)
     
-    def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5):
+    def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5, controlnet_scale=1.0):
         """
         Forward pass: predict velocity
         
@@ -379,10 +427,30 @@ class DualStreamFLUXSR(nn.Module):
         prompt = self._cached_embeds['prompt'].expand(B, -1, -1)
         text_ids = self._cached_embeds['text_ids']
         
+<<<<<<< ours
+<<<<<<< ours
         # Timestep is already / 1000, use directly
         t_input = timestep.to(dtype) if isinstance(timestep, torch.Tensor) else torch.tensor([timestep], device=device, dtype=dtype).expand(B)
         
         # Check if models use guidance embeds
+=======
+=======
+>>>>>>> theirs
+        # 🌟 timestep 已经是 / 1000 后的值，直接使用
+        if isinstance(timestep, torch.Tensor):
+            t_input = timestep.to(device=device, dtype=dtype)
+            if t_input.ndim == 0:
+                t_input = t_input.expand(B)
+            elif t_input.ndim == 1 and t_input.shape[0] == 1 and B > 1:
+                t_input = t_input.expand(B)
+            elif t_input.ndim != 1:
+                raise ValueError(f"Expected 1D timestep tensor, got shape {tuple(t_input.shape)}")
+        else:
+            t_input = torch.full((B,), float(timestep), device=device, dtype=dtype)
+<<<<<<< ours
+>>>>>>> theirs
+=======
+>>>>>>> theirs
         controlnet_guidance = None
         transformer_guidance = None
         if getattr(self.controlnet.config, "guidance_embeds", False):
@@ -394,6 +462,7 @@ class DualStreamFLUXSR(nn.Module):
         ctrl_out = self.controlnet(
             hidden_states=noisy_packed,
             controlnet_cond=fused_packed,
+            conditioning_scale=float(self.conditioning_scale * controlnet_scale),
             timestep=t_input,
             guidance=controlnet_guidance,
             pooled_projections=pooled,
@@ -439,8 +508,18 @@ class DualStreamFLUXSR(nn.Module):
         lr_lat = lr_lat.to(dtype)
         lr_pixel = lr_pixel.to(dtype)
         
+<<<<<<< ours
+<<<<<<< ours
         # Set timesteps (pass mu when dynamic shifting is enabled)
         set_scheduler_timesteps_for_latent(self.scheduler, lr_lat, num_steps, device)
+=======
+        # 设置 timesteps（dynamic shifting 时需要 mu）
+        self._set_scheduler_timesteps(num_steps, device, lr_lat)
+>>>>>>> theirs
+=======
+        # 设置 timesteps（dynamic shifting 时需要 mu）
+        self._set_scheduler_timesteps(num_steps, device, lr_lat)
+>>>>>>> theirs
         timesteps = self.scheduler.timesteps
         
         # Calculate starting point based on strength (official img2img way)
@@ -454,6 +533,8 @@ class DualStreamFLUXSR(nn.Module):
                 f"Please increase num_steps (current: {num_steps}) or strength."
             )
 
+<<<<<<< ours
+<<<<<<< ours
         # Align with official img2img: set begin_index before scale_noise
         self.scheduler.set_begin_index(t_start)
 
@@ -473,13 +554,54 @@ class DualStreamFLUXSR(nn.Module):
             controlnet_keep.append(keeps)
         
         # Denoising loop
+=======
+=======
+>>>>>>> theirs
+        # 和官方 img2img 对齐：显式设置 begin_index，再调用 scale_noise
+        self.scheduler.set_begin_index(t_start)
+
+        # 生成噪声
+        noise = torch.randn_like(lr_lat)
+
+        # 🌟 使用官方 scale_noise 加噪
+        # scale_noise: sample = sigma * noise + (1 - sigma) * sample
+        timestep_batch = timesteps[:1].expand(B)
+        latents = self.scheduler.scale_noise(lr_lat, timestep_batch, noise)
+        
+        # 去噪循环
+        total_steps = len(timesteps)
+<<<<<<< ours
+>>>>>>> theirs
+=======
+>>>>>>> theirs
         for i, t in enumerate(timesteps):
             # Timestep passed to model needs / 1000
             timestep_model = t / 1000.0
+
+            if total_steps <= 1:
+                step_ratio = 1.0
+            else:
+                step_ratio = i / float(total_steps - 1)
+            keep = self.control_guidance_start <= step_ratio <= self.control_guidance_end
+            controlnet_scale = 1.0 if keep else 0.0
             
+<<<<<<< ours
+<<<<<<< ours
             # Predict velocity (controlnet_keep applied implicitly via control_guidance window)
             # Note: For full control, conditioning_scale parameter can be added and multiplied with controlnet_keep[i]
             model_output = self.forward(latents, lr_lat, lr_pixel, timestep_model, guidance)
+=======
+=======
+>>>>>>> theirs
+            # 预测 velocity
+            model_output = self.forward(
+                latents, lr_lat, lr_pixel, timestep_model, guidance,
+                controlnet_scale=controlnet_scale
+            )
+<<<<<<< ours
+>>>>>>> theirs
+=======
+>>>>>>> theirs
             
             # Use official scheduler.step to update
             latents = self.scheduler.step(model_output, t, latents, return_dict=False)[0]
@@ -516,6 +638,8 @@ def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, num_train_times
     device = hr_lat.device
     dtype = torch.bfloat16
     
+<<<<<<< ours
+<<<<<<< ours
     # Sample sigma from scheduler.sigmas (not manual U[0,1])
     # This preserves shift / dynamic shifting config semantics
     unwrapped = system.module if hasattr(system, 'module') else system
@@ -532,6 +656,17 @@ def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, num_train_times
     if len(sched_sigmas) == 0:
         sched_sigmas = unwrapped.scheduler.sigmas
     
+=======
+=======
+>>>>>>> theirs
+    # 采样 sigma（对应官方 scheduler.sigmas，而不是手工 U[0,1]）
+    # 这样能保留 shift / dynamic shifting 等配置语义
+    unwrapped = system.module if hasattr(system, 'module') else system
+    sched_sigmas = unwrapped.scheduler.sigmas[:-1] if unwrapped.scheduler.sigmas.shape[0] > 1 else unwrapped.scheduler.sigmas
+<<<<<<< ours
+>>>>>>> theirs
+=======
+>>>>>>> theirs
     sigma_idx = torch.randint(0, sched_sigmas.shape[0], (B,), device=device)
     sigma = sched_sigmas.to(device=device, dtype=dtype)[sigma_idx]
     noise = torch.randn_like(hr_lat)
@@ -543,7 +678,14 @@ def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, num_train_times
     # Target: v = noise - hr_lat (flow matching velocity)
     target_v = noise - hr_lat
     
+<<<<<<< ours
     # Timestep passed to model = sigma (since official is timestep / 1000, and timestep = sigma * 1000)
+=======
+    # 🌟 传给模型的 timestep = sigma（因为官方是 timestep / 1000，而 timestep = sigma * 1000）
+<<<<<<< ours
+>>>>>>> theirs
+=======
+>>>>>>> theirs
     v_pred = unwrapped.forward(noisy, lr_lat, lr_pixel, sigma)
     
     # Loss
@@ -606,6 +748,7 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
         'loss': loss,
         'psnr': psnr,
         'pixel_weight': pixel_weight,
+        'conditioning_scale': unwrapped.conditioning_scale,
         'strength': strength,
         'control_guidance_start': control_guidance_start,
         'control_guidance_end': control_guidance_end,
@@ -633,6 +776,7 @@ def main():
     parser.add_argument('--model_name', type=str, default='black-forest-labs/FLUX.1-dev')
     parser.add_argument('--pretrained_controlnet', type=str, default=None)
     parser.add_argument('--pixel_weight', type=float, default=1.0)
+    parser.add_argument('--conditioning_scale', type=float, default=1.0)
     
     # Training
     parser.add_argument('--batch_size', type=int, default=4)
@@ -640,10 +784,20 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--warmup_epochs', type=int, default=5)
     parser.add_argument('--guidance', type=float, default=3.5)
+<<<<<<< ours
+<<<<<<< ours
     parser.add_argument('--control_guidance_start', type=float, default=0.0,
                         help='Fraction of steps to start applying ControlNet')
     parser.add_argument('--control_guidance_end', type=float, default=1.0,
                         help='Fraction of steps to stop applying ControlNet')
+=======
+    parser.add_argument('--control_guidance_start', type=float, default=0.0)
+    parser.add_argument('--control_guidance_end', type=float, default=1.0)
+>>>>>>> theirs
+=======
+    parser.add_argument('--control_guidance_start', type=float, default=0.0)
+    parser.add_argument('--control_guidance_end', type=float, default=1.0)
+>>>>>>> theirs
     
     # Strength (official img2img semantics)
     parser.add_argument('--strength', type=float, default=0.7,
@@ -695,7 +849,17 @@ def main():
         print(f"Num Crops: {args.num_crops}")
         print(f"Batch Size: {args.batch_size}")
         print(f"Pixel Weight: {args.pixel_weight}")
+<<<<<<< ours
+<<<<<<< ours
         print(f"Strength: {args.strength} (skip {(1-args.strength)*100:.0f}% steps at inference)")
+=======
+        print(f"Conditioning Scale: {args.conditioning_scale}")
+        print(f"Strength: {args.strength} (推理时跳过 {(1-args.strength)*100:.0f}% 步数)")
+>>>>>>> theirs
+=======
+        print(f"Conditioning Scale: {args.conditioning_scale}")
+        print(f"Strength: {args.strength} (推理时跳过 {(1-args.strength)*100:.0f}% 步数)")
+>>>>>>> theirs
         print(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]")
         print(f"Learning Rate: {args.lr} (PixelExtractor: {args.lr * 10})")
         print(f"Save Dir: {save_dir}")
@@ -704,7 +868,10 @@ def main():
     # Create model
     system = DualStreamFLUXSR(
         args.model_name, device, args.pretrained_controlnet,
-        train_controlnet=args.train_controlnet, pixel_weight=args.pixel_weight
+        train_controlnet=args.train_controlnet, pixel_weight=args.pixel_weight,
+        control_guidance_start=args.control_guidance_start,
+        control_guidance_end=args.control_guidance_end,
+        conditioning_scale=args.conditioning_scale,
     )
     
     # Enable gradient checkpointing
@@ -766,6 +933,12 @@ def main():
     system, optimizer, train_loader, lr_scheduler = accelerator.prepare(
         system, optimizer, train_loader, lr_scheduler
     )
+
+    # DeepSpeed ZeRO-2 与 accelerate.accumulate(no_sync) 不兼容
+    # 这种情况下交给 DeepSpeed 自己管理 grad accumulation
+    use_accumulate = accelerator.distributed_type != DistributedType.DEEPSPEED
+    if is_main and not use_accumulate:
+        print("[Training] DeepSpeed detected: disable accelerator.accumulate() to avoid no_sync assertion.")
     
     # Resume
     start_epoch = 0
@@ -790,6 +963,16 @@ def main():
             args.control_guidance_start = ckpt['control_guidance_start']
         if 'control_guidance_end' in ckpt:
             args.control_guidance_end = ckpt['control_guidance_end']
+<<<<<<< ours
+<<<<<<< ours
+=======
+        if 'conditioning_scale' in ckpt:
+            unwrapped.conditioning_scale = ckpt['conditioning_scale']
+>>>>>>> theirs
+=======
+        if 'conditioning_scale' in ckpt:
+            unwrapped.conditioning_scale = ckpt['conditioning_scale']
+>>>>>>> theirs
         if is_main:
             print(f"[Resume] Starting from epoch {start_epoch}, best PSNR: {best_psnr:.2f}")
     
@@ -800,7 +983,15 @@ def main():
             f.write("FLUX SR Training - Official Scheduler\n")
             f.write("=" * 60 + "\n")
             f.write(f"Strength: {args.strength}\n")
+<<<<<<< ours
             f.write(f"Pixel Weight: {args.pixel_weight}\n")
+=======
+            f.write(f"Pixel Weight: {args.pixel_weight}\n\n")
+            f.write(f"Conditioning Scale: {args.conditioning_scale}\n")
+<<<<<<< ours
+>>>>>>> theirs
+=======
+>>>>>>> theirs
             f.write(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]\n\n")
     
     # Training loop
@@ -829,9 +1020,18 @@ def main():
             with torch.no_grad():
                 hr_lat = unwrapped.encode(hr)
                 lr_lat = unwrapped.encode(lr)
+<<<<<<< ours
 
             ctx = nullcontext() if ds_zero_incompatible_no_sync else accelerator.accumulate(system)
             with ctx:
+=======
+            
+            accumulate_ctx = accelerator.accumulate(system) if use_accumulate else nullcontext()
+            with accumulate_ctx:
+<<<<<<< ours
+>>>>>>> theirs
+=======
+>>>>>>> theirs
                 loss = compute_flow_matching_loss(system, hr_lat, lr_lat, lr)
                 boundary = True
                 if ds_zero_incompatible_no_sync and hasattr(system, "is_gradient_accumulation_boundary"):
@@ -840,6 +1040,7 @@ def main():
                 accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
+<<<<<<< ours
 
             if ds_zero_incompatible_no_sync:
                 if boundary:
@@ -847,6 +1048,11 @@ def main():
             else:
                 if accelerator.sync_gradients:
                     lr_scheduler.step()
+=======
+            
+            if (use_accumulate and accelerator.sync_gradients) or (not use_accumulate):
+                lr_scheduler.step()
+>>>>>>> theirs
             
             epoch_losses.append(loss.item())
             pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{lr_scheduler.get_last_lr()[0]:.2e}'})

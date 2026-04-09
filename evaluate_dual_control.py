@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """
 ======================================================================
-Dual-Stream FLUX SR Evaluation - 对齐官方 Diffusers 流程
+Dual-Stream FLUX SR Evaluation - 瀵归綈瀹樻柟 Diffusers 娴佺▼
 ======================================================================
 
-与 train_dual_control.py 配套使用
+涓?train_dual_control.py 閰嶅浣跨敤
 
 Usage:
     python evaluate_dual_control.py \
@@ -99,9 +99,15 @@ def calculate_ssim(img1, img2):
            ((mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2))
     return ssim
 
+def clear_memory(device):
+    """Aggressively clear Python/CUDA memory."""
+    gc.collect()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 # ============================================================================
-# Evaluator - 对齐官方流程
+# Evaluator - 瀵归綈瀹樻柟娴佺▼
 # ============================================================================
 
 class DualStreamEvaluator(nn.Module):
@@ -121,6 +127,7 @@ class DualStreamEvaluator(nn.Module):
         self.strength = 0.7
         self.control_guidance_start = 0.0
         self.control_guidance_end = 1.0
+        self.conditioning_scale = 1.0
     
     def load(self):
         from diffusers import FluxTransformer2DModel, AutoencoderKL, FluxControlNetModel
@@ -138,50 +145,55 @@ class DualStreamEvaluator(nn.Module):
         self.vae = AutoencoderKL.from_pretrained(
             self.model_name, subfolder="vae", torch_dtype=dtype
         ).to(self.device)
+        self.vae.requires_grad_(False)
         self.vae.eval()
         self.vae.enable_tiling()
-        
-        print("Loading Transformer...")
-        self.transformer = FluxTransformer2DModel.from_pretrained(
-            self.model_name, subfolder="transformer", torch_dtype=dtype
-        ).to(self.device)
-        self.transformer.eval()
-        
-        print("Loading ControlNet...")
-        self.controlnet = FluxControlNetModel.from_pretrained(
-            "jasperai/Flux.1-dev-Controlnet-Upscaler", torch_dtype=dtype
-        ).to(self.device)
-        self.controlnet.eval()
-        
-        print("Creating Pixel Extractor...")
-        self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
-        self.pixel_extractor.eval()
-        
-        print("Loading checkpoint...")
-        ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
-        
-        if 'pixel_extractor' in ckpt:
-            state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
-            self.pixel_extractor.load_state_dict(state)
-        
-        if 'controlnet' in ckpt:
-            state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
-            self.controlnet.load_state_dict(state)
-        
-        if 'pixel_weight' in ckpt:
-            self.pixel_weight = ckpt['pixel_weight']
-        
-        self.strength = ckpt.get('strength', 0.7)
-        self.control_guidance_start = ckpt.get('control_guidance_start', 0.0)
-        self.control_guidance_end = ckpt.get('control_guidance_end', 1.0)
-        
-        print(f"Checkpoint: epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', 0):.2f}")
-        print(f"Pixel Weight: {self.pixel_weight}, Strength: {self.strength}")
-        print(f"Control Guidance Window: [{self.control_guidance_start}, {self.control_guidance_end}]")
         
         # Cache text embeddings
         print("Caching text embeddings...")
         self._cache_text_embeddings()
+
+        print("Loading Transformer...")
+        self.transformer = FluxTransformer2DModel.from_pretrained(
+            self.model_name, subfolder="transformer", torch_dtype=dtype
+        ).to(self.device)
+        self.transformer.requires_grad_(False)
+        self.transformer.eval()
+
+        print("Loading ControlNet...")
+        self.controlnet = FluxControlNetModel.from_pretrained(
+            "jasperai/Flux.1-dev-Controlnet-Upscaler", torch_dtype=dtype
+        ).to(self.device)
+        self.controlnet.requires_grad_(False)
+        self.controlnet.eval()
+
+        print("Creating Pixel Extractor...")
+        self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
+        self.pixel_extractor.requires_grad_(False)
+        self.pixel_extractor.eval()
+
+        print("Loading checkpoint...")
+        ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
+
+        if 'pixel_extractor' in ckpt:
+            state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
+            self.pixel_extractor.load_state_dict(state)
+
+        if 'controlnet' in ckpt:
+            state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
+            self.controlnet.load_state_dict(state)
+
+        if 'pixel_weight' in ckpt:
+            self.pixel_weight = ckpt['pixel_weight']
+        self.conditioning_scale = ckpt.get('conditioning_scale', 1.0)
+        self.strength = ckpt.get('strength', 0.7)
+        self.control_guidance_start = ckpt.get('control_guidance_start', 0.0)
+        self.control_guidance_end = ckpt.get('control_guidance_end', 1.0)
+
+        print(f"Checkpoint: epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', 0):.2f}")
+        print(f"Pixel Weight: {self.pixel_weight}, Strength: {self.strength}")
+        print(f"Conditioning Scale: {self.conditioning_scale}")
+        print(f"Control Guidance Window: [{self.control_guidance_start}, {self.control_guidance_end}]")
         
         try:
             self.transformer.enable_xformers_memory_efficient_attention()
@@ -215,10 +227,10 @@ class DualStreamEvaluator(nn.Module):
                 'text_ids': torch.zeros(t5_out[0].shape[1], 3, device=self.device, dtype=dtype),
             }
         
-        del text_enc, text_enc_2
-        torch.cuda.empty_cache()
-        gc.collect()
+        del text_enc, text_enc_2, tok, tok_2, clip_out, t5_out
+        clear_memory(self.device)
     
+    @torch.no_grad()
     def encode(self, img):
         lat = self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample()
         if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
@@ -227,6 +239,7 @@ class DualStreamEvaluator(nn.Module):
             lat = lat * self.vae.config.scaling_factor
         return lat
     
+    @torch.no_grad()
     def decode(self, lat):
         if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
             lat = (lat / self.vae.config.scaling_factor) + self.vae.config.shift_factor
@@ -251,9 +264,41 @@ class DualStreamEvaluator(nn.Module):
         ids[..., 1] = torch.arange(h, device=device, dtype=dtype)[:, None]
         ids[..., 2] = torch.arange(w, device=device, dtype=dtype)[None, :]
         return ids.reshape(h * w, 3)
+
+    def _compute_scheduler_mu(self, latent):
+        """Compute `mu` for FlowMatch dynamic shifting when required."""
+        if not getattr(self.scheduler.config, "use_dynamic_shifting", False):
+            return None
+
+        base_shift = float(getattr(self.scheduler.config, "base_shift", 0.5))
+        max_shift = float(getattr(self.scheduler.config, "max_shift", 1.15))
+        base_seq = int(getattr(self.scheduler.config, "base_image_seq_len", 256))
+        max_seq = int(getattr(self.scheduler.config, "max_image_seq_len", 4096))
+
+        h, w = latent.shape[-2:]
+        image_seq_len = int((h // 2) * (w // 2))
+
+        if max_seq == base_seq:
+            return base_shift
+
+        slope = (max_shift - base_shift) / (max_seq - base_seq)
+        mu = slope * image_seq_len + (base_shift - slope * base_seq)
+        return float(mu)
+
+    def _set_scheduler_timesteps(self, num_steps, device, latent_for_mu):
+        """Set scheduler timesteps with backward-compatible `mu` handling."""
+        mu = self._compute_scheduler_mu(latent_for_mu)
+        if mu is not None:
+            try:
+                self.scheduler.set_timesteps(num_steps, device=device, mu=mu)
+                return
+            except TypeError:
+                # Older diffusers may not accept `mu` in set_timesteps
+                pass
+        self.scheduler.set_timesteps(num_steps, device=device)
     
     @torch.no_grad()
-    def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5):
+    def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5, controlnet_scale=1.0):
         B, C, H, W = noisy.shape
         device = noisy.device
         dtype = torch.bfloat16
@@ -265,16 +310,27 @@ class DualStreamEvaluator(nn.Module):
             )
         
         fused_cond = (lr_lat + self.pixel_weight * pixel_feat).to(dtype)
+        del pixel_feat
         
         noisy_packed = self._pack(noisy.to(dtype))
         fused_packed = self._pack(fused_cond)
+        del fused_cond
         img_ids = self._img_ids(H, W, device, dtype)
         
         pooled = self._cached_embeds['pooled'].expand(B, -1)
         prompt = self._cached_embeds['prompt'].expand(B, -1, -1)
         text_ids = self._cached_embeds['text_ids']
         
-        t_input = timestep.to(dtype) if isinstance(timestep, torch.Tensor) else torch.tensor([timestep], device=device, dtype=dtype).expand(B)
+        if isinstance(timestep, torch.Tensor):
+            t_input = timestep.to(device=device, dtype=dtype)
+            if t_input.ndim == 0:
+                t_input = t_input.expand(B)
+            elif t_input.ndim == 1 and t_input.shape[0] == 1 and B > 1:
+                t_input = t_input.expand(B)
+            elif t_input.ndim != 1:
+                raise ValueError(f"Expected 1D timestep tensor, got shape {tuple(t_input.shape)}")
+        else:
+            t_input = torch.full((B,), float(timestep), device=device, dtype=dtype)
         controlnet_guidance = None
         transformer_guidance = None
         if getattr(self.controlnet.config, "guidance_embeds", False):
@@ -285,6 +341,7 @@ class DualStreamEvaluator(nn.Module):
         ctrl_out = self.controlnet(
             hidden_states=noisy_packed,
             controlnet_cond=fused_packed,
+            conditioning_scale=float(self.conditioning_scale * controlnet_scale),
             timestep=t_input,
             guidance=controlnet_guidance,
             pooled_projections=pooled,
@@ -293,6 +350,7 @@ class DualStreamEvaluator(nn.Module):
             img_ids=img_ids,
             return_dict=False,
         )
+        del fused_packed
         
         out = self.transformer(
             hidden_states=noisy_packed,
@@ -306,12 +364,13 @@ class DualStreamEvaluator(nn.Module):
             controlnet_single_block_samples=ctrl_out[1],
             return_dict=False,
         )[0]
+        del ctrl_out, noisy_packed, img_ids
         
         return self._unpack(out, H, W)
     
     @torch.no_grad()
     def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, strength=0.7):
-        """使用官方 Scheduler 的推理"""
+        """Inference using the official scheduler."""
         B = lr_lat.shape[0]
         device = lr_lat.device
         dtype = torch.bfloat16
@@ -319,11 +378,11 @@ class DualStreamEvaluator(nn.Module):
         lr_lat = lr_lat.to(dtype)
         lr_pixel = lr_pixel.to(dtype)
         
-        # 设置 timesteps
-        self.scheduler.set_timesteps(num_steps, device=device)
+        # 璁剧疆 timesteps锛坉ynamic shifting 鏃堕渶瑕?mu锛?
+        self._set_scheduler_timesteps(num_steps, device, lr_lat)
         timesteps = self.scheduler.timesteps
         
-        # 根据 strength 计算起始点
+        # 鏍规嵁 strength 璁＄畻璧峰鐐?
         init_timestep = min(int(num_steps * strength), num_steps)
         t_start = max(num_steps - init_timestep, 0)
         timesteps = timesteps[t_start:]
@@ -334,20 +393,33 @@ class DualStreamEvaluator(nn.Module):
                 f"Please increase num_steps (current: {num_steps}) or strength."
             )
 
-        # 和官方 img2img 对齐：显式设置 begin_index，再调用 scale_noise
+        # 鍜屽畼鏂?img2img 瀵归綈锛氭樉寮忚缃?begin_index锛屽啀璋冪敤 scale_noise
         self.scheduler.set_begin_index(t_start)
 
         noise = torch.randn_like(lr_lat)
 
-        # 使用官方 scale_noise
+        # 浣跨敤瀹樻柟 scale_noise
         timestep_batch = timesteps[:1].expand(B)
         latents = self.scheduler.scale_noise(lr_lat, timestep_batch, noise)
+        del noise
         
-        # 去噪循环
+        # 鍘诲櫔寰幆
+        total_steps = len(timesteps)
         for i, t in enumerate(timesteps):
             timestep_model = t / 1000.0
-            model_output = self.forward(latents, lr_lat, lr_pixel, timestep_model, guidance)
+            if total_steps <= 1:
+                step_ratio = 1.0
+            else:
+                step_ratio = i / float(total_steps - 1)
+            keep = self.control_guidance_start <= step_ratio <= self.control_guidance_end
+            controlnet_scale = 1.0 if keep else 0.0
+
+            model_output = self.forward(
+                latents, lr_lat, lr_pixel, timestep_model, guidance,
+                controlnet_scale=controlnet_scale
+            )
             latents = self.scheduler.step(model_output, t, latents, return_dict=False)[0]
+            del model_output
         
         return latents
 
@@ -356,6 +428,7 @@ class DualStreamEvaluator(nn.Module):
 # Tiled Inference
 # ============================================================================
 
+@torch.no_grad()
 def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
                  tile_size=512, overlap=64, blend_mode='linear', strength=0.7):
     _, _, H, W = lr_t.shape
@@ -364,11 +437,13 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
         lr_lat = evaluator.encode(lr_t)
         sr_lat = evaluator.inference(lr_lat, lr_t, num_steps=num_steps, 
                                      guidance=guidance, strength=strength)
-        return evaluator.decode(sr_lat)
+        result = evaluator.decode(sr_lat)
+        del lr_lat, sr_lat
+        return result
     
     stride = tile_size - overlap
-    out = torch.zeros_like(lr_t)
-    weight = torch.zeros((1, 1, H, W), device=device)
+    out = torch.zeros((1, 3, H, W), device='cpu', dtype=torch.float32)
+    weight = torch.zeros((1, 1, H, W), device='cpu', dtype=torch.float32)
     
     if H <= tile_size:
         y_positions = [0]
@@ -389,6 +464,14 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
             x_positions.append(W - tile_size)
     
     total_tiles = len(y_positions) * len(x_positions)
+    full_blend = torch.ones((1, 1, tile_size, tile_size), dtype=torch.float32)
+    if blend_mode == 'linear':
+        for i in range(min(overlap, tile_size // 2)):
+            factor = i / overlap
+            full_blend[:, :, i, :] *= factor
+            full_blend[:, :, -i-1, :] *= factor
+            full_blend[:, :, :, i] *= factor
+            full_blend[:, :, :, -i-1] *= factor
     
     with tqdm(total=total_tiles, desc="Tiled SR", leave=False) as pbar:
         for y in y_positions:
@@ -409,27 +492,62 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
                 sr_lat = evaluator.inference(tile_lat, tile, num_steps=num_steps, 
                                             guidance=guidance, strength=strength)
                 sr_tile = evaluator.decode(sr_lat)
-                
-                sr_tile = sr_tile[:, :, :tile_h, :tile_w]
+                sr_tile_cpu = sr_tile[:, :, :tile_h, :tile_w].float().cpu()
+                del tile_lat, sr_lat, sr_tile, tile
+                clear_memory(device)
                 
                 if tile_h == tile_size and tile_w == tile_size:
-                    tile_blend = torch.ones((1, 1, tile_size, tile_size), device=device)
-                    if blend_mode == 'linear':
-                        for i in range(min(overlap, tile_size // 2)):
-                            factor = i / overlap
-                            tile_blend[:, :, i, :] *= factor
-                            tile_blend[:, :, -i-1, :] *= factor
-                            tile_blend[:, :, :, i] *= factor
-                            tile_blend[:, :, :, -i-1] *= factor
+                    tile_blend = full_blend
                 else:
-                    tile_blend = torch.ones((1, 1, tile_h, tile_w), device=device)
+                    tile_blend = torch.ones((1, 1, tile_h, tile_w), dtype=torch.float32)
                 
-                out[:, :, y:y_end, x:x_end] += sr_tile * tile_blend
+                out[:, :, y:y_end, x:x_end] += sr_tile_cpu * tile_blend
                 weight[:, :, y:y_end, x:x_end] += tile_blend
+                del sr_tile_cpu
                 
                 pbar.update(1)
     
     return out / weight.clamp(min=1e-8)
+
+
+@torch.no_grad()
+def run_sr_tiled_with_oom_retry(
+    evaluator, lr_t, device, num_steps=20, guidance=3.5,
+    tile_size=512, overlap=64, blend_mode='linear', strength=0.7,
+    min_tile_size=256
+):
+    """
+    OOM-safe tiled inference:
+    - 灏濊瘯褰撳墠 tile_size
+    - OOM 鏃舵竻鐞嗘樉瀛樺苟灏?tile_size 鍑忓崐閲嶈瘯锛岀洿鍒?min_tile_size
+    """
+    current_tile = tile_size
+    last_err = None
+    while current_tile >= min_tile_size:
+        try:
+            clear_memory(device)
+            return run_sr_tiled(
+                evaluator, lr_t, device, num_steps=num_steps, guidance=guidance,
+                tile_size=current_tile, overlap=min(overlap, max(0, current_tile // 4)),
+                blend_mode=blend_mode, strength=strength
+            )
+        except Exception as e:
+            is_oom = isinstance(e, torch.OutOfMemoryError)
+            if (not is_oom) and isinstance(e, RuntimeError):
+                msg = str(e).lower()
+                is_oom = ("out of memory" in msg) or ("cuda error: out of memory" in msg)
+
+            if not is_oom:
+                raise
+
+            last_err = e
+            clear_memory(device)
+            if current_tile == min_tile_size:
+                break
+            next_tile = max(min_tile_size, current_tile // 2)
+            print(f"[OOM] tile_size={current_tile} failed, retry with tile_size={next_tile}")
+            current_tile = next_tile
+    raise last_err if last_err is not None else RuntimeError("OOM retry failed without exception details.")
 
 
 # ============================================================================
@@ -448,13 +566,16 @@ def main():
     parser.add_argument('--guidance', type=float, default=3.5)
     parser.add_argument('--pixel_weight', type=float, default=None)
     parser.add_argument('--strength', type=float, default=None,
-                        help='推理起点 (1.0=从纯噪声，0.7=跳过30%)')
+                        help='鎺ㄧ悊璧风偣 (1.0=浠庣函鍣０锛?.7=璺宠繃30%)')
     parser.add_argument('--control_guidance_start', type=float, default=None)
     parser.add_argument('--control_guidance_end', type=float, default=None)
     
     parser.add_argument('--tile_size', type=int, default=512)
+    parser.add_argument('--min_tile_size', type=int, default=256)
     parser.add_argument('--overlap', type=int, default=64)
     parser.add_argument('--blend_mode', type=str, default='linear')
+    parser.add_argument('--calc_lpips', action='store_true')
+    parser.add_argument('--lpips_device', type=str, default='cpu', choices=['cpu', 'cuda'])
     
     parser.add_argument('--output_base', type=str, default='./outputs')
     parser.add_argument('--dataset', type=str, default=None)
@@ -500,6 +621,8 @@ def main():
         if args.control_guidance_end is not None
         else evaluator.control_guidance_end
     )
+    evaluator.control_guidance_start = control_guidance_start
+    evaluator.control_guidance_end = control_guidance_end
     
     # Experiment name
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -528,9 +651,17 @@ def main():
     print("=" * 70)
     
     lpips_fn = None
-    if LPIPS_AVAILABLE:
-        lpips_fn = lpips.LPIPS(net='alex').to(device)
-        lpips_fn.eval()
+    lpips_device = torch.device('cpu')
+    if args.calc_lpips:
+        if not LPIPS_AVAILABLE:
+            print("Warning: --calc_lpips set but lpips package not available, skip LPIPS.")
+        else:
+            if args.lpips_device == 'cuda' and torch.cuda.is_available():
+                lpips_device = torch.device('cuda')
+            else:
+                lpips_device = torch.device('cpu')
+            lpips_fn = lpips.LPIPS(net='alex').to(lpips_device)
+            lpips_fn.eval()
     
     hr_files = sorted([f for f in os.listdir(args.hr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
     lr_files = sorted([f for f in os.listdir(args.lr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
@@ -572,11 +703,12 @@ def main():
         lr_t = torch.from_numpy(lr_bicubic_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
         lr_t = lr_t.to(device).to(torch.bfloat16)
         
-        sr_t = run_sr_tiled(
+        sr_t = run_sr_tiled_with_oom_retry(
             evaluator, lr_t, device,
             num_steps=args.num_steps,
             guidance=args.guidance,
             tile_size=args.tile_size,
+            min_tile_size=args.min_tile_size,
             overlap=args.overlap,
             blend_mode=args.blend_mode,
             strength=strength
@@ -596,11 +728,12 @@ def main():
         
         if lpips_fn:
             hr_t = torch.from_numpy(hr_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
-            sr_t_lpips = torch.from_numpy(sr_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
             lr_t_lpips = torch.from_numpy(lr_bicubic_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
             
-            lpips_val = lpips_fn(sr_t_lpips.to(device), hr_t.to(device)).item()
-            lpips_bic = lpips_fn(lr_t_lpips.to(device), hr_t.to(device)).item()
+            hr_t = hr_t.to(lpips_device)
+            lr_t_lpips = lr_t_lpips.to(lpips_device)
+            lpips_val = lpips_fn(sr_t.float().clamp(-1, 1).to(lpips_device), hr_t).item()
+            lpips_bic = lpips_fn(lr_t_lpips, hr_t).item()
             lpips_list.append(lpips_val)
             lpips_bic_list.append(lpips_bic)
         
@@ -616,7 +749,11 @@ def main():
             comp.paste(hr_img, (W * 3, 0))
             comp.save(os.path.join(output_dir, 'comparisons', f'{base_name}_compare.png'))
         
-        torch.cuda.empty_cache()
+        del lr_t, sr_t
+        if lpips_fn:
+            del hr_t, lr_t_lpips
+        del hr_np, lr_bicubic_np, sr_np
+        clear_memory(device)
     
     avg_psnr = np.mean(psnr_list)
     avg_ssim = np.mean(ssim_list)
@@ -630,10 +767,10 @@ def main():
     print("=" * 70)
     print(f"Strength: {strength}")
     print(f"Pixel Weight: {evaluator.pixel_weight}")
-    if LPIPS_AVAILABLE:
+    if lpips_fn:
         print(f"Bicubic:  PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}")
         print(f"SR:       PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
-        print(f"Δ:        {avg_psnr - avg_psnr_bic:+.4f} dB, {avg_ssim - avg_ssim_bic:+.4f}, {avg_lpips_bic - avg_lpips:+.4f}")
+        print(f"螖:        {avg_psnr - avg_psnr_bic:+.4f} dB, {avg_ssim - avg_ssim_bic:+.4f}, {avg_lpips_bic - avg_lpips:+.4f}")
     else:
         print(f"Bicubic:  PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}")
         print(f"SR:       PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}")
@@ -653,7 +790,7 @@ def main():
         f.write(f"Steps: {args.num_steps}, Guidance: {args.guidance}\n")
         f.write("\n" + "=" * 60 + "\n")
         f.write("Summary:\n")
-        if LPIPS_AVAILABLE:
+        if lpips_fn:
             f.write(f"Bicubic:  PSNR={avg_psnr_bic:.4f}, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}\n")
             f.write(f"SR:       PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}\n")
         else:
@@ -663,12 +800,12 @@ def main():
         f.write("Per-image:\n")
         for i, fname in enumerate(filenames):
             delta = psnr_list[i] - psnr_bic_list[i]
-            if LPIPS_AVAILABLE:
-                f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (Δ{delta:+.2f}), LPIPS={lpips_list[i]:.4f}\n")
+            if lpips_fn:
+                f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (螖{delta:+.2f}), LPIPS={lpips_list[i]:.4f}\n")
             else:
-                f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (Δ{delta:+.2f})\n")
+                f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (螖{delta:+.2f})\n")
     
-    print(f"\n✅ Results saved: {output_dir}")
+    print(f"\n鉁?Results saved: {output_dir}")
 
 
 if __name__ == '__main__':
