@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """
 ======================================================================
-Dual-Stream FLUX SR Evaluation - 对齐官方 Diffusers 流程
+Dual-Stream FLUX SR Evaluation - 鐎靛綊缍堢€规ɑ鏌?Diffusers 濞翠胶鈻?
 ======================================================================
 
-与 train_dual_control.py 配套使用
+娑?train_dual_control.py 闁板秴顨滄担璺ㄦ暏
 
 Usage:
     python evaluate_dual_control.py \
@@ -99,9 +99,15 @@ def calculate_ssim(img1, img2):
            ((mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2))
     return ssim
 
+def clear_memory(device):
+    """Aggressively clear Python/CUDA memory."""
+    gc.collect()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 # ============================================================================
-# Evaluator - 对齐官方流程
+# Evaluator - 鐎靛綊缍堢€规ɑ鏌熷ù浣衡柤
 # ============================================================================
 
 class DualStreamEvaluator(nn.Module):
@@ -139,6 +145,7 @@ class DualStreamEvaluator(nn.Module):
         self.vae = AutoencoderKL.from_pretrained(
             self.model_name, subfolder="vae", torch_dtype=dtype
         ).to(self.device)
+        self.vae.requires_grad_(False)
         self.vae.eval()
         self.vae.enable_tiling()
         
@@ -150,16 +157,19 @@ class DualStreamEvaluator(nn.Module):
         self.transformer = FluxTransformer2DModel.from_pretrained(
             self.model_name, subfolder="transformer", torch_dtype=dtype
         ).to(self.device)
+        self.transformer.requires_grad_(False)
         self.transformer.eval()
 
         print("Loading ControlNet...")
         self.controlnet = FluxControlNetModel.from_pretrained(
             "jasperai/Flux.1-dev-Controlnet-Upscaler", torch_dtype=dtype
         ).to(self.device)
+        self.controlnet.requires_grad_(False)
         self.controlnet.eval()
 
         print("Creating Pixel Extractor...")
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
+        self.pixel_extractor.requires_grad_(False)
         self.pixel_extractor.eval()
 
         print("Loading checkpoint...")
@@ -217,10 +227,10 @@ class DualStreamEvaluator(nn.Module):
                 'text_ids': torch.zeros(t5_out[0].shape[1], 3, device=self.device, dtype=dtype),
             }
         
-        del text_enc, text_enc_2
-        torch.cuda.empty_cache()
-        gc.collect()
+        del text_enc, text_enc_2, tok, tok_2, clip_out, t5_out
+        clear_memory(self.device)
     
+    @torch.no_grad()
     def encode(self, img):
         lat = self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample()
         if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
@@ -229,6 +239,7 @@ class DualStreamEvaluator(nn.Module):
             lat = lat * self.vae.config.scaling_factor
         return lat
     
+    @torch.no_grad()
     def decode(self, lat):
         if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
             lat = (lat / self.vae.config.scaling_factor) + self.vae.config.shift_factor
@@ -299,9 +310,11 @@ class DualStreamEvaluator(nn.Module):
             )
         
         fused_cond = (lr_lat + self.pixel_weight * pixel_feat).to(dtype)
+        del pixel_feat
         
         noisy_packed = self._pack(noisy.to(dtype))
         fused_packed = self._pack(fused_cond)
+        del fused_cond
         img_ids = self._img_ids(H, W, device, dtype)
         
         pooled = self._cached_embeds['pooled'].expand(B, -1)
@@ -337,6 +350,7 @@ class DualStreamEvaluator(nn.Module):
             img_ids=img_ids,
             return_dict=False,
         )
+        del fused_packed
         
         out = self.transformer(
             hidden_states=noisy_packed,
@@ -350,12 +364,13 @@ class DualStreamEvaluator(nn.Module):
             controlnet_single_block_samples=ctrl_out[1],
             return_dict=False,
         )[0]
+        del ctrl_out, noisy_packed, img_ids
         
         return self._unpack(out, H, W)
     
     @torch.no_grad()
     def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, strength=0.7):
-        """使用官方 Scheduler 的推理"""
+        """Inference using the official scheduler."""
         B = lr_lat.shape[0]
         device = lr_lat.device
         dtype = torch.bfloat16
@@ -363,11 +378,10 @@ class DualStreamEvaluator(nn.Module):
         lr_lat = lr_lat.to(dtype)
         lr_pixel = lr_pixel.to(dtype)
         
-        # 设置 timesteps（dynamic shifting 时需要 mu）
-        self._set_scheduler_timesteps(num_steps, device, lr_lat)
+        # Set timesteps (dynamic shifting may require mu)`r`n        self._set_scheduler_timesteps(num_steps, device, lr_lat)
         timesteps = self.scheduler.timesteps
         
-        # 根据 strength 计算起始点
+        # 閺嶈宓?strength 鐠侊紕鐣荤挧宄邦潗閻?
         init_timestep = min(int(num_steps * strength), num_steps)
         t_start = max(num_steps - init_timestep, 0)
         timesteps = timesteps[t_start:]
@@ -378,16 +392,17 @@ class DualStreamEvaluator(nn.Module):
                 f"Please increase num_steps (current: {num_steps}) or strength."
             )
 
-        # 和官方 img2img 对齐：显式设置 begin_index，再调用 scale_noise
+        # 閸滃苯鐣奸弬?img2img 鐎靛綊缍堥敍姘▔瀵繗顔曠純?begin_index閿涘苯鍟€鐠嬪啰鏁?scale_noise
         self.scheduler.set_begin_index(t_start)
 
         noise = torch.randn_like(lr_lat)
 
-        # 使用官方 scale_noise
+        # 娴ｈ法鏁ょ€规ɑ鏌?scale_noise
         timestep_batch = timesteps[:1].expand(B)
         latents = self.scheduler.scale_noise(lr_lat, timestep_batch, noise)
+        del noise
         
-        # 去噪循环
+        # 閸樿娅斿顏嗗箚
         total_steps = len(timesteps)
         for i, t in enumerate(timesteps):
             timestep_model = t / 1000.0
@@ -403,6 +418,7 @@ class DualStreamEvaluator(nn.Module):
                 controlnet_scale=controlnet_scale
             )
             latents = self.scheduler.step(model_output, t, latents, return_dict=False)[0]
+            del model_output
         
         return latents
 
@@ -411,6 +427,7 @@ class DualStreamEvaluator(nn.Module):
 # Tiled Inference
 # ============================================================================
 
+@torch.no_grad()
 def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
                  tile_size=512, overlap=64, blend_mode='linear', strength=0.7):
     _, _, H, W = lr_t.shape
@@ -419,7 +436,9 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
         lr_lat = evaluator.encode(lr_t)
         sr_lat = evaluator.inference(lr_lat, lr_t, num_steps=num_steps, 
                                      guidance=guidance, strength=strength)
-        return evaluator.decode(sr_lat)
+        result = evaluator.decode(sr_lat)
+        del lr_lat, sr_lat
+        return result
     
     stride = tile_size - overlap
     out = torch.zeros((1, 3, H, W), device='cpu', dtype=torch.float32)
@@ -444,6 +463,14 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
             x_positions.append(W - tile_size)
     
     total_tiles = len(y_positions) * len(x_positions)
+    full_blend = torch.ones((1, 1, tile_size, tile_size), dtype=torch.float32)
+    if blend_mode == 'linear':
+        for i in range(min(overlap, tile_size // 2)):
+            factor = i / overlap
+            full_blend[:, :, i, :] *= factor
+            full_blend[:, :, -i-1, :] *= factor
+            full_blend[:, :, :, i] *= factor
+            full_blend[:, :, :, -i-1] *= factor
     
     with tqdm(total=total_tiles, desc="Tiled SR", leave=False) as pbar:
         for y in y_positions:
@@ -464,29 +491,25 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
                 sr_lat = evaluator.inference(tile_lat, tile, num_steps=num_steps, 
                                             guidance=guidance, strength=strength)
                 sr_tile = evaluator.decode(sr_lat)
-                
-                sr_tile = sr_tile[:, :, :tile_h, :tile_w]
+                sr_tile_cpu = sr_tile[:, :, :tile_h, :tile_w].float().cpu()
+                del tile_lat, sr_lat, sr_tile, tile
+                clear_memory(device)
                 
                 if tile_h == tile_size and tile_w == tile_size:
-                    tile_blend = torch.ones((1, 1, tile_size, tile_size), device='cpu', dtype=torch.float32)
-                    if blend_mode == 'linear':
-                        for i in range(min(overlap, tile_size // 2)):
-                            factor = i / overlap
-                            tile_blend[:, :, i, :] *= factor
-                            tile_blend[:, :, -i-1, :] *= factor
-                            tile_blend[:, :, :, i] *= factor
-                            tile_blend[:, :, :, -i-1] *= factor
+                    tile_blend = full_blend
                 else:
-                    tile_blend = torch.ones((1, 1, tile_h, tile_w), device='cpu', dtype=torch.float32)
+                    tile_blend = torch.ones((1, 1, tile_h, tile_w), dtype=torch.float32)
                 
-                out[:, :, y:y_end, x:x_end] += sr_tile.float().cpu() * tile_blend
+                out[:, :, y:y_end, x:x_end] += sr_tile_cpu * tile_blend
                 weight[:, :, y:y_end, x:x_end] += tile_blend
+                del sr_tile_cpu
                 
                 pbar.update(1)
     
     return out / weight.clamp(min=1e-8)
 
 
+@torch.no_grad()
 def run_sr_tiled_with_oom_retry(
     evaluator, lr_t, device, num_steps=20, guidance=3.5,
     tile_size=512, overlap=64, blend_mode='linear', strength=0.7,
@@ -494,23 +517,30 @@ def run_sr_tiled_with_oom_retry(
 ):
     """
     OOM-safe tiled inference:
-    - 尝试当前 tile_size
-    - OOM 时清理显存并将 tile_size 减半重试，直到 min_tile_size
+    - 鐏忔繆鐦ぐ鎾冲 tile_size
+    - OOM 閺冭埖绔婚悶鍡樻▔鐎涙ê鑻熺亸?tile_size 閸戝繐宕愰柌宥堢槸閿涘瞼娲块崚?min_tile_size
     """
     current_tile = tile_size
     last_err = None
     while current_tile >= min_tile_size:
         try:
+            clear_memory(device)
             return run_sr_tiled(
                 evaluator, lr_t, device, num_steps=num_steps, guidance=guidance,
                 tile_size=current_tile, overlap=min(overlap, max(0, current_tile // 4)),
                 blend_mode=blend_mode, strength=strength
             )
-        except torch.OutOfMemoryError as e:
+        except Exception as e:
+            is_oom = isinstance(e, torch.OutOfMemoryError)
+            if (not is_oom) and isinstance(e, RuntimeError):
+                msg = str(e).lower()
+                is_oom = ("out of memory" in msg) or ("cuda error: out of memory" in msg)
+
+            if not is_oom:
+                raise
+
             last_err = e
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-            gc.collect()
+            clear_memory(device)
             if current_tile == min_tile_size:
                 break
             next_tile = max(min_tile_size, current_tile // 2)
@@ -535,7 +565,7 @@ def main():
     parser.add_argument('--guidance', type=float, default=3.5)
     parser.add_argument('--pixel_weight', type=float, default=None)
     parser.add_argument('--strength', type=float, default=None,
-                        help='推理起点 (1.0=从纯噪声，0.7=跳过30%)')
+                        help='閹恒劎鎮婄挧椋庡仯 (1.0=娴犲海鍑介崳顏勶紣閿?.7=鐠哄疇绻?0%)')
     parser.add_argument('--control_guidance_start', type=float, default=None)
     parser.add_argument('--control_guidance_end', type=float, default=None)
     
@@ -721,9 +751,8 @@ def main():
         del lr_t, sr_t
         if lpips_fn:
             del hr_t, lr_t_lpips
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-        gc.collect()
+        del hr_np, lr_bicubic_np, sr_np
+        clear_memory(device)
     
     avg_psnr = np.mean(psnr_list)
     avg_ssim = np.mean(ssim_list)
@@ -740,7 +769,7 @@ def main():
     if lpips_fn:
         print(f"Bicubic:  PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}")
         print(f"SR:       PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
-        print(f"Δ:        {avg_psnr - avg_psnr_bic:+.4f} dB, {avg_ssim - avg_ssim_bic:+.4f}, {avg_lpips_bic - avg_lpips:+.4f}")
+        print(f"铻?        {avg_psnr - avg_psnr_bic:+.4f} dB, {avg_ssim - avg_ssim_bic:+.4f}, {avg_lpips_bic - avg_lpips:+.4f}")
     else:
         print(f"Bicubic:  PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}")
         print(f"SR:       PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}")
@@ -771,11 +800,11 @@ def main():
         for i, fname in enumerate(filenames):
             delta = psnr_list[i] - psnr_bic_list[i]
             if lpips_fn:
-                f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (Δ{delta:+.2f}), LPIPS={lpips_list[i]:.4f}\n")
+                f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (铻杮delta:+.2f}), LPIPS={lpips_list[i]:.4f}\n")
             else:
-                f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (Δ{delta:+.2f})\n")
+                f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (铻杮delta:+.2f})\n")
     
-    print(f"\n✅ Results saved: {output_dir}")
+    print(f"\n閴?Results saved: {output_dir}")
 
 
 if __name__ == '__main__':
