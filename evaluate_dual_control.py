@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """
 ======================================================================
-Dual-Stream FLUX SR Evaluation - 鐎靛綊缍堢€规ɑ鏌?Diffusers 濞翠胶鈻?
+Dual-Stream FLUX SR Evaluation - aligned with official Diffusers pipeline
 ======================================================================
 
-娑?train_dual_control.py 闁板秴顨滄担璺ㄦ暏
+Companion script for train_dual_control.py
 
 Usage:
     python evaluate_dual_control.py \
@@ -107,7 +107,7 @@ def clear_memory(device):
         torch.cuda.synchronize()
 
 # ============================================================================
-# Evaluator - 鐎靛綊缍堢€规ɑ鏌熷ù浣衡柤
+# Evaluator
 # ============================================================================
 
 class DualStreamEvaluator(nn.Module):
@@ -378,10 +378,11 @@ class DualStreamEvaluator(nn.Module):
         lr_lat = lr_lat.to(dtype)
         lr_pixel = lr_pixel.to(dtype)
         
-        # Set timesteps (dynamic shifting may require mu)`r`n        self._set_scheduler_timesteps(num_steps, device, lr_lat)
+        # Set timesteps (dynamic shifting may require mu)
+        self._set_scheduler_timesteps(num_steps, device, lr_lat)
         timesteps = self.scheduler.timesteps
         
-        # 閺嶈宓?strength 鐠侊紕鐣荤挧宄邦潗閻?
+        # Compute start point based on strength
         init_timestep = min(int(num_steps * strength), num_steps)
         t_start = max(num_steps - init_timestep, 0)
         timesteps = timesteps[t_start:]
@@ -392,17 +393,17 @@ class DualStreamEvaluator(nn.Module):
                 f"Please increase num_steps (current: {num_steps}) or strength."
             )
 
-        # 閸滃苯鐣奸弬?img2img 鐎靛綊缍堥敍姘▔瀵繗顔曠純?begin_index閿涘苯鍟€鐠嬪啰鏁?scale_noise
+        # Align with official img2img: set begin_index then call scale_noise
         self.scheduler.set_begin_index(t_start)
 
         noise = torch.randn_like(lr_lat)
 
-        # 娴ｈ法鏁ょ€规ɑ鏌?scale_noise
+        # Use official scale_noise
         timestep_batch = timesteps[:1].expand(B)
         latents = self.scheduler.scale_noise(lr_lat, timestep_batch, noise)
         del noise
         
-        # 閸樿娅斿顏嗗箚
+        # Denoising loop
         total_steps = len(timesteps)
         for i, t in enumerate(timesteps):
             timestep_model = t / 1000.0
@@ -517,8 +518,8 @@ def run_sr_tiled_with_oom_retry(
 ):
     """
     OOM-safe tiled inference:
-    - 鐏忔繆鐦ぐ鎾冲 tile_size
-    - OOM 閺冭埖绔婚悶鍡樻▔鐎涙ê鑻熺亸?tile_size 閸戝繐宕愰柌宥堢槸閿涘瞼娲块崚?min_tile_size
+    - Try current tile_size
+    - On OOM, clear memory and halve tile_size until min_tile_size
     """
     current_tile = tile_size
     last_err = None
@@ -565,7 +566,7 @@ def main():
     parser.add_argument('--guidance', type=float, default=3.5)
     parser.add_argument('--pixel_weight', type=float, default=None)
     parser.add_argument('--strength', type=float, default=None,
-                        help='閹恒劎鎮婄挧椋庡仯 (1.0=娴犲海鍑介崳顏勶紣閿?.7=鐠哄疇绻?0%)')
+                        help='Inference start strength (1.0 = pure noise start, 0.7 = skip first 30% steps)')
     parser.add_argument('--control_guidance_start', type=float, default=None)
     parser.add_argument('--control_guidance_end', type=float, default=None)
     
@@ -769,7 +770,7 @@ def main():
     if lpips_fn:
         print(f"Bicubic:  PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}")
         print(f"SR:       PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
-        print(f"铻?        {avg_psnr - avg_psnr_bic:+.4f} dB, {avg_ssim - avg_ssim_bic:+.4f}, {avg_lpips_bic - avg_lpips:+.4f}")
+        print(f"Delta:    {avg_psnr - avg_psnr_bic:+.4f} dB, {avg_ssim - avg_ssim_bic:+.4f}, {avg_lpips_bic - avg_lpips:+.4f}")
     else:
         print(f"Bicubic:  PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}")
         print(f"SR:       PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}")
@@ -804,7 +805,7 @@ def main():
             else:
                 f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (delta {delta:+.2f})\n")
     
-    print(f"\n閴?Results saved: {output_dir}")
+    print(f"\nResults saved: {output_dir}")
 
 
 if __name__ == '__main__':
