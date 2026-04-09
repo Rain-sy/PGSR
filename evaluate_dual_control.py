@@ -251,6 +251,38 @@ class DualStreamEvaluator(nn.Module):
         ids[..., 1] = torch.arange(h, device=device, dtype=dtype)[:, None]
         ids[..., 2] = torch.arange(w, device=device, dtype=dtype)[None, :]
         return ids.reshape(h * w, 3)
+
+    def _compute_scheduler_mu(self, latent):
+        """Compute `mu` for FlowMatch dynamic shifting when required."""
+        if not getattr(self.scheduler.config, "use_dynamic_shifting", False):
+            return None
+
+        base_shift = float(getattr(self.scheduler.config, "base_shift", 0.5))
+        max_shift = float(getattr(self.scheduler.config, "max_shift", 1.15))
+        base_seq = int(getattr(self.scheduler.config, "base_image_seq_len", 256))
+        max_seq = int(getattr(self.scheduler.config, "max_image_seq_len", 4096))
+
+        h, w = latent.shape[-2:]
+        image_seq_len = int((h // 2) * (w // 2))
+
+        if max_seq == base_seq:
+            return base_shift
+
+        slope = (max_shift - base_shift) / (max_seq - base_seq)
+        mu = slope * image_seq_len + (base_shift - slope * base_seq)
+        return float(mu)
+
+    def _set_scheduler_timesteps(self, num_steps, device, latent_for_mu):
+        """Set scheduler timesteps with backward-compatible `mu` handling."""
+        mu = self._compute_scheduler_mu(latent_for_mu)
+        if mu is not None:
+            try:
+                self.scheduler.set_timesteps(num_steps, device=device, mu=mu)
+                return
+            except TypeError:
+                # Older diffusers may not accept `mu` in set_timesteps
+                pass
+        self.scheduler.set_timesteps(num_steps, device=device)
     
     @torch.no_grad()
     def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5):
@@ -328,8 +360,8 @@ class DualStreamEvaluator(nn.Module):
         lr_lat = lr_lat.to(dtype)
         lr_pixel = lr_pixel.to(dtype)
         
-        # 设置 timesteps
-        self.scheduler.set_timesteps(num_steps, device=device)
+        # 设置 timesteps（dynamic shifting 时需要 mu）
+        self._set_scheduler_timesteps(num_steps, device, lr_lat)
         timesteps = self.scheduler.timesteps
         
         # 根据 strength 计算起始点
