@@ -800,9 +800,9 @@ def main():
         for i, fname in enumerate(filenames):
             delta = psnr_list[i] - psnr_bic_list[i]
             if lpips_fn:
-                f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (铻杮delta:+.2f}), LPIPS={lpips_list[i]:.4f}\n")
+                f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (delta {delta:+.2f}), LPIPS={lpips_list[i]:.4f}\n")
             else:
-                f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (铻杮delta:+.2f})\n")
+                f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (delta {delta:+.2f})\n")
     
     print(f"\n閴?Results saved: {output_dir}")
 
