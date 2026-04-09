@@ -164,13 +164,18 @@ class DualStreamFLUXSR(nn.Module):
     Dual-Stream FLUX SR System - 使用官方 Scheduler
     """
     
-    def __init__(self, model_name, device, pretrained_controlnet=None, 
-                 train_controlnet=True, pixel_weight=1.0):
+    def __init__(self, model_name, device, pretrained_controlnet=None,
+                 train_controlnet=True, pixel_weight=1.0,
+                 control_guidance_start=0.0, control_guidance_end=1.0,
+                 conditioning_scale=1.0):
         super().__init__()
         self.model_name = model_name
         self.device = device
         self.train_controlnet = train_controlnet
         self.pixel_weight = pixel_weight
+        self.control_guidance_start = control_guidance_start
+        self.control_guidance_end = control_guidance_end
+        self.conditioning_scale = conditioning_scale
         
         self.vae = None
         self.transformer = None
@@ -206,6 +211,10 @@ class DualStreamFLUXSR(nn.Module):
         self.vae.eval()
         self.vae.enable_tiling()
         
+        # Cache text embeddings (空字符串) - 提前做，避免初始化显存峰值
+        print(f"[Rank {local_rank}] Caching text embeddings...")
+        self._cache_text_embeddings()
+
         # Load Transformer (frozen)
         print(f"[Rank {local_rank}] Loading FLUX Transformer...")
         self.transformer = FluxTransformer2DModel.from_pretrained(
@@ -213,29 +222,25 @@ class DualStreamFLUXSR(nn.Module):
         ).to(self.device)
         self.transformer.requires_grad_(False)
         self.transformer.eval()
-        
+
         # Load ControlNet
         controlnet_path = pretrained_controlnet or "jasperai/Flux.1-dev-Controlnet-Upscaler"
         print(f"[Rank {local_rank}] Loading ControlNet from {controlnet_path}...")
         self.controlnet = FluxControlNetModel.from_pretrained(
             controlnet_path, torch_dtype=dtype
         ).to(self.device)
-        
+
         if self.train_controlnet:
             self.controlnet.train()
             self.controlnet.requires_grad_(True)
         else:
             self.controlnet.eval()
             self.controlnet.requires_grad_(False)
-        
+
         # Pixel Feature Extractor
         print(f"[Rank {local_rank}] Initializing Pixel Feature Extractor...")
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         self.pixel_extractor.train()
-        
-        # Cache text embeddings (空字符串)
-        print(f"[Rank {local_rank}] Caching text embeddings...")
-        self._cache_text_embeddings()
         
         # Enable Flash Attention
         try:
@@ -352,7 +357,7 @@ class DualStreamFLUXSR(nn.Module):
                 pass
         self.scheduler.set_timesteps(num_steps, device=device)
     
-    def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5):
+    def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5, controlnet_scale=1.0):
         """
         Forward pass: predict velocity
         
@@ -409,6 +414,7 @@ class DualStreamFLUXSR(nn.Module):
         ctrl_out = self.controlnet(
             hidden_states=noisy_packed,
             controlnet_cond=fused_packed,
+            conditioning_scale=float(self.conditioning_scale * controlnet_scale),
             timestep=t_input,
             guidance=controlnet_guidance,
             pooled_projections=pooled,
@@ -478,12 +484,23 @@ class DualStreamFLUXSR(nn.Module):
         latents = self.scheduler.scale_noise(lr_lat, timestep_batch, noise)
         
         # 去噪循环
+        total_steps = len(timesteps)
         for i, t in enumerate(timesteps):
             # 🌟 传给模型的 timestep 需要 / 1000
             timestep_model = t / 1000.0
+
+            if total_steps <= 1:
+                step_ratio = 1.0
+            else:
+                step_ratio = i / float(total_steps - 1)
+            keep = self.control_guidance_start <= step_ratio <= self.control_guidance_end
+            controlnet_scale = 1.0 if keep else 0.0
             
             # 预测 velocity
-            model_output = self.forward(latents, lr_lat, lr_pixel, timestep_model, guidance)
+            model_output = self.forward(
+                latents, lr_lat, lr_pixel, timestep_model, guidance,
+                controlnet_scale=controlnet_scale
+            )
             
             # 🌟 使用官方 scheduler.step 更新
             latents = self.scheduler.step(model_output, t, latents, return_dict=False)[0]
@@ -594,6 +611,7 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
         'loss': loss,
         'psnr': psnr,
         'pixel_weight': pixel_weight,
+        'conditioning_scale': unwrapped.conditioning_scale,
         'strength': strength,
         'control_guidance_start': control_guidance_start,
         'control_guidance_end': control_guidance_end,
@@ -621,6 +639,7 @@ def main():
     parser.add_argument('--model_name', type=str, default='black-forest-labs/FLUX.1-dev')
     parser.add_argument('--pretrained_controlnet', type=str, default=None)
     parser.add_argument('--pixel_weight', type=float, default=1.0)
+    parser.add_argument('--conditioning_scale', type=float, default=1.0)
     
     # Training
     parser.add_argument('--batch_size', type=int, default=4)
@@ -674,6 +693,7 @@ def main():
         print(f"Num Crops: {args.num_crops}")
         print(f"Batch Size: {args.batch_size}")
         print(f"Pixel Weight: {args.pixel_weight}")
+        print(f"Conditioning Scale: {args.conditioning_scale}")
         print(f"Strength: {args.strength} (推理时跳过 {(1-args.strength)*100:.0f}% 步数)")
         print(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]")
         print(f"Learning Rate: {args.lr} (PixelExtractor: {args.lr * 10})")
@@ -683,7 +703,10 @@ def main():
     # Create model
     system = DualStreamFLUXSR(
         args.model_name, device, args.pretrained_controlnet,
-        train_controlnet=args.train_controlnet, pixel_weight=args.pixel_weight
+        train_controlnet=args.train_controlnet, pixel_weight=args.pixel_weight,
+        control_guidance_start=args.control_guidance_start,
+        control_guidance_end=args.control_guidance_end,
+        conditioning_scale=args.conditioning_scale,
     )
     
     # Enable gradient checkpointing
@@ -775,6 +798,8 @@ def main():
             args.control_guidance_start = ckpt['control_guidance_start']
         if 'control_guidance_end' in ckpt:
             args.control_guidance_end = ckpt['control_guidance_end']
+        if 'conditioning_scale' in ckpt:
+            unwrapped.conditioning_scale = ckpt['conditioning_scale']
         if is_main:
             print(f"[Resume] Starting from epoch {start_epoch}, best PSNR: {best_psnr:.2f}")
     
@@ -786,6 +811,7 @@ def main():
             f.write("=" * 60 + "\n")
             f.write(f"Strength: {args.strength}\n")
             f.write(f"Pixel Weight: {args.pixel_weight}\n\n")
+            f.write(f"Conditioning Scale: {args.conditioning_scale}\n")
             f.write(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]\n\n")
     
     # Training loop

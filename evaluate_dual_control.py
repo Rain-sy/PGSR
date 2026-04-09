@@ -121,6 +121,7 @@ class DualStreamEvaluator(nn.Module):
         self.strength = 0.7
         self.control_guidance_start = 0.0
         self.control_guidance_end = 1.0
+        self.conditioning_scale = 1.0
     
     def load(self):
         from diffusers import FluxTransformer2DModel, AutoencoderKL, FluxControlNetModel
@@ -141,47 +142,48 @@ class DualStreamEvaluator(nn.Module):
         self.vae.eval()
         self.vae.enable_tiling()
         
+        # Cache text embeddings
+        print("Caching text embeddings...")
+        self._cache_text_embeddings()
+
         print("Loading Transformer...")
         self.transformer = FluxTransformer2DModel.from_pretrained(
             self.model_name, subfolder="transformer", torch_dtype=dtype
         ).to(self.device)
         self.transformer.eval()
-        
+
         print("Loading ControlNet...")
         self.controlnet = FluxControlNetModel.from_pretrained(
             "jasperai/Flux.1-dev-Controlnet-Upscaler", torch_dtype=dtype
         ).to(self.device)
         self.controlnet.eval()
-        
+
         print("Creating Pixel Extractor...")
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         self.pixel_extractor.eval()
-        
+
         print("Loading checkpoint...")
         ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
-        
+
         if 'pixel_extractor' in ckpt:
             state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
             self.pixel_extractor.load_state_dict(state)
-        
+
         if 'controlnet' in ckpt:
             state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
             self.controlnet.load_state_dict(state)
-        
+
         if 'pixel_weight' in ckpt:
             self.pixel_weight = ckpt['pixel_weight']
-        
+        self.conditioning_scale = ckpt.get('conditioning_scale', 1.0)
         self.strength = ckpt.get('strength', 0.7)
         self.control_guidance_start = ckpt.get('control_guidance_start', 0.0)
         self.control_guidance_end = ckpt.get('control_guidance_end', 1.0)
-        
+
         print(f"Checkpoint: epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', 0):.2f}")
         print(f"Pixel Weight: {self.pixel_weight}, Strength: {self.strength}")
+        print(f"Conditioning Scale: {self.conditioning_scale}")
         print(f"Control Guidance Window: [{self.control_guidance_start}, {self.control_guidance_end}]")
-        
-        # Cache text embeddings
-        print("Caching text embeddings...")
-        self._cache_text_embeddings()
         
         try:
             self.transformer.enable_xformers_memory_efficient_attention()
@@ -285,7 +287,7 @@ class DualStreamEvaluator(nn.Module):
         self.scheduler.set_timesteps(num_steps, device=device)
     
     @torch.no_grad()
-    def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5):
+    def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5, controlnet_scale=1.0):
         B, C, H, W = noisy.shape
         device = noisy.device
         dtype = torch.bfloat16
@@ -326,6 +328,7 @@ class DualStreamEvaluator(nn.Module):
         ctrl_out = self.controlnet(
             hidden_states=noisy_packed,
             controlnet_cond=fused_packed,
+            conditioning_scale=float(self.conditioning_scale * controlnet_scale),
             timestep=t_input,
             guidance=controlnet_guidance,
             pooled_projections=pooled,
@@ -385,9 +388,20 @@ class DualStreamEvaluator(nn.Module):
         latents = self.scheduler.scale_noise(lr_lat, timestep_batch, noise)
         
         # 去噪循环
+        total_steps = len(timesteps)
         for i, t in enumerate(timesteps):
             timestep_model = t / 1000.0
-            model_output = self.forward(latents, lr_lat, lr_pixel, timestep_model, guidance)
+            if total_steps <= 1:
+                step_ratio = 1.0
+            else:
+                step_ratio = i / float(total_steps - 1)
+            keep = self.control_guidance_start <= step_ratio <= self.control_guidance_end
+            controlnet_scale = 1.0 if keep else 0.0
+
+            model_output = self.forward(
+                latents, lr_lat, lr_pixel, timestep_model, guidance,
+                controlnet_scale=controlnet_scale
+            )
             latents = self.scheduler.step(model_output, t, latents, return_dict=False)[0]
         
         return latents
@@ -408,8 +422,8 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
         return evaluator.decode(sr_lat)
     
     stride = tile_size - overlap
-    out = torch.zeros_like(lr_t)
-    weight = torch.zeros((1, 1, H, W), device=device)
+    out = torch.zeros((1, 3, H, W), device='cpu', dtype=torch.float32)
+    weight = torch.zeros((1, 1, H, W), device='cpu', dtype=torch.float32)
     
     if H <= tile_size:
         y_positions = [0]
@@ -454,7 +468,7 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
                 sr_tile = sr_tile[:, :, :tile_h, :tile_w]
                 
                 if tile_h == tile_size and tile_w == tile_size:
-                    tile_blend = torch.ones((1, 1, tile_size, tile_size), device=device)
+                    tile_blend = torch.ones((1, 1, tile_size, tile_size), device='cpu', dtype=torch.float32)
                     if blend_mode == 'linear':
                         for i in range(min(overlap, tile_size // 2)):
                             factor = i / overlap
@@ -463,9 +477,9 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
                             tile_blend[:, :, :, i] *= factor
                             tile_blend[:, :, :, -i-1] *= factor
                 else:
-                    tile_blend = torch.ones((1, 1, tile_h, tile_w), device=device)
+                    tile_blend = torch.ones((1, 1, tile_h, tile_w), device='cpu', dtype=torch.float32)
                 
-                out[:, :, y:y_end, x:x_end] += sr_tile * tile_blend
+                out[:, :, y:y_end, x:x_end] += sr_tile.float().cpu() * tile_blend
                 weight[:, :, y:y_end, x:x_end] += tile_blend
                 
                 pbar.update(1)
@@ -529,6 +543,8 @@ def main():
     parser.add_argument('--min_tile_size', type=int, default=256)
     parser.add_argument('--overlap', type=int, default=64)
     parser.add_argument('--blend_mode', type=str, default='linear')
+    parser.add_argument('--calc_lpips', action='store_true')
+    parser.add_argument('--lpips_device', type=str, default='cpu', choices=['cpu', 'cuda'])
     
     parser.add_argument('--output_base', type=str, default='./outputs')
     parser.add_argument('--dataset', type=str, default=None)
@@ -574,6 +590,8 @@ def main():
         if args.control_guidance_end is not None
         else evaluator.control_guidance_end
     )
+    evaluator.control_guidance_start = control_guidance_start
+    evaluator.control_guidance_end = control_guidance_end
     
     # Experiment name
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -602,9 +620,17 @@ def main():
     print("=" * 70)
     
     lpips_fn = None
-    if LPIPS_AVAILABLE:
-        lpips_fn = lpips.LPIPS(net='alex').to(device)
-        lpips_fn.eval()
+    lpips_device = torch.device('cpu')
+    if args.calc_lpips:
+        if not LPIPS_AVAILABLE:
+            print("Warning: --calc_lpips set but lpips package not available, skip LPIPS.")
+        else:
+            if args.lpips_device == 'cuda' and torch.cuda.is_available():
+                lpips_device = torch.device('cuda')
+            else:
+                lpips_device = torch.device('cpu')
+            lpips_fn = lpips.LPIPS(net='alex').to(lpips_device)
+            lpips_fn.eval()
     
     hr_files = sorted([f for f in os.listdir(args.hr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
     lr_files = sorted([f for f in os.listdir(args.lr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
@@ -673,9 +699,9 @@ def main():
             hr_t = torch.from_numpy(hr_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
             lr_t_lpips = torch.from_numpy(lr_bicubic_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
             
-            hr_t = hr_t.to(device)
-            lr_t_lpips = lr_t_lpips.to(device)
-            lpips_val = lpips_fn(sr_t.float().clamp(-1, 1), hr_t).item()
+            hr_t = hr_t.to(lpips_device)
+            lr_t_lpips = lr_t_lpips.to(lpips_device)
+            lpips_val = lpips_fn(sr_t.float().clamp(-1, 1).to(lpips_device), hr_t).item()
             lpips_bic = lpips_fn(lr_t_lpips, hr_t).item()
             lpips_list.append(lpips_val)
             lpips_bic_list.append(lpips_bic)
@@ -711,7 +737,7 @@ def main():
     print("=" * 70)
     print(f"Strength: {strength}")
     print(f"Pixel Weight: {evaluator.pixel_weight}")
-    if LPIPS_AVAILABLE:
+    if lpips_fn:
         print(f"Bicubic:  PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}")
         print(f"SR:       PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
         print(f"Δ:        {avg_psnr - avg_psnr_bic:+.4f} dB, {avg_ssim - avg_ssim_bic:+.4f}, {avg_lpips_bic - avg_lpips:+.4f}")
@@ -734,7 +760,7 @@ def main():
         f.write(f"Steps: {args.num_steps}, Guidance: {args.guidance}\n")
         f.write("\n" + "=" * 60 + "\n")
         f.write("Summary:\n")
-        if LPIPS_AVAILABLE:
+        if lpips_fn:
             f.write(f"Bicubic:  PSNR={avg_psnr_bic:.4f}, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}\n")
             f.write(f"SR:       PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}\n")
         else:
@@ -744,7 +770,7 @@ def main():
         f.write("Per-image:\n")
         for i, fname in enumerate(filenames):
             delta = psnr_list[i] - psnr_bic_list[i]
-            if LPIPS_AVAILABLE:
+            if lpips_fn:
                 f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (Δ{delta:+.2f}), LPIPS={lpips_list[i]:.4f}\n")
             else:
                 f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (Δ{delta:+.2f})\n")
