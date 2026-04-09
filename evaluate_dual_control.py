@@ -473,6 +473,38 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
     return out / weight.clamp(min=1e-8)
 
 
+def run_sr_tiled_with_oom_retry(
+    evaluator, lr_t, device, num_steps=20, guidance=3.5,
+    tile_size=512, overlap=64, blend_mode='linear', strength=0.7,
+    min_tile_size=256
+):
+    """
+    OOM-safe tiled inference:
+    - 尝试当前 tile_size
+    - OOM 时清理显存并将 tile_size 减半重试，直到 min_tile_size
+    """
+    current_tile = tile_size
+    last_err = None
+    while current_tile >= min_tile_size:
+        try:
+            return run_sr_tiled(
+                evaluator, lr_t, device, num_steps=num_steps, guidance=guidance,
+                tile_size=current_tile, overlap=min(overlap, max(0, current_tile // 4)),
+                blend_mode=blend_mode, strength=strength
+            )
+        except torch.OutOfMemoryError as e:
+            last_err = e
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
+            if current_tile == min_tile_size:
+                break
+            next_tile = max(min_tile_size, current_tile // 2)
+            print(f"[OOM] tile_size={current_tile} failed, retry with tile_size={next_tile}")
+            current_tile = next_tile
+    raise last_err if last_err is not None else RuntimeError("OOM retry failed without exception details.")
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -494,6 +526,7 @@ def main():
     parser.add_argument('--control_guidance_end', type=float, default=None)
     
     parser.add_argument('--tile_size', type=int, default=512)
+    parser.add_argument('--min_tile_size', type=int, default=256)
     parser.add_argument('--overlap', type=int, default=64)
     parser.add_argument('--blend_mode', type=str, default='linear')
     
@@ -613,11 +646,12 @@ def main():
         lr_t = torch.from_numpy(lr_bicubic_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
         lr_t = lr_t.to(device).to(torch.bfloat16)
         
-        sr_t = run_sr_tiled(
+        sr_t = run_sr_tiled_with_oom_retry(
             evaluator, lr_t, device,
             num_steps=args.num_steps,
             guidance=args.guidance,
             tile_size=args.tile_size,
+            min_tile_size=args.min_tile_size,
             overlap=args.overlap,
             blend_mode=args.blend_mode,
             strength=strength
@@ -637,11 +671,12 @@ def main():
         
         if lpips_fn:
             hr_t = torch.from_numpy(hr_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
-            sr_t_lpips = torch.from_numpy(sr_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
             lr_t_lpips = torch.from_numpy(lr_bicubic_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
             
-            lpips_val = lpips_fn(sr_t_lpips.to(device), hr_t.to(device)).item()
-            lpips_bic = lpips_fn(lr_t_lpips.to(device), hr_t.to(device)).item()
+            hr_t = hr_t.to(device)
+            lr_t_lpips = lr_t_lpips.to(device)
+            lpips_val = lpips_fn(sr_t.float().clamp(-1, 1), hr_t).item()
+            lpips_bic = lpips_fn(lr_t_lpips, hr_t).item()
             lpips_list.append(lpips_val)
             lpips_bic_list.append(lpips_bic)
         
@@ -657,7 +692,12 @@ def main():
             comp.paste(hr_img, (W * 3, 0))
             comp.save(os.path.join(output_dir, 'comparisons', f'{base_name}_compare.png'))
         
-        torch.cuda.empty_cache()
+        del lr_t, sr_t
+        if lpips_fn:
+            del hr_t, lr_t_lpips
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        gc.collect()
     
     avg_psnr = np.mean(psnr_list)
     avg_ssim = np.mean(ssim_list)
