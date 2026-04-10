@@ -574,8 +574,12 @@ def main():
     parser.add_argument('--min_tile_size', type=int, default=256)
     parser.add_argument('--overlap', type=int, default=64)
     parser.add_argument('--blend_mode', type=str, default='linear')
-    parser.add_argument('--calc_lpips', action='store_true')
+    parser.add_argument('--calc_lpips', dest='calc_lpips', action='store_true',
+                        help='Enable LPIPS calculation (default: enabled if lpips package is available)')
+    parser.add_argument('--no_calc_lpips', dest='calc_lpips', action='store_false',
+                        help='Disable LPIPS calculation')
     parser.add_argument('--lpips_device', type=str, default='cpu', choices=['cpu', 'cuda'])
+    parser.set_defaults(calc_lpips=True)
     
     parser.add_argument('--output_base', type=str, default='./outputs')
     parser.add_argument('--dataset', type=str, default=None)
@@ -654,7 +658,7 @@ def main():
     lpips_device = torch.device('cpu')
     if args.calc_lpips:
         if not LPIPS_AVAILABLE:
-            print("Warning: --calc_lpips set but lpips package not available, skip LPIPS.")
+            print("Warning: LPIPS enabled but lpips package not available, skip LPIPS.")
         else:
             if args.lpips_device == 'cuda' and torch.cuda.is_available():
                 lpips_device = torch.device('cuda')

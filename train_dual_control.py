@@ -525,7 +525,7 @@ class DualStreamFLUXSR(nn.Module):
 # Training Functions - 对齐官方 Scheduler
 # ============================================================================
 
-def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, num_train_timesteps=1000):
+def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, guidance=3.5, num_train_timesteps=1000):
     """
     Flow Matching Loss - 对齐官方 Scheduler 的 timestep 格式
     
@@ -547,6 +547,7 @@ def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, num_train_times
     # 采样 sigma（对应官方 scheduler.sigmas，而不是手工 U[0,1]）
     # 这样能保留 shift / dynamic shifting 等配置语义
     unwrapped = system.module if hasattr(system, 'module') else system
+    unwrapped._set_scheduler_timesteps(num_train_timesteps, device, hr_lat)
     sched_sigmas = unwrapped.scheduler.sigmas[:-1] if unwrapped.scheduler.sigmas.shape[0] > 1 else unwrapped.scheduler.sigmas
     sigma_idx = torch.randint(0, sched_sigmas.shape[0], (B,), device=device)
     sigma = sched_sigmas.to(device=device, dtype=dtype)[sigma_idx]
@@ -560,7 +561,7 @@ def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, num_train_times
     target_v = noise - hr_lat
     
     # 🌟 传给模型的 timestep = sigma（因为官方是 timestep / 1000，而 timestep = sigma * 1000）
-    v_pred = unwrapped.forward(noisy, lr_lat, lr_pixel, sigma)
+    v_pred = unwrapped.forward(noisy, lr_lat, lr_pixel, sigma, guidance=guidance)
     
     # Loss
     loss = F.mse_loss(v_pred.float(), target_v.float())
@@ -579,7 +580,7 @@ def calculate_psnr(pred, target):
 
 @torch.no_grad()
 def validate(system, accelerator, val_loader, device, num_samples=5, 
-             num_steps=20, strength=0.7):
+             num_steps=20, guidance=3.5, strength=0.7):
     """验证（使用官方 scheduler）"""
     unwrapped = accelerator.unwrap_model(system)
     unwrapped.pixel_extractor.eval()
@@ -597,7 +598,7 @@ def validate(system, accelerator, val_loader, device, num_samples=5,
         hr_lat = unwrapped.encode(hr)
         lr_lat = unwrapped.encode(lr)
         
-        sr_lat = unwrapped.inference(lr_lat, lr, num_steps=num_steps, strength=strength)
+        sr_lat = unwrapped.inference(lr_lat, lr, num_steps=num_steps, guidance=guidance, strength=strength)
         sr = unwrapped.decode(sr_lat)
         
         psnr_list.append(calculate_psnr(sr.float(), hr.float()))
@@ -803,8 +804,10 @@ def main():
         best_psnr = ckpt.get('psnr', 0.0)
         if 'control_guidance_start' in ckpt:
             args.control_guidance_start = ckpt['control_guidance_start']
+            unwrapped.control_guidance_start = ckpt['control_guidance_start']
         if 'control_guidance_end' in ckpt:
             args.control_guidance_end = ckpt['control_guidance_end']
+            unwrapped.control_guidance_end = ckpt['control_guidance_end']
         if 'conditioning_scale' in ckpt:
             unwrapped.conditioning_scale = ckpt['conditioning_scale']
         if is_main:
@@ -844,7 +847,7 @@ def main():
             
             accumulate_ctx = accelerator.accumulate(system) if use_accumulate else nullcontext()
             with accumulate_ctx:
-                loss = compute_flow_matching_loss(system, hr_lat, lr_lat, lr)
+                loss = compute_flow_matching_loss(system, hr_lat, lr_lat, lr, guidance=args.guidance)
                 
                 accelerator.backward(loss)
                 optimizer.step()
@@ -862,7 +865,8 @@ def main():
         val_psnr = 0.0
         if val_loader and (epoch + 1) % args.val_interval == 0:
             val_psnr = validate(system, accelerator, val_loader, device,
-                               num_samples=5, num_steps=args.val_num_steps, strength=args.strength)
+                               num_samples=5, num_steps=args.val_num_steps,
+                               guidance=args.guidance, strength=args.strength)
         
         if is_main:
             lr_current = lr_scheduler.get_last_lr()[0]
