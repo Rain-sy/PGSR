@@ -21,7 +21,7 @@ Usage:
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
         --batch_size 4 --epochs 120 --lr 1e-5 \
-        --strength 0.7
+        --strength 1  --lpips_weight 0.05 --lpips_resize 256 --lpips_apply_prob 0.25 --pixel_gate_init -1.0
 """
 
 import os
@@ -740,7 +740,7 @@ def main():
                         help='Probability of applying LPIPS loss on each train step')
     
     # Validation/eval start point (img2img-style interpolation from LR + noise)
-    parser.add_argument('--strength', type=float, default=0.8,
+    parser.add_argument('--strength', type=float, default=1,
                         help='Validation/eval strength (1.0 = pure noise start, 0.8 = skip first 20% steps)')
     parser.add_argument('--val_num_steps', type=int, default=20)
     
