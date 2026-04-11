@@ -44,6 +44,13 @@ from tqdm import tqdm
 
 from diffusers import FlowMatchEulerDiscreteScheduler
 
+try:
+    import lpips
+    LPIPS_AVAILABLE = True
+except ImportError:
+    lpips = None
+    LPIPS_AVAILABLE = False
+
 
 # ============================================================================
 # Pixel Feature Extractor
@@ -188,6 +195,8 @@ class DualStreamFLUXSR(nn.Module):
         self.transformer = None
         self.controlnet = None
         self.pixel_extractor = None
+        self.pixel_fuse_proj = None
+        self.pixel_gate_logit = None
         self.scheduler = None
         self._cached_embeds = None
         
@@ -247,7 +256,11 @@ class DualStreamFLUXSR(nn.Module):
         # Pixel Feature Extractor
         print(f"[Rank {local_rank}] Initializing Pixel Feature Extractor...")
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
+        self.pixel_fuse_proj = nn.Conv2d(16, 16, kernel_size=1).to(self.device).to(dtype)
+        self._reset_pixel_fuse_proj_to_identity()
+        self.pixel_gate_logit = nn.Parameter(torch.tensor(-1.0, device=self.device))
         self.pixel_extractor.train()
+        self.pixel_fuse_proj.train()
         
         # Enable Flash Attention
         try:
@@ -293,6 +306,23 @@ class DualStreamFLUXSR(nn.Module):
         del text_enc, text_enc_2
         torch.cuda.empty_cache()
         gc.collect()
+
+    def _reset_pixel_fuse_proj_to_identity(self):
+        """Initialize 1x1 projection as identity so channel statistics are preserved."""
+        if self.pixel_fuse_proj is None:
+            return
+        with torch.no_grad():
+            self.pixel_fuse_proj.weight.zero_()
+            self.pixel_fuse_proj.bias.zero_()
+            channels = min(self.pixel_fuse_proj.out_channels, self.pixel_fuse_proj.in_channels)
+            idx = torch.arange(channels, device=self.pixel_fuse_proj.weight.device)
+            self.pixel_fuse_proj.weight[idx, idx, 0, 0] = 1.0
+
+    def get_pixel_branch_params(self):
+        params = list(self.pixel_extractor.parameters())
+        params += list(self.pixel_fuse_proj.parameters())
+        params.append(self.pixel_gate_logit)
+        return params
     
     def encode(self, img):
         """Encode image to latent (FLUX VAE with shift_factor)"""
@@ -385,9 +415,11 @@ class DualStreamFLUXSR(nn.Module):
             pixel_feat = F.interpolate(
                 pixel_feat, size=lr_lat.shape[-2:], mode='bilinear', align_corners=False
             )
-        
-        # Fuse: lr_lat + pixel features
-        fused_cond = (lr_lat + self.pixel_weight * pixel_feat).to(dtype)
+
+        # Gated fusion keeps latent prior stable while allowing pixel branch to grow when useful.
+        pixel_feat = self.pixel_fuse_proj(pixel_feat.to(dtype))
+        pixel_gate = torch.sigmoid(self.pixel_gate_logit).to(dtype)
+        fused_cond = (lr_lat + self.pixel_weight * pixel_gate * pixel_feat).to(dtype)
         
         # Pack
         noisy_packed = self._pack(noisy.to(dtype))
@@ -515,7 +547,7 @@ class DualStreamFLUXSR(nn.Module):
         return latents
     
     def get_trainable_params(self):
-        params = list(self.pixel_extractor.parameters())
+        params = self.get_pixel_branch_params()
         if self.train_controlnet:
             params += list(self.controlnet.parameters())
         return params
@@ -525,7 +557,19 @@ class DualStreamFLUXSR(nn.Module):
 # Training Functions - 对齐官方 Scheduler
 # ============================================================================
 
-def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, guidance=3.5, num_train_timesteps=1000):
+def compute_flow_matching_loss(
+    system,
+    hr_lat,
+    lr_lat,
+    lr_pixel,
+    hr_pixel=None,
+    guidance=3.5,
+    num_train_timesteps=1000,
+    lpips_model=None,
+    lpips_weight=0.0,
+    lpips_resize=256,
+    lpips_apply_prob=0.25,
+):
     """
     Flow Matching Loss - 对齐官方 Scheduler 的 timestep 格式
     
@@ -561,11 +605,33 @@ def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, guidance=3.5, n
     target_v = noise - hr_lat
     
     # 🌟 传给模型的 timestep = sigma（因为官方是 timestep / 1000，而 timestep = sigma * 1000）
-    v_pred = unwrapped.forward(noisy, lr_lat, lr_pixel, sigma, guidance=guidance)
+    # IMPORTANT: keep forward on wrapped `system` so DDP/DeepSpeed hooks remain active.
+    v_pred = system(noisy, lr_lat, lr_pixel, sigma, guidance)
     
-    # Loss
+    # Base FM loss
     loss = F.mse_loss(v_pred.float(), target_v.float())
-    
+
+    # Optional perceptual regularizer in pixel space.
+    do_lpips = (
+        lpips_model is not None
+        and lpips_weight > 0
+        and hr_pixel is not None
+        and (lpips_apply_prob >= 1.0 or torch.rand(1, device=device).item() < lpips_apply_prob)
+    )
+    if do_lpips:
+        pred_hr_lat = noisy - sigma_expand * v_pred
+        pred_hr = unwrapped.decode(pred_hr_lat)
+
+        pred_lp = pred_hr.float().clamp(-1, 1)
+        target_lp = hr_pixel.float().clamp(-1, 1)
+        if lpips_resize is not None and lpips_resize > 0:
+            size = (int(lpips_resize), int(lpips_resize))
+            pred_lp = F.interpolate(pred_lp, size=size, mode='bilinear', align_corners=False)
+            target_lp = F.interpolate(target_lp, size=size, mode='bilinear', align_corners=False)
+
+        lpips_term = lpips_model(pred_lp, target_lp).mean().float()
+        loss = loss + float(lpips_weight) * lpips_term
+
     return loss
 
 
@@ -584,6 +650,7 @@ def validate(system, accelerator, val_loader, device, num_samples=5,
     """验证（使用官方 scheduler）"""
     unwrapped = accelerator.unwrap_model(system)
     unwrapped.pixel_extractor.eval()
+    unwrapped.pixel_fuse_proj.eval()
     unwrapped.controlnet.eval()
     
     psnr_list = []
@@ -605,6 +672,7 @@ def validate(system, accelerator, val_loader, device, num_samples=5,
     
     # 恢复训练模式
     unwrapped.pixel_extractor.train()
+    unwrapped.pixel_fuse_proj.train()
     if unwrapped.train_controlnet:
         unwrapped.controlnet.train()
     
@@ -612,7 +680,8 @@ def validate(system, accelerator, val_loader, device, num_samples=5,
 
 
 def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, strength,
-                    control_guidance_start, control_guidance_end, path):
+                    control_guidance_start, control_guidance_end, path,
+                    lpips_weight=0.0, lpips_apply_prob=0.25):
     unwrapped = accelerator.unwrap_model(system)
     torch.save({
         'epoch': epoch,
@@ -621,9 +690,13 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
         'pixel_weight': pixel_weight,
         'conditioning_scale': unwrapped.conditioning_scale,
         'strength': strength,
+        'lpips_weight': lpips_weight,
+        'lpips_apply_prob': lpips_apply_prob,
         'control_guidance_start': control_guidance_start,
         'control_guidance_end': control_guidance_end,
         'pixel_extractor': unwrapped.pixel_extractor.state_dict(),
+        'pixel_fuse_proj': unwrapped.pixel_fuse_proj.state_dict(),
+        'pixel_gate_logit': unwrapped.pixel_gate_logit.detach().cpu(),
         'controlnet': unwrapped.controlnet.state_dict(),
     }, path)
 
@@ -657,6 +730,14 @@ def main():
     parser.add_argument('--guidance', type=float, default=3.5)
     parser.add_argument('--control_guidance_start', type=float, default=0.0)
     parser.add_argument('--control_guidance_end', type=float, default=1.0)
+    parser.add_argument('--pixel_gate_init', type=float, default=-1.0,
+                        help='Initial logit for pixel gate (sigmoid(logit) is initial gate value)')
+    parser.add_argument('--lpips_weight', type=float, default=0.0,
+                        help='Optional LPIPS loss weight in training')
+    parser.add_argument('--lpips_resize', type=int, default=256,
+                        help='Resize for LPIPS loss (0 = use original training resolution)')
+    parser.add_argument('--lpips_apply_prob', type=float, default=0.25,
+                        help='Probability of applying LPIPS loss on each train step')
     
     # Validation/eval start point (img2img-style interpolation from LR + noise)
     parser.add_argument('--strength', type=float, default=0.8,
@@ -701,10 +782,12 @@ def main():
         print(f"Num Crops: {args.num_crops}")
         print(f"Batch Size: {args.batch_size}")
         print(f"Pixel Weight: {args.pixel_weight}")
+        print(f"Pixel Gate Init (logit): {args.pixel_gate_init}")
         print(f"Conditioning Scale: {args.conditioning_scale}")
+        print(f"LPIPS Weight: {args.lpips_weight} (resize={args.lpips_resize}, prob={args.lpips_apply_prob})")
         print(f"Strength: {args.strength} (推理时跳过 {(1-args.strength)*100:.0f}% 步数)")
         print(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]")
-        print(f"Learning Rate: {args.lr} (PixelExtractor: {args.lr * 10})")
+        print(f"Learning Rate: {args.lr} (Pixel branch: {args.lr * 10})")
         print(f"Save Dir: {save_dir}")
         print("=" * 70 + "\n")
     
@@ -716,6 +799,23 @@ def main():
         control_guidance_end=args.control_guidance_end,
         conditioning_scale=args.conditioning_scale,
     )
+    with torch.no_grad():
+        system.pixel_gate_logit.fill_(args.pixel_gate_init)
+
+    lpips_model = None
+    if args.lpips_weight > 0:
+        if not LPIPS_AVAILABLE:
+            raise ImportError(
+                "lpips package is required when --lpips_weight > 0. Install with: pip install lpips"
+            )
+        lpips_model = lpips.LPIPS(net='alex').to(device)
+        lpips_model.eval()
+        lpips_model.requires_grad_(False)
+        if is_main:
+            print(
+                f"[Loss] LPIPS enabled: weight={args.lpips_weight}, "
+                f"resize={args.lpips_resize}, prob={args.lpips_apply_prob}"
+            )
     
     # Enable gradient checkpointing
     if hasattr(system.transformer, 'enable_gradient_checkpointing'):
@@ -723,15 +823,16 @@ def main():
     if hasattr(system.controlnet, 'enable_gradient_checkpointing'):
         system.controlnet.enable_gradient_checkpointing()
     
-    # Optimizer groups (PixelExtractor 10x LR)
+    # Optimizer groups (pixel branch 10x LR)
+    pixel_branch_params = system.get_pixel_branch_params()
     if args.train_controlnet:
         optimizer_grouped_parameters = [
             {"params": system.controlnet.parameters(), "lr": args.lr},
-            {"params": system.pixel_extractor.parameters(), "lr": args.lr * 10.0}
+            {"params": pixel_branch_params, "lr": args.lr * 10.0}
         ]
     else:
         optimizer_grouped_parameters = [
-            {"params": system.pixel_extractor.parameters(), "lr": args.lr * 10.0}
+            {"params": pixel_branch_params, "lr": args.lr * 10.0}
         ]
     
     if is_main:
@@ -796,6 +897,23 @@ def main():
         if 'pixel_extractor' in ckpt:
             state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
             unwrapped.pixel_extractor.load_state_dict(state)
+        if 'pixel_fuse_proj' in ckpt:
+            state = {k.replace('module.', ''): v for k, v in ckpt['pixel_fuse_proj'].items()}
+            unwrapped.pixel_fuse_proj.load_state_dict(state)
+        if 'pixel_gate_logit' in ckpt:
+            gate = ckpt['pixel_gate_logit']
+            if isinstance(gate, torch.Tensor):
+                gate = gate.to(device=unwrapped.pixel_gate_logit.device, dtype=unwrapped.pixel_gate_logit.dtype)
+                unwrapped.pixel_gate_logit.data.copy_(gate)
+            else:
+                unwrapped.pixel_gate_logit.data.fill_(float(gate))
+        elif 'pixel_fuse_proj' not in ckpt:
+            # Backward-compatible resume for older checkpoints (legacy direct-add behavior).
+            with torch.no_grad():
+                unwrapped._reset_pixel_fuse_proj_to_identity()
+                unwrapped.pixel_gate_logit.fill_(6.0)
+            if is_main:
+                print("[Resume] Legacy checkpoint detected: initialize gated fusion to near-identity.")
         if args.train_controlnet and 'controlnet' in ckpt:
             state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
             unwrapped.controlnet.load_state_dict(state)
@@ -820,7 +938,9 @@ def main():
             f.write("FLUX SR Training - Official Scheduler\n")
             f.write("=" * 60 + "\n")
             f.write(f"Strength: {args.strength}\n")
-            f.write(f"Pixel Weight: {args.pixel_weight}\n\n")
+            f.write(f"Pixel Weight: {args.pixel_weight}\n")
+            f.write(f"Pixel Gate Init (logit): {args.pixel_gate_init}\n")
+            f.write(f"LPIPS Weight: {args.lpips_weight} (resize={args.lpips_resize}, prob={args.lpips_apply_prob})\n\n")
             f.write(f"Conditioning Scale: {args.conditioning_scale}\n")
             f.write(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]\n\n")
     
@@ -831,6 +951,7 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         unwrapped = accelerator.unwrap_model(system)
         unwrapped.pixel_extractor.train()
+        unwrapped.pixel_fuse_proj.train()
         if args.train_controlnet:
             unwrapped.controlnet.train()
         
@@ -847,7 +968,18 @@ def main():
             
             accumulate_ctx = accelerator.accumulate(system) if use_accumulate else nullcontext()
             with accumulate_ctx:
-                loss = compute_flow_matching_loss(system, hr_lat, lr_lat, lr, guidance=args.guidance)
+                loss = compute_flow_matching_loss(
+                    system,
+                    hr_lat,
+                    lr_lat,
+                    lr,
+                    hr_pixel=hr,
+                    guidance=args.guidance,
+                    lpips_model=lpips_model,
+                    lpips_weight=args.lpips_weight,
+                    lpips_resize=args.lpips_resize,
+                    lpips_apply_prob=args.lpips_apply_prob,
+                )
                 
                 accelerator.backward(loss)
                 optimizer.step()
@@ -881,14 +1013,18 @@ def main():
                 save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr,
                                args.pixel_weight, args.strength,
                                args.control_guidance_start, args.control_guidance_end,
-                               os.path.join(save_dir, 'best_model.pt'))
+                               os.path.join(save_dir, 'best_model.pt'),
+                               lpips_weight=args.lpips_weight,
+                               lpips_apply_prob=args.lpips_apply_prob)
                 print(f"  → New best PSNR: {best_psnr:.2f} dB")
             
             if (epoch + 1) % args.save_interval == 0:
                 save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr,
                                args.pixel_weight, args.strength,
                                args.control_guidance_start, args.control_guidance_end,
-                               os.path.join(save_dir, f'epoch{epoch+1}.pt'))
+                               os.path.join(save_dir, f'epoch{epoch+1}.pt'),
+                               lpips_weight=args.lpips_weight,
+                               lpips_apply_prob=args.lpips_apply_prob)
             
             torch.cuda.empty_cache()
         
@@ -899,7 +1035,9 @@ def main():
         save_checkpoint(system, accelerator, args.epochs - 1, avg_loss, best_psnr,
                        args.pixel_weight, args.strength,
                        args.control_guidance_start, args.control_guidance_end,
-                       os.path.join(save_dir, 'final_model.pt'))
+                       os.path.join(save_dir, 'final_model.pt'),
+                       lpips_weight=args.lpips_weight,
+                       lpips_apply_prob=args.lpips_apply_prob)
         
         print("\n" + "=" * 70)
         print("Training Complete!")

@@ -122,6 +122,9 @@ class DualStreamEvaluator(nn.Module):
         self.transformer = None
         self.controlnet = None
         self.pixel_extractor = None
+        self.pixel_fuse_proj = None
+        self.pixel_gate_logit = None
+        self.use_gated_fusion = False
         self.scheduler = None
         self._cached_embeds = None
         self.strength = 0.7
@@ -171,6 +174,11 @@ class DualStreamEvaluator(nn.Module):
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         self.pixel_extractor.requires_grad_(False)
         self.pixel_extractor.eval()
+        self.pixel_fuse_proj = nn.Conv2d(16, 16, kernel_size=1).to(self.device).to(dtype)
+        self._reset_pixel_fuse_proj_to_identity()
+        self.pixel_fuse_proj.requires_grad_(False)
+        self.pixel_fuse_proj.eval()
+        self.pixel_gate_logit = nn.Parameter(torch.tensor(-1.0, device=self.device), requires_grad=False)
 
         print("Loading checkpoint...")
         ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
@@ -183,6 +191,19 @@ class DualStreamEvaluator(nn.Module):
             state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
             self.controlnet.load_state_dict(state)
 
+        if 'pixel_fuse_proj' in ckpt and 'pixel_gate_logit' in ckpt:
+            state = {k.replace('module.', ''): v for k, v in ckpt['pixel_fuse_proj'].items()}
+            self.pixel_fuse_proj.load_state_dict(state)
+            gate = ckpt['pixel_gate_logit']
+            if isinstance(gate, torch.Tensor):
+                gate = gate.to(device=self.pixel_gate_logit.device, dtype=self.pixel_gate_logit.dtype)
+                self.pixel_gate_logit.data.copy_(gate)
+            else:
+                self.pixel_gate_logit.data.fill_(float(gate))
+            self.use_gated_fusion = True
+        else:
+            self.use_gated_fusion = False
+
         if 'pixel_weight' in ckpt:
             self.pixel_weight = ckpt['pixel_weight']
         self.conditioning_scale = ckpt.get('conditioning_scale', 1.0)
@@ -192,6 +213,11 @@ class DualStreamEvaluator(nn.Module):
 
         print(f"Checkpoint: epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', 0):.2f}")
         print(f"Pixel Weight: {self.pixel_weight}, Strength: {self.strength}")
+        if self.use_gated_fusion:
+            gate_val = torch.sigmoid(self.pixel_gate_logit).item()
+            print(f"Pixel Fusion: gated (gate={gate_val:.4f})")
+        else:
+            print("Pixel Fusion: legacy direct-add (old checkpoint format)")
         print(f"Conditioning Scale: {self.conditioning_scale}")
         print(f"Control Guidance Window: [{self.control_guidance_start}, {self.control_guidance_end}]")
         
@@ -200,6 +226,16 @@ class DualStreamEvaluator(nn.Module):
             self.controlnet.enable_xformers_memory_efficient_attention()
         except:
             pass
+
+    def _reset_pixel_fuse_proj_to_identity(self):
+        if self.pixel_fuse_proj is None:
+            return
+        with torch.no_grad():
+            self.pixel_fuse_proj.weight.zero_()
+            self.pixel_fuse_proj.bias.zero_()
+            channels = min(self.pixel_fuse_proj.out_channels, self.pixel_fuse_proj.in_channels)
+            idx = torch.arange(channels, device=self.pixel_fuse_proj.weight.device)
+            self.pixel_fuse_proj.weight[idx, idx, 0, 0] = 1.0
     
     def _cache_text_embeddings(self):
         from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
@@ -308,8 +344,13 @@ class DualStreamEvaluator(nn.Module):
             pixel_feat = F.interpolate(
                 pixel_feat, size=lr_lat.shape[-2:], mode='bilinear', align_corners=False
             )
-        
-        fused_cond = (lr_lat + self.pixel_weight * pixel_feat).to(dtype)
+
+        if self.use_gated_fusion:
+            pixel_feat = self.pixel_fuse_proj(pixel_feat.to(dtype))
+            pixel_gate = torch.sigmoid(self.pixel_gate_logit).to(dtype)
+            fused_cond = (lr_lat + self.pixel_weight * pixel_gate * pixel_feat).to(dtype)
+        else:
+            fused_cond = (lr_lat + self.pixel_weight * pixel_feat).to(dtype)
         del pixel_feat
         
         noisy_packed = self._pack(noisy.to(dtype))
@@ -771,6 +812,10 @@ def main():
     print("=" * 70)
     print(f"Strength: {strength}")
     print(f"Pixel Weight: {evaluator.pixel_weight}")
+    if evaluator.use_gated_fusion:
+        print(f"Pixel Fusion: gated (gate={torch.sigmoid(evaluator.pixel_gate_logit).item():.4f})")
+    else:
+        print("Pixel Fusion: legacy direct-add")
     if lpips_fn:
         print(f"Bicubic:  PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}")
         print(f"SR:       PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
@@ -789,6 +834,10 @@ def main():
         f.write(f"Strength: {strength}\n")
         f.write(f"Control Guidance Window: [{control_guidance_start}, {control_guidance_end}]\n")
         f.write(f"Pixel Weight: {evaluator.pixel_weight}\n")
+        if evaluator.use_gated_fusion:
+            f.write(f"Pixel Fusion: gated (gate={torch.sigmoid(evaluator.pixel_gate_logit).item():.6f})\n")
+        else:
+            f.write("Pixel Fusion: legacy direct-add\n")
         f.write(f"Dataset: {args.dataset}\n")
         f.write(f"Images: {len(psnr_list)}\n")
         f.write(f"Steps: {args.num_steps}, Guidance: {args.guidance}\n")
