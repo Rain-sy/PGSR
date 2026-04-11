@@ -131,6 +131,8 @@ class DualStreamEvaluator(nn.Module):
         self.control_guidance_start = 0.0
         self.control_guidance_end = 1.0
         self.conditioning_scale = 1.0
+        self.train_lpips_weight = 0.0
+        self.train_lpips_apply_prob = 0.0
     
     def load(self):
         from diffusers import FluxTransformer2DModel, AutoencoderKL, FluxControlNetModel
@@ -210,6 +212,8 @@ class DualStreamEvaluator(nn.Module):
         self.strength = ckpt.get('strength', 0.7)
         self.control_guidance_start = ckpt.get('control_guidance_start', 0.0)
         self.control_guidance_end = ckpt.get('control_guidance_end', 1.0)
+        self.train_lpips_weight = ckpt.get('lpips_weight', 0.0)
+        self.train_lpips_apply_prob = ckpt.get('lpips_apply_prob', 0.0)
 
         print(f"Checkpoint: epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', 0):.2f}")
         print(f"Pixel Weight: {self.pixel_weight}, Strength: {self.strength}")
@@ -218,6 +222,7 @@ class DualStreamEvaluator(nn.Module):
             print(f"Pixel Fusion: gated (gate={gate_val:.4f})")
         else:
             print("Pixel Fusion: legacy direct-add (old checkpoint format)")
+        print(f"Train LPIPS: weight={self.train_lpips_weight}, prob={self.train_lpips_apply_prob}")
         print(f"Conditioning Scale: {self.conditioning_scale}")
         print(f"Control Guidance Window: [{self.control_guidance_start}, {self.control_guidance_end}]")
         
@@ -372,12 +377,8 @@ class DualStreamEvaluator(nn.Module):
                 raise ValueError(f"Expected 1D timestep tensor, got shape {tuple(t_input.shape)}")
         else:
             t_input = torch.full((B,), float(timestep), device=device, dtype=dtype)
-        controlnet_guidance = None
-        transformer_guidance = None
-        if getattr(self.controlnet.config, "guidance_embeds", False):
-            controlnet_guidance = torch.full((B,), guidance, device=device, dtype=dtype)
-        if getattr(self.transformer.config, "guidance_embeds", False):
-            transformer_guidance = torch.full((B,), guidance, device=device, dtype=dtype)
+        controlnet_guidance = torch.full((B,), guidance, device=device, dtype=dtype)
+        transformer_guidance = torch.full((B,), guidance, device=device, dtype=dtype)
         
         ctrl_out = self.controlnet(
             hidden_states=noisy_packed,
@@ -671,12 +672,28 @@ def main():
     
     # Experiment name
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    def _fmt_tag(v):
+        s = f"{v:g}" if isinstance(v, float) else str(v)
+        return s.replace("-", "m").replace(".", "p")
+
     if args.exp_name:
         exp_name = args.exp_name
     else:
-        exp_name = f"{ts}_str{strength}_{args.num_steps}step"
+        fusion_tag = "gated" if evaluator.use_gated_fusion else "legacy"
+        gate_val = float(torch.sigmoid(evaluator.pixel_gate_logit).item()) if evaluator.use_gated_fusion else 1.0
+        exp_name = (
+            f"{ts}"
+            f"_str{_fmt_tag(strength)}"
+            f"_step{args.num_steps}"
+            f"_g{_fmt_tag(args.guidance)}"
+            f"_pw{_fmt_tag(evaluator.pixel_weight)}"
+            f"_{fusion_tag}"
+            f"_gate{_fmt_tag(gate_val)}"
+            f"_trlpw{_fmt_tag(evaluator.train_lpips_weight)}"
+        )
     
-    output_dir = os.path.join(args.output_base, args.dataset, 'DualOfficial', exp_name)
+    output_dir = os.path.join(args.output_base, args.dataset, 'DualControl', exp_name)
     os.makedirs(output_dir, exist_ok=True)
     if args.save_images:
         os.makedirs(os.path.join(output_dir, 'predictions'), exist_ok=True)
@@ -691,6 +708,7 @@ def main():
     print(f"Strength: {strength}")
     print(f"Control Guidance Window: [{control_guidance_start}, {control_guidance_end}]")
     print(f"Pixel Weight: {evaluator.pixel_weight}")
+    print(f"Train LPIPS: weight={evaluator.train_lpips_weight}, prob={evaluator.train_lpips_apply_prob}")
     print(f"Steps: {args.num_steps}, Guidance: {args.guidance}")
     print(f"Output: {output_dir}")
     print("=" * 70)
@@ -834,6 +852,8 @@ def main():
         f.write(f"Strength: {strength}\n")
         f.write(f"Control Guidance Window: [{control_guidance_start}, {control_guidance_end}]\n")
         f.write(f"Pixel Weight: {evaluator.pixel_weight}\n")
+        f.write(f"Train LPIPS Weight: {evaluator.train_lpips_weight}\n")
+        f.write(f"Train LPIPS Apply Prob: {evaluator.train_lpips_apply_prob}\n")
         if evaluator.use_gated_fusion:
             f.write(f"Pixel Fusion: gated (gate={torch.sigmoid(evaluator.pixel_gate_logit).item():.6f})\n")
         else:

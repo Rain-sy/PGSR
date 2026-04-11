@@ -442,12 +442,9 @@ class DualStreamFLUXSR(nn.Module):
                 raise ValueError(f"Expected 1D timestep tensor, got shape {tuple(t_input.shape)}")
         else:
             t_input = torch.full((B,), float(timestep), device=device, dtype=dtype)
-        controlnet_guidance = None
-        transformer_guidance = None
-        if getattr(self.controlnet.config, "guidance_embeds", False):
-            controlnet_guidance = torch.full((B,), guidance, device=device, dtype=dtype)
-        if getattr(self.transformer.config, "guidance_embeds", False):
-            transformer_guidance = torch.full((B,), guidance, device=device, dtype=dtype)
+        # Keep guidance behavior consistent with previous V2 training path.
+        controlnet_guidance = torch.full((B,), guidance, device=device, dtype=dtype)
+        transformer_guidance = torch.full((B,), guidance, device=device, dtype=dtype)
         
         # ControlNet
         ctrl_out = self.controlnet(
@@ -730,7 +727,7 @@ def main():
     parser.add_argument('--guidance', type=float, default=3.5)
     parser.add_argument('--control_guidance_start', type=float, default=0.0)
     parser.add_argument('--control_guidance_end', type=float, default=1.0)
-    parser.add_argument('--pixel_gate_init', type=float, default=-1.0,
+    parser.add_argument('--pixel_gate_init', type=float, default=6.0,
                         help='Initial logit for pixel gate (sigmoid(logit) is initial gate value)')
     parser.add_argument('--lpips_weight', type=float, default=0.0,
                         help='Optional LPIPS loss weight in training')
@@ -767,7 +764,20 @@ def main():
     
     # Create save directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_name = f"{timestamp}_official_res{args.resolution}_str{args.strength}"
+
+    def _fmt_tag(v):
+        s = f"{v:g}" if isinstance(v, float) else str(v)
+        return s.replace("-", "m").replace(".", "p")
+
+    exp_name = (
+        f"{timestamp}"
+        f"_str{_fmt_tag(args.strength)}"
+        f"_pw{_fmt_tag(args.pixel_weight)}"
+        f"_gate{_fmt_tag(args.pixel_gate_init)}"
+        f"_lpw{_fmt_tag(args.lpips_weight)}"
+        f"_lpp{_fmt_tag(args.lpips_apply_prob)}"
+        f"_crop{args.num_crops}"
+    )
     save_dir = os.path.join(args.save_dir, exp_name)
     
     if is_main:
@@ -783,6 +793,7 @@ def main():
         print(f"Batch Size: {args.batch_size}")
         print(f"Pixel Weight: {args.pixel_weight}")
         print(f"Pixel Gate Init (logit): {args.pixel_gate_init}")
+        print(f"Pixel Gate Init (sigmoid): {1.0 / (1.0 + math.exp(-args.pixel_gate_init)):.4f}")
         print(f"Conditioning Scale: {args.conditioning_scale}")
         print(f"LPIPS Weight: {args.lpips_weight} (resize={args.lpips_resize}, prob={args.lpips_apply_prob})")
         print(f"Strength: {args.strength} (推理时跳过 {(1-args.strength)*100:.0f}% 步数)")
@@ -940,6 +951,7 @@ def main():
             f.write(f"Strength: {args.strength}\n")
             f.write(f"Pixel Weight: {args.pixel_weight}\n")
             f.write(f"Pixel Gate Init (logit): {args.pixel_gate_init}\n")
+            f.write(f"Pixel Gate Init (sigmoid): {1.0 / (1.0 + math.exp(-args.pixel_gate_init)):.6f}\n")
             f.write(f"LPIPS Weight: {args.lpips_weight} (resize={args.lpips_resize}, prob={args.lpips_apply_prob})\n\n")
             f.write(f"Conditioning Scale: {args.conditioning_scale}\n")
             f.write(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]\n\n")
@@ -1002,11 +1014,18 @@ def main():
         
         if is_main:
             lr_current = lr_scheduler.get_last_lr()[0]
-            log_line = f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, LR={lr_current:.2e}\n"
+            gate_value = torch.sigmoid(unwrapped.pixel_gate_logit.detach().float()).item()
+            log_line = (
+                f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, "
+                f"LR={lr_current:.2e}, Gate={gate_value:.4f}\n"
+            )
             with open(log_path, 'a') as f:
                 f.write(log_line)
             
-            print(f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, lr={lr_current:.2e}")
+            print(
+                f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, "
+                f"lr={lr_current:.2e}, gate={gate_value:.4f}"
+            )
             
             if val_psnr > best_psnr:
                 best_psnr = val_psnr
