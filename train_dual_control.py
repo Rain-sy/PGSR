@@ -21,7 +21,7 @@ Usage:
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
         --batch_size 4 --epochs 120 --lr 1e-5 \
-        --strength 1  --lpips_weight 0.05 --lpips_resize 256 --lpips_apply_prob 0.25 --pixel_gate_init -1.0
+        --strength 1  --lpips_weight 0.05 --lpips_resize 256 --lpips_apply_prob 0.25 --pixel_gate_init 6
 """
 
 import os
@@ -32,6 +32,15 @@ import numpy as np
 from contextlib import nullcontext
 from datetime import datetime
 from PIL import Image
+
+# Reduce CUDA allocator fragmentation by default (can still be overridden by env).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
+# Avoid DeepSpeed Triton autotune cache on NFS home dirs on Linux clusters.
+if os.name == "posix":
+    os.environ.setdefault(
+        "TRITON_CACHE_DIR",
+        os.path.join("/tmp", os.environ.get("USER", "user"), "triton_autotune_cache"),
+    )
 
 import torch
 import torch.nn as nn
@@ -201,6 +210,16 @@ class DualStreamFLUXSR(nn.Module):
         self._cached_embeds = None
         
         self._load_models(pretrained_controlnet)
+
+    @staticmethod
+    def _from_pretrained_with_dtype(model_cls, *args, dtype=None, **kwargs):
+        """Prefer `dtype`, but fallback to `torch_dtype` for older library versions."""
+        if dtype is None:
+            return model_cls.from_pretrained(*args, **kwargs)
+        try:
+            return model_cls.from_pretrained(*args, dtype=dtype, **kwargs)
+        except TypeError:
+            return model_cls.from_pretrained(*args, torch_dtype=dtype, **kwargs)
     
     def _load_models(self, pretrained_controlnet):
         from diffusers import FluxTransformer2DModel, AutoencoderKL, FluxControlNetModel
@@ -220,12 +239,13 @@ class DualStreamFLUXSR(nn.Module):
         
         # Load VAE
         print(f"[Rank {local_rank}] Loading VAE...")
-        self.vae = AutoencoderKL.from_pretrained(
-            self.model_name, subfolder="vae", torch_dtype=dtype
+        self.vae = self._from_pretrained_with_dtype(
+            AutoencoderKL, self.model_name, subfolder="vae", dtype=dtype
         ).to(self.device)
         self.vae.requires_grad_(False)
         self.vae.eval()
         self.vae.enable_tiling()
+        self.vae.enable_slicing()
         
         # Cache text embeddings (空字符串) - 提前做，避免初始化显存峰值
         print(f"[Rank {local_rank}] Caching text embeddings...")
@@ -233,8 +253,8 @@ class DualStreamFLUXSR(nn.Module):
 
         # Load Transformer (frozen)
         print(f"[Rank {local_rank}] Loading FLUX Transformer...")
-        self.transformer = FluxTransformer2DModel.from_pretrained(
-            self.model_name, subfolder="transformer", torch_dtype=dtype
+        self.transformer = self._from_pretrained_with_dtype(
+            FluxTransformer2DModel, self.model_name, subfolder="transformer", dtype=dtype
         ).to(self.device)
         self.transformer.requires_grad_(False)
         self.transformer.eval()
@@ -242,8 +262,8 @@ class DualStreamFLUXSR(nn.Module):
         # Load ControlNet
         controlnet_path = pretrained_controlnet or "jasperai/Flux.1-dev-Controlnet-Upscaler"
         print(f"[Rank {local_rank}] Loading ControlNet from {controlnet_path}...")
-        self.controlnet = FluxControlNetModel.from_pretrained(
-            controlnet_path, torch_dtype=dtype
+        self.controlnet = self._from_pretrained_with_dtype(
+            FluxControlNetModel, controlnet_path, dtype=dtype
         ).to(self.device)
 
         if self.train_controlnet:
@@ -281,14 +301,14 @@ class DualStreamFLUXSR(nn.Module):
         dtype = torch.bfloat16
         
         # CLIP
-        text_enc = CLIPTextModel.from_pretrained(
-            self.model_name, subfolder="text_encoder", torch_dtype=dtype
+        text_enc = self._from_pretrained_with_dtype(
+            CLIPTextModel, self.model_name, subfolder="text_encoder", dtype=dtype
         ).to(self.device)
         tok = CLIPTokenizer.from_pretrained(self.model_name, subfolder="tokenizer")
         
         # T5
-        text_enc_2 = T5EncoderModel.from_pretrained(
-            self.model_name, subfolder="text_encoder_2", torch_dtype=dtype
+        text_enc_2 = self._from_pretrained_with_dtype(
+            T5EncoderModel, self.model_name, subfolder="text_encoder_2", dtype=dtype
         ).to(self.device)
         tok_2 = T5TokenizerFast.from_pretrained(self.model_name, subfolder="tokenizer_2")
         
@@ -304,7 +324,8 @@ class DualStreamFLUXSR(nn.Module):
             }
         
         del text_enc, text_enc_2
-        torch.cuda.empty_cache()
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
         gc.collect()
 
     def _reset_pixel_fuse_proj_to_identity(self):
@@ -540,6 +561,7 @@ class DualStreamFLUXSR(nn.Module):
             
             # 🌟 使用官方 scheduler.step 更新
             latents = self.scheduler.step(model_output, t, latents, return_dict=False)[0]
+            del model_output
         
         return latents
     
@@ -628,7 +650,9 @@ def compute_flow_matching_loss(
 
         lpips_term = lpips_model(pred_lp, target_lp).mean().float()
         loss = loss + float(lpips_weight) * lpips_term
+        del pred_hr_lat, pred_hr, pred_lp, target_lp, lpips_term
 
+    del target_v, noise, sigma_expand, noisy, v_pred
     return loss
 
 
@@ -666,12 +690,18 @@ def validate(system, accelerator, val_loader, device, num_samples=5,
         sr = unwrapped.decode(sr_lat)
         
         psnr_list.append(calculate_psnr(sr.float(), hr.float()))
+        del hr, lr, hr_lat, lr_lat, sr_lat, sr
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
     
     # 恢复训练模式
     unwrapped.pixel_extractor.train()
     unwrapped.pixel_fuse_proj.train()
     if unwrapped.train_controlnet:
         unwrapped.controlnet.train()
+    gc.collect()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
     
     return np.mean(psnr_list) if psnr_list else 0.0
 
@@ -735,6 +765,8 @@ def main():
                         help='Resize for LPIPS loss (0 = use original training resolution)')
     parser.add_argument('--lpips_apply_prob', type=float, default=0.25,
                         help='Probability of applying LPIPS loss on each train step')
+    parser.add_argument('--empty_cache_steps', type=int, default=0,
+                        help='Call gc/empty_cache every N training steps (0 to disable)')
     
     # Validation/eval start point (img2img-style interpolation from LR + noise)
     parser.add_argument('--strength', type=float, default=1,
@@ -761,6 +793,12 @@ def main():
     device = accelerator.device
     is_main = accelerator.is_main_process
     set_seed(args.seed)
+    triton_cache_dir = os.environ.get("TRITON_CACHE_DIR")
+    if triton_cache_dir:
+        try:
+            os.makedirs(triton_cache_dir, exist_ok=True)
+        except OSError:
+            pass
     
     # Create save directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -796,6 +834,9 @@ def main():
         print(f"Pixel Gate Init (sigmoid): {1.0 / (1.0 + math.exp(-args.pixel_gate_init)):.4f}")
         print(f"Conditioning Scale: {args.conditioning_scale}")
         print(f"LPIPS Weight: {args.lpips_weight} (resize={args.lpips_resize}, prob={args.lpips_apply_prob})")
+        print(f"Empty Cache Steps: {args.empty_cache_steps}")
+        if triton_cache_dir:
+            print(f"TRITON_CACHE_DIR: {triton_cache_dir}")
         print(f"Strength: {args.strength} (推理时跳过 {(1-args.strength)*100:.0f}% 步数)")
         print(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]")
         print(f"Learning Rate: {args.lr} (Pixel branch: {args.lr * 10})")
@@ -953,13 +994,14 @@ def main():
             f.write(f"Pixel Gate Init (logit): {args.pixel_gate_init}\n")
             f.write(f"Pixel Gate Init (sigmoid): {1.0 / (1.0 + math.exp(-args.pixel_gate_init)):.6f}\n")
             f.write(f"LPIPS Weight: {args.lpips_weight} (resize={args.lpips_resize}, prob={args.lpips_apply_prob})\n\n")
+            f.write(f"Empty Cache Steps: {args.empty_cache_steps}\n\n")
             f.write(f"Conditioning Scale: {args.conditioning_scale}\n")
             f.write(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]\n\n")
     
     # Training loop
     if is_main:
         print("\n[Training] Starting...\n")
-    
+    global_step = 0
     for epoch in range(start_epoch, args.epochs):
         unwrapped = accelerator.unwrap_model(system)
         unwrapped.pixel_extractor.train()
@@ -995,22 +1037,31 @@ def main():
                 
                 accelerator.backward(loss)
                 optimizer.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
             
             if (use_accumulate and accelerator.sync_gradients) or (not use_accumulate):
                 lr_scheduler.step()
             
-            epoch_losses.append(loss.item())
-            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{lr_scheduler.get_last_lr()[0]:.2e}'})
+            loss_item = loss.item()
+            epoch_losses.append(loss_item)
+            pbar.set_postfix({'loss': f'{loss_item:.4f}', 'lr': f'{lr_scheduler.get_last_lr()[0]:.2e}'})
+            global_step += 1
+
+            del hr, lr, hr_lat, lr_lat, loss
+            if args.empty_cache_steps > 0 and (global_step % args.empty_cache_steps == 0):
+                gc.collect()
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
         
         avg_loss = np.mean(epoch_losses)
         
         # Validation
         val_psnr = 0.0
         if val_loader and (epoch + 1) % args.val_interval == 0:
-            val_psnr = validate(system, accelerator, val_loader, device,
-                               num_samples=5, num_steps=args.val_num_steps,
-                               guidance=args.guidance, strength=args.strength)
+            if is_main:
+                val_psnr = validate(system, accelerator, val_loader, device,
+                                   num_samples=5, num_steps=args.val_num_steps,
+                                   guidance=args.guidance, strength=args.strength)
         
         if is_main:
             lr_current = lr_scheduler.get_last_lr()[0]
@@ -1045,6 +1096,8 @@ def main():
                                lpips_weight=args.lpips_weight,
                                lpips_apply_prob=args.lpips_apply_prob)
             
+        gc.collect()
+        if device.type == 'cuda':
             torch.cuda.empty_cache()
         
         accelerator.wait_for_everyone()
