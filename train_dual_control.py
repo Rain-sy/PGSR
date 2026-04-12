@@ -18,10 +18,9 @@ Typical commands:
         --degrade_mode realesrgan --scale 4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --batch_size 2 --epochs 5 --num_crops 1 --lr 5e-6 \
-        --strength 1 --pixel_gate_init 6 \
-        --lpips_weight 0.03 --lpips_resize 256 --lpips_apply_prob 0.1 \
-        --empty_cache_steps 50
+        --batch_size 4 --epochs 40 --num_crops 2 --lr 1e-5 \
+        --strength 1 --pixel_gate_init 4 \
+        --lpips_weight 0.1  --empty_cache_steps 50
 
 2) Paired training (fallback/ablation):
     accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
@@ -1039,7 +1038,7 @@ def main():
     # Validation/eval start point (img2img-style interpolation from LR + noise)
     parser.add_argument('--strength', type=float, default=1,
                         help='Validation/eval strength (1.0 = pure noise start, 0.8 = skip first 20% steps)')
-    parser.add_argument('--val_num_steps', type=int, default=20)
+    parser.add_argument('--val_num_steps', type=int, default=10)
     
     # Checkpointing
     parser.add_argument('--save_dir', type=str, default='./checkpoints/dual_control')

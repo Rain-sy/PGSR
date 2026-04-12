@@ -52,7 +52,7 @@ if __name__ == "__main__":
         "DIV2K":    {"path": "./Data/DIV2K/DIV2K_train_HR", "count": 800},
         "Flickr2K": {"path": "./Data/Flickr2K/Flickr2K", "count": 2650},
         "LSDIR":    {"path": "./Data/LSDIR/LSDIR_HR", "count": 8000},
-        "FFHQ":     {"path": "./Data/FFHQ", "count": 3550}, # 15000 - 800 - 2650 - 8000 = 3550
+        "FFHQ":     {"path": "./Data/FFHQ", "count": 4550}, # 15000 - 800 - 2650 - 8000 = 3550
     }
     
     # 输出的大数据集路径
