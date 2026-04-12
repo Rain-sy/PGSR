@@ -1,28 +1,27 @@
 #!/usr/bin/env python
 """
 ======================================================================
-Dual-Stream FLUX SR ControlNet Training - 对齐官方 Diffusers 流程
+Dual-Stream FLUX SR ControlNet Training V1 (No Degradation Pipeline)
 ======================================================================
 
-核心改动（对比之前版本）：
-1. 使用 FlowMatchEulerDiscreteScheduler 而非自定义 flow matching
-2. 训练时用 scheduler.sigmas 采样，timestep 传入 sigma * 1000
-3. 推理时用 scheduler.scale_noise() 和 scheduler.step()
-4. strength 参数控制推理起点（官方语义）
+This is the OLD baseline training entry.
+- No `--degrade_mode` support
+- Expects paired LR/HR input (`--lr_dir` is required)
+- Use this file when reproducing previous paired bicubic experiments
 
-这样确保 frozen FLUX transformer 和预训练 ControlNet 接收的
-timestep/scheduler 语义与官方一致。
-
-Usage:
+Typical command:
     accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
-        train_dual_control.py \
-        --hr_dir Data/DIV2K/DIV2K_train_HR \
-        --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
+        train_dual_control_v1.py \
+        --hr_dir Data/Mix16K_HR \
+        --lr_dir Data/Mix16K_LR_bicubic_X4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --batch_size 4 --epochs 120 --lr 1e-5 \
-        --strength 1  --lpips_weight 0.05 --lpips_resize 256 --lpips_apply_prob 0.25 --pixel_gate_init 6
+        --batch_size 4 --epochs 40 --num_crops 2 \
+        --lr 1e-5 --strength 1 --pixel_gate_init 4 \
+        --lpips_weight 0.05 --lpips_resize 256 --lpips_apply_prob 0.1 \
+        --empty_cache_steps 50
 """
+
 
 import os
 import gc
