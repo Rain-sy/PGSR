@@ -27,12 +27,11 @@ Usage:
 import os
 import gc
 import math
-import io
 import argparse
 import numpy as np
 from contextlib import nullcontext
 from datetime import datetime
-from PIL import Image, ImageFilter
+from PIL import Image
 
 # Reduce CUDA allocator fragmentation by default (can still be overridden by env).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
@@ -60,11 +59,6 @@ try:
 except ImportError:
     lpips = None
     LPIPS_AVAILABLE = False
-
-if hasattr(Image, "Resampling"):
-    PIL_RESAMPLING = Image.Resampling
-else:
-    PIL_RESAMPLING = Image
 
 
 # ============================================================================
@@ -120,290 +114,63 @@ class PixelFeatureExtractor(nn.Module):
 # ============================================================================
 
 class SRDataset(Dataset):
-    def __init__(
-        self,
-        hr_dir,
-        lr_dir=None,
-        resolution=512,
-        num_crops=1,
-        is_val=False,
-        degrade_mode='paired',
-        scale=4,
-        realesrgan_cfg=None,
-    ):
+    def __init__(self, hr_dir, lr_dir, resolution=512, num_crops=1, is_val=False):
         self.hr_dir = hr_dir
         self.lr_dir = lr_dir
         self.resolution = resolution
         self.num_crops = num_crops
-        self.scale = int(scale)
+        self.scale = 4
         self.is_val = is_val
-        self.degrade_mode = degrade_mode
-        self.realesrgan_cfg = dict(realesrgan_cfg or {})
-        self._resample_map = {
-            'area': PIL_RESAMPLING.BOX,
-            'bilinear': PIL_RESAMPLING.BILINEAR,
-            'bicubic': PIL_RESAMPLING.BICUBIC,
-            'lanczos': PIL_RESAMPLING.LANCZOS,
-        }
-        self._resample_choices = ['area', 'bilinear', 'bicubic', 'lanczos']
         
         self.hr_files = sorted([f for f in os.listdir(hr_dir) 
                                 if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
     
     def __len__(self):
         return len(self.hr_files) * self.num_crops
-
-    @staticmethod
-    def _normalize_triplet(prob_triplet):
-        p = np.array(prob_triplet, dtype=np.float32)
-        p = np.clip(p, 1e-6, None)
-        p = p / p.sum()
-        return p
-
-    def _sample_resample(self):
-        mode = np.random.choice(self._resample_choices)
-        return self._resample_map[mode]
     
     def _find_lr_file(self, hr_name):
-        if not self.lr_dir:
-            return None
         base = os.path.splitext(hr_name)[0]
         for suffix in ['', 'x4', 'x2', '_x4', '_x2']:
             for ext in ['.png', '.jpg', '.jpeg']:
                 candidate = os.path.join(self.lr_dir, base + suffix + ext)
                 if os.path.exists(candidate):
                     return candidate
-        fallback = os.path.join(self.lr_dir, hr_name)
-        return fallback if os.path.exists(fallback) else None
-
-    def _crop_hr_only(self, hr_img):
-        hr_w, hr_h = hr_img.size
-        crop_size = self.resolution
-
-        if hr_w >= crop_size and hr_h >= crop_size:
-            if self.is_val:
-                x = (hr_w - crop_size) // 2
-                y = (hr_h - crop_size) // 2
-                x = x - (x % self.scale)
-                y = y - (y % self.scale)
-            else:
-                x = np.random.randint(0, hr_w - crop_size + 1)
-                y = np.random.randint(0, hr_h - crop_size + 1)
-            return hr_img.crop((x, y, x + crop_size, y + crop_size))
-
-        return hr_img.resize((crop_size, crop_size), PIL_RESAMPLING.BICUBIC)
-
-    def _paired_crop(self, hr_img, lr_img):
-        hr_w, hr_h = hr_img.size
-        lr_w, lr_h = lr_img.size
-        crop_size = self.resolution
-        lr_crop_size = crop_size // self.scale
-
-        if hr_w >= crop_size and hr_h >= crop_size:
-            if self.is_val:
-                x = (hr_w - crop_size) // 2
-                y = (hr_h - crop_size) // 2
-                x = x - (x % self.scale)
-                y = y - (y % self.scale)
-            else:
-                lr_x = np.random.randint(0, max(1, lr_w - lr_crop_size + 1))
-                lr_y = np.random.randint(0, max(1, lr_h - lr_crop_size + 1))
-                x = lr_x * self.scale
-                y = lr_y * self.scale
-
-            hr_crop = hr_img.crop((x, y, x + crop_size, y + crop_size))
-            lr_x, lr_y = x // self.scale, y // self.scale
-            lr_crop = lr_img.crop((lr_x, lr_y, lr_x + lr_crop_size, lr_y + lr_crop_size))
-        else:
-            hr_crop = hr_img.resize((crop_size, crop_size), PIL_RESAMPLING.BICUBIC)
-            lr_crop = lr_img.resize((lr_crop_size, lr_crop_size), PIL_RESAMPLING.BICUBIC)
-
-        lr_up = lr_crop.resize((crop_size, crop_size), PIL_RESAMPLING.BICUBIC)
-        return hr_crop, lr_up
-
-    def _bicubic_degrade(self, hr_crop):
-        crop_size = self.resolution
-        lr_crop_size = crop_size // self.scale
-        lr_crop = hr_crop.resize((lr_crop_size, lr_crop_size), PIL_RESAMPLING.BICUBIC)
-        return lr_crop.resize((crop_size, crop_size), PIL_RESAMPLING.BICUBIC)
-
-    def _random_resize(self, img, resize_prob, resize_range, min_size):
-        p = self._normalize_triplet(resize_prob)
-        choice = int(np.random.choice(3, p=p))
-        low = float(min(resize_range))
-        high = float(max(resize_range))
-        if choice == 0:  # up
-            scale = np.random.uniform(1.0, max(1.0, high))
-        elif choice == 1:  # down
-            scale = np.random.uniform(min(low, 1.0), 1.0)
-        else:  # keep
-            scale = 1.0
-
-        w, h = img.size
-        out_w = max(int(min_size), int(round(w * scale)))
-        out_h = max(int(min_size), int(round(h * scale)))
-        return img.resize((out_w, out_h), self._sample_resample())
-
-    @staticmethod
-    def _clip_uint8(arr):
-        return np.clip(np.round(arr), 0, 255).astype(np.uint8)
-
-    def _random_blur(self, img, sigma_range):
-        sigma = float(np.random.uniform(float(sigma_range[0]), float(sigma_range[1])))
-        return img.filter(ImageFilter.GaussianBlur(radius=max(0.0, sigma)))
-
-    @staticmethod
-    def _build_sinc_kernel(cutoff, kernel_size):
-        """Approximate low-pass sinc kernel without scipy (separable form)."""
-        if kernel_size % 2 == 0:
-            kernel_size += 1
-        half = kernel_size // 2
-        x = np.arange(-half, half + 1, dtype=np.float32)
-        # np.sinc uses pi-normalized input: sinc(x) = sin(pi x)/(pi x)
-        one_d = np.sinc((float(cutoff) / np.pi) * x).astype(np.float32)
-        kernel = np.outer(one_d, one_d).astype(np.float32)
-        kernel_sum = float(kernel.sum())
-        if abs(kernel_sum) < 1e-8:
-            kernel[half, half] = 1.0
-            kernel_sum = 1.0
-        kernel /= kernel_sum
-        return kernel
-
-    @staticmethod
-    def _apply_kernel(img, kernel):
-        arr = np.array(img).astype(np.float32) / 255.0
-        t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-        k = torch.from_numpy(kernel.astype(np.float32)).unsqueeze(0).unsqueeze(0)
-        pad = int(kernel.shape[0] // 2)
-        t = F.pad(t, (pad, pad, pad, pad), mode='reflect')
-        k = k.repeat(3, 1, 1, 1)
-        out = F.conv2d(t, k, groups=3).squeeze(0).permute(1, 2, 0).numpy()
-        out = np.clip(out, 0.0, 1.0)
-        return Image.fromarray(np.clip(np.round(out * 255.0), 0, 255).astype(np.uint8), mode='RGB')
-
-    def _random_noise(self, img, gaussian_prob, sigma_range, poisson_scale_range, gray_prob):
-        arr = np.array(img).astype(np.float32) / 255.0
-        use_gray = np.random.rand() < float(gray_prob)
-
-        if np.random.rand() < float(gaussian_prob):
-            sigma = float(np.random.uniform(float(sigma_range[0]), float(sigma_range[1]))) / 255.0
-            if use_gray:
-                noise = np.random.randn(arr.shape[0], arr.shape[1], 1).astype(np.float32) * sigma
-                noise = np.repeat(noise, 3, axis=2)
-            else:
-                noise = np.random.randn(*arr.shape).astype(np.float32) * sigma
-            arr = np.clip(arr + noise, 0.0, 1.0)
-        else:
-            scale = float(np.random.uniform(float(poisson_scale_range[0]), float(poisson_scale_range[1])))
-            scale = max(scale, 1e-6)
-            if use_gray:
-                gray = (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]).astype(np.float32)
-                noisy = np.random.poisson(np.clip(gray, 0.0, 1.0) * 255.0 * scale) / (255.0 * scale)
-                arr = np.repeat(noisy[..., None], 3, axis=2)
-            else:
-                arr = np.random.poisson(np.clip(arr, 0.0, 1.0) * 255.0 * scale) / (255.0 * scale)
-            arr = np.clip(arr, 0.0, 1.0)
-
-        return Image.fromarray(self._clip_uint8(arr * 255.0), mode='RGB')
-
-    @staticmethod
-    def _jpeg_compress(img, jpeg_range):
-        q_min = int(min(jpeg_range))
-        q_max = int(max(jpeg_range))
-        quality = int(np.random.randint(q_min, q_max + 1))
-        buffer = io.BytesIO()
-        img.save(buffer, format='JPEG', quality=quality)
-        buffer.seek(0)
-        out = Image.open(buffer).convert('RGB')
-        out.load()
-        buffer.close()
-        return out
-
-    def _degrade_realesrgan(self, hr_crop):
-        cfg = self.realesrgan_cfg
-
-        blur_prob = float(cfg.get('blur_prob', 0.8))
-        blur_sigma = cfg.get('blur_sigma', [0.2, 3.0])
-        resize_prob1 = cfg.get('resize_prob1', [0.2, 0.7, 0.1])
-        resize_range1 = cfg.get('resize_range1', [0.15, 1.5])
-        gaussian_noise_prob1 = float(cfg.get('gaussian_noise_prob1', 0.5))
-        noise_sigma1 = cfg.get('noise_sigma1', [1.0, 30.0])
-        poisson_scale1 = cfg.get('poisson_scale1', [0.05, 3.0])
-        gray_noise_prob1 = float(cfg.get('gray_noise_prob1', 0.4))
-        jpeg_range1 = cfg.get('jpeg_range1', [30, 95])
-
-        second_blur_prob = float(cfg.get('second_blur_prob', 0.8))
-        blur_sigma2 = cfg.get('blur_sigma2', [0.2, 1.5])
-        resize_prob2 = cfg.get('resize_prob2', [0.3, 0.4, 0.3])
-        resize_range2 = cfg.get('resize_range2', [0.3, 1.2])
-        gaussian_noise_prob2 = float(cfg.get('gaussian_noise_prob2', 0.5))
-        noise_sigma2 = cfg.get('noise_sigma2', [1.0, 25.0])
-        poisson_scale2 = cfg.get('poisson_scale2', [0.05, 2.5])
-        gray_noise_prob2 = float(cfg.get('gray_noise_prob2', 0.4))
-        jpeg_range2 = cfg.get('jpeg_range2', [30, 95])
-        final_sinc_prob = float(cfg.get('final_sinc_prob', 0.8))
-
-        target_lr = self.resolution // self.scale
-        lq = hr_crop
-
-        if np.random.rand() < blur_prob:
-            lq = self._random_blur(lq, blur_sigma)
-        lq = self._random_resize(lq, resize_prob1, resize_range1, min_size=target_lr)
-        lq = self._random_noise(lq, gaussian_noise_prob1, noise_sigma1, poisson_scale1, gray_noise_prob1)
-        lq = self._jpeg_compress(lq, jpeg_range1)
-
-        if np.random.rand() < second_blur_prob:
-            lq = self._random_blur(lq, blur_sigma2)
-        lq = self._random_resize(lq, resize_prob2, resize_range2, min_size=target_lr)
-        lq = self._random_noise(lq, gaussian_noise_prob2, noise_sigma2, poisson_scale2, gray_noise_prob2)
-
-        if np.random.rand() < 0.5:
-            lq = lq.resize((target_lr, target_lr), self._sample_resample())
-            if np.random.rand() < final_sinc_prob:
-                k_size = int(np.random.choice([7, 9, 11, 13, 15, 17, 19, 21]))
-                cutoff = float(np.random.uniform(np.pi / 5.0, np.pi))
-                lq = self._apply_kernel(lq, self._build_sinc_kernel(cutoff, k_size))
-            lq = self._jpeg_compress(lq, jpeg_range2)
-        else:
-            lq = self._jpeg_compress(lq, jpeg_range2)
-            lq = lq.resize((target_lr, target_lr), self._sample_resample())
-            if np.random.rand() < final_sinc_prob:
-                k_size = int(np.random.choice([7, 9, 11, 13, 15, 17, 19, 21]))
-                cutoff = float(np.random.uniform(np.pi / 5.0, np.pi))
-                lq = self._apply_kernel(lq, self._build_sinc_kernel(cutoff, k_size))
-
-        lq = Image.fromarray(self._clip_uint8(np.array(lq).astype(np.float32)), mode='RGB')
-        return lq.resize((self.resolution, self.resolution), PIL_RESAMPLING.BICUBIC)
+        return os.path.join(self.lr_dir, hr_name)
     
     def __getitem__(self, idx):
         img_idx = idx // self.num_crops
         hr_name = self.hr_files[img_idx]
         
         hr_img = Image.open(os.path.join(self.hr_dir, hr_name)).convert('RGB')
-        lr_up = None
-        if self.is_val:
-            lr_path = self._find_lr_file(hr_name)
-            if lr_path:
-                lr_img = Image.open(lr_path).convert('RGB')
-                hr_crop, lr_up = self._paired_crop(hr_img, lr_img)
+        lr_img = Image.open(self._find_lr_file(hr_name)).convert('RGB')
+        
+        hr_w, hr_h = hr_img.size
+        lr_w, lr_h = lr_img.size
+        crop_size = self.resolution
+        lr_crop_size = crop_size // self.scale
+        
+        if hr_w >= crop_size and hr_h >= crop_size:
+            if self.is_val:
+                # Center crop aligned to scale to keep HR/LR perfectly matched
+                x = (hr_w - crop_size) // 2
+                y = (hr_h - crop_size) // 2
+                x = x - (x % self.scale)
+                y = y - (y % self.scale)
             else:
-                hr_crop = self._crop_hr_only(hr_img)
-                lr_up = self._bicubic_degrade(hr_crop)
+                # Sample on LR grid first, then map to HR grid
+                lr_x = np.random.randint(0, lr_w - lr_crop_size + 1)
+                lr_y = np.random.randint(0, lr_h - lr_crop_size + 1)
+                x = lr_x * self.scale
+                y = lr_y * self.scale
+            
+            hr_crop = hr_img.crop((x, y, x + crop_size, y + crop_size))
+            lr_x, lr_y = x // self.scale, y // self.scale
+            lr_crop = lr_img.crop((lr_x, lr_y, lr_x + lr_crop_size, lr_y + lr_crop_size))
         else:
-            if self.degrade_mode == 'realesrgan':
-                hr_crop = self._crop_hr_only(hr_img)
-                lr_up = self._degrade_realesrgan(hr_crop)
-            elif self.degrade_mode == 'bicubic':
-                hr_crop = self._crop_hr_only(hr_img)
-                lr_up = self._bicubic_degrade(hr_crop)
-            else:
-                lr_path = self._find_lr_file(hr_name)
-                if lr_path:
-                    lr_img = Image.open(lr_path).convert('RGB')
-                    hr_crop, lr_up = self._paired_crop(hr_img, lr_img)
-                else:
-                    hr_crop = self._crop_hr_only(hr_img)
-                    lr_up = self._bicubic_degrade(hr_crop)
+            hr_crop = hr_img.resize((crop_size, crop_size), Image.BICUBIC)
+            lr_crop = lr_img.resize((lr_crop_size, lr_crop_size), Image.BICUBIC)
+        
+        lr_up = lr_crop.resize((crop_size, crop_size), Image.BICUBIC)
         
         hr_t = torch.from_numpy(np.array(hr_crop)).float().permute(2, 0, 1) / 127.5 - 1
         lr_t = torch.from_numpy(np.array(lr_up)).float().permute(2, 0, 1) / 127.5 - 1
@@ -970,36 +737,11 @@ def main():
     
     # Data
     parser.add_argument('--hr_dir', type=str, required=True)
-    parser.add_argument('--lr_dir', type=str, default=None,
-                        help='Paired LR dir. Required when --degrade_mode=paired.')
+    parser.add_argument('--lr_dir', type=str, required=True)
     parser.add_argument('--val_hr_dir', type=str, default=None)
     parser.add_argument('--val_lr_dir', type=str, default=None)
     parser.add_argument('--resolution', type=int, default=512)
     parser.add_argument('--num_crops', type=int, default=2)
-    parser.add_argument('--scale', type=int, default=4)
-    parser.add_argument('--degrade_mode', type=str, default='paired', choices=['paired', 'bicubic', 'realesrgan'],
-                        help='Train-time degradation mode. Validation still uses paired LR when val_lr_dir is set.')
-
-    # Real-ESRGAN-style second-order degradation
-    parser.add_argument('--realesrgan_blur_prob', type=float, default=0.8)
-    parser.add_argument('--realesrgan_second_blur_prob', type=float, default=0.8)
-    parser.add_argument('--realesrgan_gaussian_noise_prob1', type=float, default=0.5)
-    parser.add_argument('--realesrgan_gaussian_noise_prob2', type=float, default=0.5)
-    parser.add_argument('--realesrgan_gray_noise_prob1', type=float, default=0.4)
-    parser.add_argument('--realesrgan_gray_noise_prob2', type=float, default=0.4)
-    parser.add_argument('--realesrgan_final_sinc_prob', type=float, default=0.8)
-    parser.add_argument('--realesrgan_blur_sigma1', type=float, nargs=2, default=[0.2, 3.0])
-    parser.add_argument('--realesrgan_blur_sigma2', type=float, nargs=2, default=[0.2, 1.5])
-    parser.add_argument('--realesrgan_resize_prob1', type=float, nargs=3, default=[0.2, 0.7, 0.1])
-    parser.add_argument('--realesrgan_resize_prob2', type=float, nargs=3, default=[0.3, 0.4, 0.3])
-    parser.add_argument('--realesrgan_resize_range1', type=float, nargs=2, default=[0.15, 1.5])
-    parser.add_argument('--realesrgan_resize_range2', type=float, nargs=2, default=[0.3, 1.2])
-    parser.add_argument('--realesrgan_noise_sigma1', type=float, nargs=2, default=[1.0, 30.0])
-    parser.add_argument('--realesrgan_noise_sigma2', type=float, nargs=2, default=[1.0, 25.0])
-    parser.add_argument('--realesrgan_poisson_scale1', type=float, nargs=2, default=[0.05, 3.0])
-    parser.add_argument('--realesrgan_poisson_scale2', type=float, nargs=2, default=[0.05, 2.5])
-    parser.add_argument('--realesrgan_jpeg_range1', type=int, nargs=2, default=[30, 95])
-    parser.add_argument('--realesrgan_jpeg_range2', type=int, nargs=2, default=[30, 95])
     
     # Model
     parser.add_argument('--model_name', type=str, default='black-forest-labs/FLUX.1-dev')
@@ -1043,13 +785,6 @@ def main():
     parser.add_argument('--freeze_controlnet', action='store_true', default=False)
     
     args = parser.parse_args()
-
-    if args.scale < 1:
-        parser.error("--scale must be >= 1")
-    if args.resolution % args.scale != 0:
-        parser.error("--resolution must be divisible by --scale")
-    if args.degrade_mode == 'paired' and not args.lr_dir:
-        parser.error("--lr_dir is required when --degrade_mode is 'paired'")
     
     if args.freeze_controlnet:
         args.train_controlnet = False
@@ -1074,8 +809,6 @@ def main():
 
     exp_name = (
         f"{timestamp}"
-        f"_deg{args.degrade_mode}"
-        f"_x{args.scale}"
         f"_str{_fmt_tag(args.strength)}"
         f"_pw{_fmt_tag(args.pixel_weight)}"
         f"_gate{_fmt_tag(args.pixel_gate_init)}"
@@ -1093,8 +826,6 @@ def main():
         print("=" * 70)
         print(f"\nHR Dir: {args.hr_dir}")
         print(f"LR Dir: {args.lr_dir}")
-        print(f"Degrade Mode: {args.degrade_mode}")
-        print(f"Scale: x{args.scale}")
         print(f"Resolution: {args.resolution}")
         print(f"Num Crops: {args.num_crops}")
         print(f"Batch Size: {args.batch_size}")
@@ -1109,12 +840,6 @@ def main():
         print(f"Strength: {args.strength} (推理时跳过 {(1-args.strength)*100:.0f}% 步数)")
         print(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]")
         print(f"Learning Rate: {args.lr} (Pixel branch: {args.lr * 10})")
-        if args.degrade_mode == 'realesrgan':
-            print(
-                f"RealESRGAN Degrade: blur_p={args.realesrgan_blur_prob}, "
-                f"second_blur_p={args.realesrgan_second_blur_prob}, "
-                f"final_sinc_p={args.realesrgan_final_sinc_prob}"
-            )
         print(f"Save Dir: {save_dir}")
         print("=" * 70 + "\n")
     
@@ -1167,33 +892,9 @@ def main():
         print(f"[Training] Trainable parameters: {total_params:,}")
     
     # Datasets
-    realesrgan_cfg = {
-        'blur_prob': args.realesrgan_blur_prob,
-        'second_blur_prob': args.realesrgan_second_blur_prob,
-        'gaussian_noise_prob1': args.realesrgan_gaussian_noise_prob1,
-        'gaussian_noise_prob2': args.realesrgan_gaussian_noise_prob2,
-        'gray_noise_prob1': args.realesrgan_gray_noise_prob1,
-        'gray_noise_prob2': args.realesrgan_gray_noise_prob2,
-        'final_sinc_prob': args.realesrgan_final_sinc_prob,
-        'blur_sigma': args.realesrgan_blur_sigma1,
-        'blur_sigma2': args.realesrgan_blur_sigma2,
-        'resize_prob1': args.realesrgan_resize_prob1,
-        'resize_prob2': args.realesrgan_resize_prob2,
-        'resize_range1': args.realesrgan_resize_range1,
-        'resize_range2': args.realesrgan_resize_range2,
-        'noise_sigma1': args.realesrgan_noise_sigma1,
-        'noise_sigma2': args.realesrgan_noise_sigma2,
-        'poisson_scale1': args.realesrgan_poisson_scale1,
-        'poisson_scale2': args.realesrgan_poisson_scale2,
-        'jpeg_range1': args.realesrgan_jpeg_range1,
-        'jpeg_range2': args.realesrgan_jpeg_range2,
-    }
-    train_lr_dir = args.lr_dir if args.degrade_mode == 'paired' else None
     train_dataset = SRDataset(
-        args.hr_dir, train_lr_dir, args.resolution,
-        num_crops=args.num_crops, is_val=False,
-        degrade_mode=args.degrade_mode, scale=args.scale,
-        realesrgan_cfg=realesrgan_cfg,
+        args.hr_dir, args.lr_dir, args.resolution,
+        num_crops=args.num_crops, is_val=False
     )
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
@@ -1201,15 +902,13 @@ def main():
     )
     
     val_loader = None
-    if args.val_hr_dir:
+    if args.val_hr_dir and args.val_lr_dir:
         val_dataset = SRDataset(
             args.val_hr_dir, args.val_lr_dir, args.resolution,
-            num_crops=1, is_val=True, degrade_mode='paired', scale=args.scale
+            num_crops=1, is_val=True
         )
         val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
         if is_main:
-            if not args.val_lr_dir:
-                print("[Data] val_lr_dir not provided: validation LR will use bicubic degradation from HR.")
             print(f"[Data] Training: {len(train_dataset)}, Validation: {len(val_dataset)}")
     
     # Optimizer and scheduler
@@ -1290,25 +989,11 @@ def main():
         with open(log_path, 'w') as f:
             f.write("FLUX SR Training - Official Scheduler\n")
             f.write("=" * 60 + "\n")
-            f.write(f"Degrade Mode: {args.degrade_mode}\n")
-            f.write(f"Scale: x{args.scale}\n")
             f.write(f"Strength: {args.strength}\n")
             f.write(f"Pixel Weight: {args.pixel_weight}\n")
             f.write(f"Pixel Gate Init (logit): {args.pixel_gate_init}\n")
             f.write(f"Pixel Gate Init (sigmoid): {1.0 / (1.0 + math.exp(-args.pixel_gate_init)):.6f}\n")
             f.write(f"LPIPS Weight: {args.lpips_weight} (resize={args.lpips_resize}, prob={args.lpips_apply_prob})\n\n")
-            if args.degrade_mode == 'realesrgan':
-                f.write(
-                    "RealESRGAN Degrade: "
-                    f"blur_p={args.realesrgan_blur_prob}, "
-                    f"second_blur_p={args.realesrgan_second_blur_prob}, "
-                    f"final_sinc_p={args.realesrgan_final_sinc_prob}\n"
-                )
-                f.write(
-                    "RealESRGAN Noise/JPEG: "
-                    f"n1={args.realesrgan_noise_sigma1}, n2={args.realesrgan_noise_sigma2}, "
-                    f"j1={args.realesrgan_jpeg_range1}, j2={args.realesrgan_jpeg_range2}\n\n"
-                )
             f.write(f"Empty Cache Steps: {args.empty_cache_steps}\n\n")
             f.write(f"Conditioning Scale: {args.conditioning_scale}\n")
             f.write(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]\n\n")
