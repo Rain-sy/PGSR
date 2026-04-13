@@ -21,7 +21,7 @@ Typical commands:
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
         --batch_size 4 --epochs 40 --num_crops 2 --lr 1e-5 \
         --strength 1 --pixel_gate_init 4 \
-        --lpips_weight 0.1 --lpips_resize 256 --lpips_apply_prob 0.1 \
+        --lpips_weight 0 \
         --empty_cache_steps 50
 
 2) Stage 2 (recommended): realesrgan degradation fine-tuning
@@ -35,7 +35,8 @@ Typical commands:
         --batch_size 4 --epochs 20 --num_crops 2 --lr 5e-6 \
         --warmup_epochs 2 \
         --strength 1 --pixel_gate_init 4 \
-        --lpips_weight 0.1 --lpips_resize 256 --lpips_apply_prob 0.1 \
+        --lpips_weight 0.05 --lpips_resize 256 --lpips_apply_prob 0.1 \
+        --usm_mode realesrgan --usm_weight 0.3 \
         --empty_cache_steps 50
 """
 
@@ -146,6 +147,12 @@ class SRDataset(Dataset):
         degrade_mode='paired',
         scale=4,
         realesrgan_cfg=None,
+        geom_aug=False,
+        usm_mode='off',
+        usm_weight=0.0,
+        usm_radius=1.0,
+        usm_threshold=10.0,
+        usm_apply_prob=1.0,
     ):
         self.hr_dir = hr_dir
         self.lr_dir = lr_dir
@@ -155,6 +162,12 @@ class SRDataset(Dataset):
         self.is_val = is_val
         self.degrade_mode = degrade_mode
         self.realesrgan_cfg = dict(realesrgan_cfg or {})
+        self.geom_aug = bool(geom_aug)
+        self.usm_mode = usm_mode
+        self.usm_weight = float(usm_weight)
+        self.usm_radius = float(usm_radius)
+        self.usm_threshold = float(usm_threshold)
+        self.usm_apply_prob = float(usm_apply_prob)
         self._resample_map = {
             'area': PIL_RESAMPLING.BOX,
             'bilinear': PIL_RESAMPLING.BILINEAR,
@@ -473,6 +486,36 @@ class SRDataset(Dataset):
 
         lq = Image.fromarray(self._clip_uint8(np.array(lq).astype(np.float32)), mode='RGB')
         return lq.resize((self.resolution, self.resolution), PIL_RESAMPLING.BICUBIC)
+
+    @staticmethod
+    def _random_augment(*imgs):
+        """Apply identical random H-flip, V-flip, 90-degree rotation to all images."""
+        hflip = np.random.rand() < 0.5
+        vflip = np.random.rand() < 0.5
+        rot90 = np.random.rand() < 0.5
+        out = []
+        for img in imgs:
+            if hflip:
+                img = img.transpose(Image.FLIP_LEFT_RIGHT)
+            if vflip:
+                img = img.transpose(Image.FLIP_TOP_BOTTOM)
+            if rot90:
+                img = img.transpose(Image.ROTATE_90)
+            out.append(img)
+        return out
+
+    @staticmethod
+    def _usm_sharp(img, weight=0.5, radius=1.0, threshold=10.0):
+        """Apply mild USM sharpening to GT, tuned for SR training stability."""
+        if weight <= 0:
+            return img
+        blur = img.filter(ImageFilter.GaussianBlur(radius=max(0.0, float(radius))))
+        arr = np.array(img).astype(np.float32)
+        arr_blur = np.array(blur).astype(np.float32)
+        diff = arr - arr_blur
+        mask = np.abs(diff) > float(threshold)
+        arr[mask] = arr[mask] + float(weight) * diff[mask]
+        return Image.fromarray(np.clip(np.round(arr), 0, 255).astype(np.uint8), mode='RGB')
     
     def __getitem__(self, idx):
         img_idx = idx // self.num_crops
@@ -503,6 +546,23 @@ class SRDataset(Dataset):
                 else:
                     hr_crop = self._crop_hr_only(hr_img)
                     lr_up = self._bicubic_degrade(hr_crop)
+
+            if self.geom_aug:
+                hr_crop, lr_up = self._random_augment(hr_crop, lr_up)
+
+            usm_enabled = (
+                self.usm_weight > 0
+                and self.usm_apply_prob > 0
+                and np.random.rand() < self.usm_apply_prob
+                and (self.usm_mode == 'all' or (self.usm_mode == 'realesrgan' and self.degrade_mode == 'realesrgan'))
+            )
+            if usm_enabled:
+                hr_crop = self._usm_sharp(
+                    hr_crop,
+                    weight=self.usm_weight,
+                    radius=self.usm_radius,
+                    threshold=self.usm_threshold,
+                )
         
         hr_t = torch.from_numpy(np.array(hr_crop)).float().permute(2, 0, 1) / 127.5 - 1
         lr_t = torch.from_numpy(np.array(lr_up)).float().permute(2, 0, 1) / 127.5 - 1
@@ -1122,6 +1182,18 @@ def main():
                         help='Resize for LPIPS loss (0 = use original training resolution)')
     parser.add_argument('--lpips_apply_prob', type=float, default=0.25,
                         help='Probability of applying LPIPS loss on each train step')
+    parser.add_argument('--geom_aug', action='store_true',
+                        help='Enable random flip/rotation augmentation during training')
+    parser.add_argument('--usm_mode', type=str, default='off', choices=['off', 'realesrgan', 'all'],
+                        help='USM sharpening scope for GT: off, only in realesrgan training, or all modes')
+    parser.add_argument('--usm_weight', type=float, default=0.0,
+                        help='USM sharpening weight (0 disables USM)')
+    parser.add_argument('--usm_radius', type=float, default=1.0,
+                        help='USM Gaussian blur radius (PIL radius)')
+    parser.add_argument('--usm_threshold', type=float, default=10.0,
+                        help='USM threshold in [0,255] space')
+    parser.add_argument('--usm_apply_prob', type=float, default=1.0,
+                        help='Probability to apply USM on each training sample')
     parser.add_argument('--empty_cache_steps', type=int, default=0,
                         help='Call gc/empty_cache every N training steps (0 to disable)')
     
@@ -1147,6 +1219,12 @@ def main():
         parser.error("--scale must be >= 1")
     if args.resolution % args.scale != 0:
         parser.error("--resolution must be divisible by --scale")
+    if args.usm_weight < 0:
+        parser.error("--usm_weight must be >= 0")
+    if args.usm_radius < 0:
+        parser.error("--usm_radius must be >= 0")
+    if not (0.0 <= args.usm_apply_prob <= 1.0):
+        parser.error("--usm_apply_prob must be within [0, 1]")
     if args.degrade_mode == 'paired' and not args.lr_dir:
         parser.error("--lr_dir is required when --degrade_mode is 'paired'")
     
@@ -1162,6 +1240,14 @@ def main():
             "[Warning] degrade_mode=realesrgan without --resume. "
             "Recommended 2-stage workflow: pretrain with paired, then resume for realesrgan fine-tuning."
         )
+    if is_main and args.degrade_mode in ('paired', 'bicubic') and args.lpips_weight > 0:
+        print("[Warning] LPIPS in Stage-1 style training can reduce PSNR. Consider --lpips_weight 0.")
+    if is_main and args.degrade_mode in ('paired', 'bicubic') and args.usm_mode != 'off' and args.usm_weight > 0:
+        print("[Warning] USM on paired/bicubic training can reduce PSNR. Consider --usm_mode off for Stage 1.")
+    if is_main and args.usm_mode == 'off' and args.usm_weight > 0:
+        print("[Warning] --usm_weight is set but --usm_mode=off, so USM is disabled.")
+    if is_main and args.usm_mode != 'off' and args.usm_weight <= 0:
+        print("[Warning] --usm_mode is enabled but --usm_weight <= 0, so USM has no effect.")
     triton_cache_dir = os.environ.get("TRITON_CACHE_DIR")
     if triton_cache_dir:
         try:
@@ -1185,6 +1271,9 @@ def main():
         f"_gate{_fmt_tag(args.pixel_gate_init)}"
         f"_lpw{_fmt_tag(args.lpips_weight)}"
         f"_lpp{_fmt_tag(args.lpips_apply_prob)}"
+        f"_aug{int(args.geom_aug)}"
+        f"_usm{_fmt_tag(args.usm_mode)}"
+        f"_usmw{_fmt_tag(args.usm_weight)}"
         f"_crop{args.num_crops}"
     )
     save_dir = os.path.join(args.save_dir, exp_name)
@@ -1207,6 +1296,11 @@ def main():
         print(f"Pixel Gate Init (sigmoid): {1.0 / (1.0 + math.exp(-args.pixel_gate_init)):.4f}")
         print(f"Conditioning Scale: {args.conditioning_scale}")
         print(f"LPIPS Weight: {args.lpips_weight} (resize={args.lpips_resize}, prob={args.lpips_apply_prob})")
+        print(f"Geometric Aug: {args.geom_aug}")
+        print(
+            f"USM: mode={args.usm_mode}, weight={args.usm_weight}, radius={args.usm_radius}, "
+            f"threshold={args.usm_threshold}, prob={args.usm_apply_prob}"
+        )
         print(f"Empty Cache Steps: {args.empty_cache_steps}")
         if triton_cache_dir:
             print(f"TRITON_CACHE_DIR: {triton_cache_dir}")
@@ -1298,6 +1392,12 @@ def main():
         num_crops=args.num_crops, is_val=False,
         degrade_mode=args.degrade_mode, scale=args.scale,
         realesrgan_cfg=realesrgan_cfg,
+        geom_aug=args.geom_aug,
+        usm_mode=args.usm_mode,
+        usm_weight=args.usm_weight,
+        usm_radius=args.usm_radius,
+        usm_threshold=args.usm_threshold,
+        usm_apply_prob=args.usm_apply_prob,
     )
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
@@ -1406,6 +1506,11 @@ def main():
             f.write(f"Pixel Gate Init (logit): {args.pixel_gate_init}\n")
             f.write(f"Pixel Gate Init (sigmoid): {1.0 / (1.0 + math.exp(-args.pixel_gate_init)):.6f}\n")
             f.write(f"LPIPS Weight: {args.lpips_weight} (resize={args.lpips_resize}, prob={args.lpips_apply_prob})\n\n")
+            f.write(f"Geometric Aug: {args.geom_aug}\n")
+            f.write(
+                f"USM: mode={args.usm_mode}, weight={args.usm_weight}, radius={args.usm_radius}, "
+                f"threshold={args.usm_threshold}, prob={args.usm_apply_prob}\n\n"
+            )
             if args.degrade_mode == 'realesrgan':
                 f.write(
                     "RealESRGAN Degrade: "
