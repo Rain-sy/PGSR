@@ -264,26 +264,106 @@ class SRDataset(Dataset):
     def _clip_uint8(arr):
         return np.clip(np.round(arr), 0, 255).astype(np.uint8)
 
-    def _random_blur(self, img, sigma_range):
-        sigma = float(np.random.uniform(float(sigma_range[0]), float(sigma_range[1])))
-        return img.filter(ImageFilter.GaussianBlur(radius=max(0.0, sigma)))
+    @staticmethod
+    def _normalize_kernel(kernel):
+        kernel = kernel.astype(np.float32)
+        s = float(kernel.sum())
+        if abs(s) < 1e-8:
+            h, w = kernel.shape
+            kernel[:] = 0.0
+            kernel[h // 2, w // 2] = 1.0
+            s = 1.0
+        kernel /= s
+        return kernel
 
     @staticmethod
-    def _build_sinc_kernel(cutoff, kernel_size):
-        """Approximate low-pass sinc kernel without scipy (separable form)."""
+    def _build_blur_kernel(kernel_size, sigma_x, sigma_y, theta, beta=2.0, plateau=False):
+        """Build anisotropic blur kernels used in RealESRGAN-style degradation."""
         if kernel_size % 2 == 0:
             kernel_size += 1
         half = kernel_size // 2
         x = np.arange(-half, half + 1, dtype=np.float32)
-        # np.sinc uses pi-normalized input: sinc(x) = sin(pi x)/(pi x)
-        one_d = np.sinc((float(cutoff) / np.pi) * x).astype(np.float32)
-        kernel = np.outer(one_d, one_d).astype(np.float32)
-        kernel_sum = float(kernel.sum())
-        if abs(kernel_sum) < 1e-8:
+        xx, yy = np.meshgrid(x, x)
+
+        ct = math.cos(float(theta))
+        st = math.sin(float(theta))
+        xr = xx * ct + yy * st
+        yr = -xx * st + yy * ct
+
+        sx = max(float(sigma_x), 1e-6)
+        sy = max(float(sigma_y), 1e-6)
+        b = max(float(beta), 1e-6)
+
+        power = (np.abs(xr) / sx) ** b + (np.abs(yr) / sy) ** b
+        if plateau:
+            kernel = 1.0 / (1.0 + power)
+        else:
+            kernel = np.exp(-0.5 * power)
+        return SRDataset._normalize_kernel(kernel)
+
+    def _random_blur(self, img, sigma_range):
+        cfg = self.realesrgan_cfg
+        default_prob = np.array([0.45, 0.25, 0.15, 0.15], dtype=np.float32)  # iso/aniso/gen/plateau
+        kernel_prob = np.array(cfg.get('blur_kernel_prob', default_prob), dtype=np.float32).reshape(-1)
+        if kernel_prob.size != 4:
+            kernel_prob = default_prob.copy()
+        kernel_prob = np.clip(kernel_prob, 1e-6, None)
+        kernel_prob = kernel_prob / kernel_prob.sum()
+        kind = int(np.random.choice(4, p=kernel_prob))
+
+        sigma_min = float(min(sigma_range))
+        sigma_max = float(max(sigma_range))
+        sigma_x = float(np.random.uniform(sigma_min, sigma_max))
+        sigma_y = float(np.random.uniform(sigma_min, sigma_max))
+        theta = float(np.random.uniform(0.0, np.pi))
+
+        if kind == 0:
+            sigma = float(np.random.uniform(sigma_min, sigma_max))
+            return img.filter(ImageFilter.GaussianBlur(radius=max(0.0, sigma)))
+
+        ksize_min, ksize_max = cfg.get('blur_kernel_size_range', [7, 21])
+        odd_sizes = [k for k in range(int(ksize_min), int(ksize_max) + 1) if k % 2 == 1]
+        if not odd_sizes:
+            odd_sizes = [7, 9, 11, 13, 15, 17, 19, 21]
+        kernel_size = int(np.random.choice(odd_sizes))
+
+        if kind == 1:  # anisotropic gaussian
+            kernel = self._build_blur_kernel(kernel_size, sigma_x, sigma_y, theta, beta=2.0, plateau=False)
+        elif kind == 2:  # generalized gaussian
+            beta_min, beta_max = cfg.get('blur_gen_beta_range', [0.5, 4.0])
+            beta = float(np.random.uniform(float(beta_min), float(beta_max)))
+            kernel = self._build_blur_kernel(kernel_size, sigma_x, sigma_y, theta, beta=beta, plateau=False)
+        else:  # plateau-shaped
+            beta_min, beta_max = cfg.get('blur_plateau_beta_range', [1.0, 2.0])
+            beta = float(np.random.uniform(float(beta_min), float(beta_max)))
+            kernel = self._build_blur_kernel(kernel_size, sigma_x, sigma_y, theta, beta=beta, plateau=True)
+        return self._apply_kernel(img, kernel)
+
+    @staticmethod
+    def _build_sinc_kernel(cutoff, kernel_size):
+        """Build circular low-pass sinc kernel (Bessel form when available)."""
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        half = kernel_size // 2
+        x = np.arange(-half, half + 1, dtype=np.float32)
+        xx, yy = np.meshgrid(x, x)
+        rr = np.sqrt(xx ** 2 + yy ** 2).astype(np.float32)
+        wc = float(cutoff)
+
+        if hasattr(torch.special, "bessel_j1"):
+            r_t = torch.from_numpy(rr)
+            z = wc * r_t
+            kernel_t = torch.empty_like(z, dtype=torch.float32)
+            nz = z != 0
+            kernel_t[nz] = (wc * torch.special.bessel_j1(z[nz])) / (2.0 * np.pi * z[nz])
+            kernel_t[~nz] = (wc * wc) / (4.0 * np.pi)
+            kernel = kernel_t.numpy()
+        else:
+            # Fallback circular sinc (radial); still isotropic unlike separable outer-product version.
+            kernel = np.sinc((wc / np.pi) * rr).astype(np.float32)
             kernel[half, half] = 1.0
-            kernel_sum = 1.0
-        kernel /= kernel_sum
-        return kernel
+
+        return SRDataset._normalize_kernel(kernel)
 
     @staticmethod
     def _apply_kernel(img, kernel):
@@ -314,10 +394,13 @@ class SRDataset(Dataset):
             scale = max(scale, 1e-6)
             if use_gray:
                 gray = (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]).astype(np.float32)
-                noisy = np.random.poisson(np.clip(gray, 0.0, 1.0) * 255.0 * scale) / (255.0 * scale)
-                arr = np.repeat(noisy[..., None], 3, axis=2)
+                noisy_gray = np.random.poisson(np.clip(gray, 0.0, 1.0) * 255.0 * scale).astype(np.float32)
+                noisy_gray = noisy_gray / (255.0 * scale)
+                noise = (noisy_gray - gray).astype(np.float32)
+                noise = np.repeat(noise[..., None], 3, axis=2)
+                arr = arr + noise
             else:
-                arr = np.random.poisson(np.clip(arr, 0.0, 1.0) * 255.0 * scale) / (255.0 * scale)
+                arr = np.random.poisson(np.clip(arr, 0.0, 1.0) * 255.0 * scale).astype(np.float32) / (255.0 * scale)
             arr = np.clip(arr, 0.0, 1.0)
 
         return Image.fromarray(self._clip_uint8(arr * 255.0), mode='RGB')
