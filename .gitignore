@@ -11,3 +11,4 @@ checkpoints/
 Data/
 outputs/
 eval_*/
+.claude/worktrees/
