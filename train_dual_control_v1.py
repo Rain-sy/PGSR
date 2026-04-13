@@ -7,7 +7,8 @@ Dual-Stream FLUX SR ControlNet Training V1 (No Degradation Pipeline)
 This is the OLD baseline training entry.
 - No `--degrade_mode` support
 - Expects paired LR/HR input (`--lr_dir` is required)
-- Use this file when reproducing previous paired bicubic experiments
+- Equivalent to Stage 1 paired bicubic training
+- For Stage 2 real-world adaptation, switch to `train_dual_control.py` with `--degrade_mode realesrgan`
 
 Typical command:
     accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \

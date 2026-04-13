@@ -11,25 +11,32 @@ This is the NEW training entry.
 
 Typical commands:
 
-1) Real-world oriented training (recommended):
-    accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
-        train_dual_control.py \
-        --hr_dir Data/Mix16K_HR \
-        --degrade_mode realesrgan --scale 4 \
-        --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
-        --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --batch_size 4 --epochs 40 --num_crops 2 --lr 1e-5 \
-        --strength 1 --pixel_gate_init 4 \
-        --lpips_weight 0.1  --empty_cache_steps 50
-
-2) Paired training (fallback/ablation):
+1) Stage 1 (recommended): paired bicubic pretraining
     accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
         train_dual_control.py \
         --hr_dir Data/Mix16K_HR \
         --lr_dir Data/Mix16K_LR_bicubic_X4 \
         --degrade_mode paired --scale 4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
-        --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4
+        --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
+        --batch_size 4 --epochs 40 --num_crops 2 --lr 1e-5 \
+        --strength 1 --pixel_gate_init 4 \
+        --lpips_weight 0.1 --lpips_resize 256 --lpips_apply_prob 0.1 \
+        --empty_cache_steps 50
+
+2) Stage 2 (recommended): realesrgan degradation fine-tuning
+    accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
+        train_dual_control.py \
+        --hr_dir Data/Mix16K_HR \
+        --degrade_mode realesrgan --scale 4 \
+        --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
+        --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
+        --resume checkpoints/dual_control/<stage1_exp>/best_model.pt \
+        --batch_size 4 --epochs 20 --num_crops 2 --lr 5e-6 \
+        --warmup_epochs 2 \
+        --strength 1 --pixel_gate_init 4 \
+        --lpips_weight 0.1 --lpips_resize 256 --lpips_apply_prob 0.1 \
+        --empty_cache_steps 50
 """
 
 
@@ -1067,6 +1074,11 @@ def main():
     device = accelerator.device
     is_main = accelerator.is_main_process
     set_seed(args.seed)
+    if is_main and args.degrade_mode == 'realesrgan' and not args.resume:
+        print(
+            "[Warning] degrade_mode=realesrgan without --resume. "
+            "Recommended 2-stage workflow: pretrain with paired, then resume for realesrgan fine-tuning."
+        )
     triton_cache_dir = os.environ.get("TRITON_CACHE_DIR")
     if triton_cache_dir:
         try:
@@ -1276,6 +1288,11 @@ def main():
                 unwrapped.pixel_gate_logit.fill_(6.0)
             if is_main:
                 print("[Resume] Legacy checkpoint detected: initialize gated fusion to near-identity.")
+        elif is_main:
+            print(
+                "[Resume] pixel_gate_logit missing in checkpoint; "
+                f"keep current --pixel_gate_init value ({args.pixel_gate_init})."
+            )
         if args.train_controlnet and 'controlnet' in ckpt:
             state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
             unwrapped.controlnet.load_state_dict(state)
