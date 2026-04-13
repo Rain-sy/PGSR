@@ -12,3 +12,4 @@ Data/
 outputs/
 eval_*/
 .claude/worktrees/
+*_tmp.py
