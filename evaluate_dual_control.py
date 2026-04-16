@@ -472,7 +472,7 @@ class DualStreamEvaluator(nn.Module):
 
 @torch.no_grad()
 def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
-                 tile_size=512, overlap=64, blend_mode='linear', strength=0.7):
+                 tile_size=640, overlap=64, strength=0.7):
     _, _, H, W = lr_t.shape
     
     if H <= tile_size and W <= tile_size:
@@ -507,13 +507,12 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
     
     total_tiles = len(y_positions) * len(x_positions)
     full_blend = torch.ones((1, 1, tile_size, tile_size), dtype=torch.float32)
-    if blend_mode == 'linear':
-        for i in range(min(overlap, tile_size // 2)):
-            factor = i / overlap
-            full_blend[:, :, i, :] *= factor
-            full_blend[:, :, -i-1, :] *= factor
-            full_blend[:, :, :, i] *= factor
-            full_blend[:, :, :, -i-1] *= factor
+    for i in range(min(overlap, tile_size // 2)):
+        factor = i / overlap
+        full_blend[:, :, i, :] *= factor
+        full_blend[:, :, -i-1, :] *= factor
+        full_blend[:, :, :, i] *= factor
+        full_blend[:, :, :, -i-1] *= factor
     
     with tqdm(total=total_tiles, desc="Tiled SR", leave=False) as pbar:
         for y in y_positions:
@@ -555,7 +554,7 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
 @torch.no_grad()
 def run_sr_tiled_with_oom_retry(
     evaluator, lr_t, device, num_steps=20, guidance=3.5,
-    tile_size=512, overlap=64, blend_mode='linear', strength=0.7,
+    tile_size=640, overlap=64, strength=0.7,
     min_tile_size=256
 ):
     """
@@ -571,7 +570,7 @@ def run_sr_tiled_with_oom_retry(
             return run_sr_tiled(
                 evaluator, lr_t, device, num_steps=num_steps, guidance=guidance,
                 tile_size=current_tile, overlap=min(overlap, max(0, current_tile // 4)),
-                blend_mode=blend_mode, strength=strength
+                strength=strength
             )
         except Exception as e:
             is_oom = isinstance(e, torch.OutOfMemoryError)
@@ -609,13 +608,9 @@ def main():
     parser.add_argument('--pixel_weight', type=float, default=None)
     parser.add_argument('--strength', type=float, default=None,
                         help='Inference start strength (omit to use checkpoint value)')
-    parser.add_argument('--control_guidance_start', type=float, default=None)
-    parser.add_argument('--control_guidance_end', type=float, default=None)
-    
-    parser.add_argument('--tile_size', type=int, default=512)
+    parser.add_argument('--tile_size', type=int, default=640)
     parser.add_argument('--min_tile_size', type=int, default=256)
     parser.add_argument('--overlap', type=int, default=64)
-    parser.add_argument('--blend_mode', type=str, default='linear')
     parser.add_argument('--calc_lpips', dest='calc_lpips', action='store_true',
                         help='Enable LPIPS calculation (default: enabled if lpips package is available)')
     parser.add_argument('--no_calc_lpips', dest='calc_lpips', action='store_false',
@@ -657,16 +652,9 @@ def main():
         evaluator.pixel_weight = args.pixel_weight
     
     strength = args.strength if args.strength is not None else evaluator.strength
-    control_guidance_start = (
-        args.control_guidance_start
-        if args.control_guidance_start is not None
-        else evaluator.control_guidance_start
-    )
-    control_guidance_end = (
-        args.control_guidance_end
-        if args.control_guidance_end is not None
-        else evaluator.control_guidance_end
-    )
+    # SR default: keep ControlNet active through the whole denoising process.
+    control_guidance_start = 0.0
+    control_guidance_end = 1.0
     evaluator.control_guidance_start = control_guidance_start
     evaluator.control_guidance_end = control_guidance_end
     
@@ -773,7 +761,6 @@ def main():
             tile_size=args.tile_size,
             min_tile_size=args.min_tile_size,
             overlap=args.overlap,
-            blend_mode=args.blend_mode,
             strength=strength
         )
         
