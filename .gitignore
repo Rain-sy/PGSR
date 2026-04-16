@@ -13,3 +13,4 @@ outputs/
 eval_*/
 .claude/worktrees/
 *_tmp.py
+NeurIPS_2026_Dual_SR/
