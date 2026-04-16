@@ -1059,7 +1059,7 @@ def calculate_psnr(pred, target):
 
 @torch.no_grad()
 def validate(system, accelerator, val_loader, device, num_samples=5, 
-             num_steps=20, guidance=3.5, strength=0.7):
+             num_steps=20, guidance=3.5, strength=0.7, lpips_model=None):
     """验证（使用官方 scheduler）"""
     unwrapped = accelerator.unwrap_model(system)
     unwrapped.pixel_extractor.eval()
@@ -1067,9 +1067,11 @@ def validate(system, accelerator, val_loader, device, num_samples=5,
     unwrapped.controlnet.eval()
     
     psnr_list = []
+    lpips_list = []
+    max_samples = None if (num_samples is None or num_samples <= 0) else int(num_samples)
     
     for i, batch in enumerate(val_loader):
-        if i >= num_samples:
+        if max_samples is not None and i >= max_samples:
             break
         
         hr = batch['hr'].to(device).to(torch.bfloat16)
@@ -1082,6 +1084,12 @@ def validate(system, accelerator, val_loader, device, num_samples=5,
         sr = unwrapped.decode(sr_lat)
         
         psnr_list.append(calculate_psnr(sr.float(), hr.float()))
+        if lpips_model is not None:
+            lpips_val = lpips_model(
+                sr.float().clamp(-1, 1),
+                hr.float().clamp(-1, 1),
+            ).mean().float().item()
+            lpips_list.append(lpips_val)
         del hr, lr, hr_lat, lr_lat, sr_lat, sr
         if device.type == 'cuda':
             torch.cuda.empty_cache()
@@ -1095,17 +1103,24 @@ def validate(system, accelerator, val_loader, device, num_samples=5,
     if device.type == 'cuda':
         torch.cuda.empty_cache()
     
-    return np.mean(psnr_list) if psnr_list else 0.0
+    return {
+        'psnr': float(np.mean(psnr_list)) if psnr_list else 0.0,
+        'lpips': float(np.mean(lpips_list)) if lpips_list else None,
+    }
 
 
 def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, strength,
                     control_guidance_start, control_guidance_end, path,
-                    lpips_weight=0.0, lpips_apply_prob=0.25):
+                    lpips_weight=0.0, lpips_apply_prob=0.25,
+                    val_lpips=None, best_metric='psnr', best_metric_value=None):
     unwrapped = accelerator.unwrap_model(system)
     torch.save({
         'epoch': epoch,
         'loss': loss,
         'psnr': psnr,
+        'val_lpips': val_lpips,
+        'best_metric': best_metric,
+        'best_metric_value': best_metric_value,
         'pixel_weight': pixel_weight,
         'conditioning_scale': unwrapped.conditioning_scale,
         'strength': strength,
@@ -1201,6 +1216,14 @@ def main():
     parser.add_argument('--strength', type=float, default=1,
                         help='Validation/eval strength (1.0 = pure noise start, 0.8 = skip first 20% steps)')
     parser.add_argument('--val_num_steps', type=int, default=10)
+    parser.add_argument('--val_num_samples', type=int, default=5,
+                        help='Number of validation samples per epoch (<=0 means full validation set)')
+    parser.add_argument('--val_calc_lpips', action='store_true',
+                        help='Also compute LPIPS on validation set')
+    parser.add_argument('--best_metric', type=str, default='psnr', choices=['psnr', 'lpips'],
+                        help='Metric used for best checkpoint selection')
+    parser.add_argument('--reset_best_on_resume', action='store_true',
+                        help='When resuming (e.g., Stage2), reset best metric tracking instead of inheriting Stage1 best')
     
     # Checkpointing
     parser.add_argument('--save_dir', type=str, default='./checkpoints/dual_control')
@@ -1227,6 +1250,10 @@ def main():
         parser.error("--usm_apply_prob must be within [0, 1]")
     if args.degrade_mode == 'paired' and not args.lr_dir:
         parser.error("--lr_dir is required when --degrade_mode is 'paired'")
+    if args.best_metric == 'lpips':
+        args.val_calc_lpips = True
+    if args.best_metric in ('psnr', 'lpips') and not args.val_hr_dir:
+        parser.error("--val_hr_dir is required when selecting best checkpoints by validation metrics")
     
     if args.freeze_controlnet:
         args.train_controlnet = False
@@ -1274,6 +1301,7 @@ def main():
         f"_aug{int(args.geom_aug)}"
         f"_usm{_fmt_tag(args.usm_mode)}"
         f"_usmw{_fmt_tag(args.usm_weight)}"
+        f"_bm{_fmt_tag(args.best_metric)}"
         f"_crop{args.num_crops}"
     )
     save_dir = os.path.join(args.save_dir, exp_name)
@@ -1306,6 +1334,8 @@ def main():
             print(f"TRITON_CACHE_DIR: {triton_cache_dir}")
         print(f"Strength: {args.strength} (推理时跳过 {(1-args.strength)*100:.0f}% 步数)")
         print(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]")
+        print(f"Validation: steps={args.val_num_steps}, samples={args.val_num_samples}, lpips={args.val_calc_lpips}")
+        print(f"Best Metric: {args.best_metric}, Reset Best On Resume: {args.reset_best_on_resume}")
         print(f"Learning Rate: {args.lr} (Pixel branch: {args.lr * 10})")
         if args.degrade_mode == 'realesrgan':
             print(
@@ -1341,6 +1371,21 @@ def main():
                 f"[Loss] LPIPS enabled: weight={args.lpips_weight}, "
                 f"resize={args.lpips_resize}, prob={args.lpips_apply_prob}"
             )
+
+    val_lpips_model = None
+    if args.val_calc_lpips:
+        if not LPIPS_AVAILABLE:
+            raise ImportError(
+                "lpips package is required when --val_calc_lpips is enabled. Install with: pip install lpips"
+            )
+        if lpips_model is not None:
+            val_lpips_model = lpips_model
+        else:
+            val_lpips_model = lpips.LPIPS(net='alex').to(device)
+            val_lpips_model.eval()
+            val_lpips_model.requires_grad_(False)
+        if is_main:
+            print("[Val] LPIPS metric enabled for validation.")
     
     # Enable gradient checkpointing
     if hasattr(system.transformer, 'enable_gradient_checkpointing'):
@@ -1444,6 +1489,7 @@ def main():
     # Resume
     start_epoch = 0
     best_psnr = 0.0
+    best_lpips = float('inf')
     
     if args.resume:
         if is_main:
@@ -1482,6 +1528,9 @@ def main():
         
         start_epoch = ckpt.get('epoch', 0) + 1
         best_psnr = ckpt.get('psnr', 0.0)
+        ckpt_lpips = ckpt.get('val_lpips', None)
+        if ckpt_lpips is not None:
+            best_lpips = float(ckpt_lpips)
         if 'control_guidance_start' in ckpt:
             args.control_guidance_start = ckpt['control_guidance_start']
             unwrapped.control_guidance_start = ckpt['control_guidance_start']
@@ -1490,8 +1539,15 @@ def main():
             unwrapped.control_guidance_end = ckpt['control_guidance_end']
         if 'conditioning_scale' in ckpt:
             unwrapped.conditioning_scale = ckpt['conditioning_scale']
+        if args.reset_best_on_resume:
+            best_psnr = -float('inf')
+            best_lpips = float('inf')
         if is_main:
-            print(f"[Resume] Starting from epoch {start_epoch}, best PSNR: {best_psnr:.2f}")
+            if args.reset_best_on_resume:
+                print(f"[Resume] Starting from epoch {start_epoch}, best metric tracking reset.")
+            else:
+                lpips_msg = f", best LPIPS: {best_lpips:.4f}" if np.isfinite(best_lpips) else ""
+                print(f"[Resume] Starting from epoch {start_epoch}, best PSNR: {best_psnr:.2f}{lpips_msg}")
     
     # Log file
     log_path = os.path.join(save_dir, 'training_log.txt')
@@ -1510,6 +1566,13 @@ def main():
             f.write(
                 f"USM: mode={args.usm_mode}, weight={args.usm_weight}, radius={args.usm_radius}, "
                 f"threshold={args.usm_threshold}, prob={args.usm_apply_prob}\n\n"
+            )
+            f.write(
+                f"Validation: steps={args.val_num_steps}, samples={args.val_num_samples}, "
+                f"lpips={args.val_calc_lpips}\n"
+            )
+            f.write(
+                f"Best Metric: {args.best_metric}, Reset Best On Resume: {args.reset_best_on_resume}\n\n"
             )
             if args.degrade_mode == 'realesrgan':
                 f.write(
@@ -1586,36 +1649,71 @@ def main():
         
         # Validation
         val_psnr = 0.0
+        val_lpips = None
         if val_loader and (epoch + 1) % args.val_interval == 0:
             if is_main:
-                val_psnr = validate(system, accelerator, val_loader, device,
-                                   num_samples=5, num_steps=args.val_num_steps,
-                                   guidance=args.guidance, strength=args.strength)
+                val_metrics = validate(
+                    system, accelerator, val_loader, device,
+                    num_samples=args.val_num_samples, num_steps=args.val_num_steps,
+                    guidance=args.guidance, strength=args.strength,
+                    lpips_model=val_lpips_model if args.val_calc_lpips else None,
+                )
+                val_psnr = val_metrics['psnr']
+                val_lpips = val_metrics['lpips']
         
         if is_main:
             lr_current = lr_scheduler.get_last_lr()[0]
             gate_value = torch.sigmoid(unwrapped.pixel_gate_logit.detach().float()).item()
-            log_line = (
-                f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, "
-                f"LR={lr_current:.2e}, Gate={gate_value:.4f}\n"
-            )
+            if val_lpips is not None:
+                log_line = (
+                    f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, "
+                    f"LPIPS={val_lpips:.4f}, LR={lr_current:.2e}, Gate={gate_value:.4f}\n"
+                )
+            else:
+                log_line = (
+                    f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, "
+                    f"LR={lr_current:.2e}, Gate={gate_value:.4f}\n"
+                )
             with open(log_path, 'a') as f:
                 f.write(log_line)
             
-            print(
-                f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, "
-                f"lr={lr_current:.2e}, gate={gate_value:.4f}"
-            )
+            if val_lpips is not None:
+                print(
+                    f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, "
+                    f"val_lpips={val_lpips:.4f}, lr={lr_current:.2e}, gate={gate_value:.4f}"
+                )
+            else:
+                print(
+                    f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, "
+                    f"lr={lr_current:.2e}, gate={gate_value:.4f}"
+                )
             
-            if val_psnr > best_psnr:
-                best_psnr = val_psnr
+            improved = False
+            if args.best_metric == 'psnr':
+                if val_psnr > best_psnr:
+                    best_psnr = val_psnr
+                    improved = True
+                best_value = best_psnr
+            else:
+                if val_lpips is not None and val_lpips < best_lpips:
+                    best_lpips = val_lpips
+                    improved = True
+                best_value = best_lpips if np.isfinite(best_lpips) else None
+
+            if improved:
                 save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr,
                                args.pixel_weight, args.strength,
                                args.control_guidance_start, args.control_guidance_end,
                                os.path.join(save_dir, 'best_model.pt'),
                                lpips_weight=args.lpips_weight,
-                               lpips_apply_prob=args.lpips_apply_prob)
-                print(f"  → New best PSNR: {best_psnr:.2f} dB")
+                               lpips_apply_prob=args.lpips_apply_prob,
+                               val_lpips=val_lpips,
+                               best_metric=args.best_metric,
+                               best_metric_value=best_value)
+                if args.best_metric == 'lpips' and best_value is not None:
+                    print(f"  -> New best LPIPS: {best_value:.4f}")
+                else:
+                    print(f"  -> New best PSNR: {best_value:.2f} dB")
             
             if (epoch + 1) % args.save_interval == 0:
                 save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr,
@@ -1623,7 +1721,10 @@ def main():
                                args.control_guidance_start, args.control_guidance_end,
                                os.path.join(save_dir, f'epoch{epoch+1}.pt'),
                                lpips_weight=args.lpips_weight,
-                               lpips_apply_prob=args.lpips_apply_prob)
+                               lpips_apply_prob=args.lpips_apply_prob,
+                               val_lpips=val_lpips,
+                               best_metric=args.best_metric,
+                               best_metric_value=(val_lpips if args.best_metric == 'lpips' else val_psnr))
             
         gc.collect()
         if device.type == 'cuda':
@@ -1633,16 +1734,28 @@ def main():
     
     # Final save
     if is_main:
+        if not np.isfinite(best_psnr):
+            best_psnr = 0.0
+        final_best_value = best_psnr if args.best_metric == 'psnr' else (best_lpips if np.isfinite(best_lpips) else None)
         save_checkpoint(system, accelerator, args.epochs - 1, avg_loss, best_psnr,
                        args.pixel_weight, args.strength,
                        args.control_guidance_start, args.control_guidance_end,
                        os.path.join(save_dir, 'final_model.pt'),
                        lpips_weight=args.lpips_weight,
-                       lpips_apply_prob=args.lpips_apply_prob)
+                       lpips_apply_prob=args.lpips_apply_prob,
+                       val_lpips=(best_lpips if np.isfinite(best_lpips) else None),
+                       best_metric=args.best_metric,
+                       best_metric_value=final_best_value)
         
         print("\n" + "=" * 70)
         print("Training Complete!")
-        print(f"Best PSNR: {best_psnr:.2f} dB")
+        if args.best_metric == 'lpips' and final_best_value is not None:
+            print(f"Best LPIPS: {final_best_value:.4f}")
+            print(f"Best PSNR (tracked): {best_psnr:.2f} dB")
+        else:
+            print(f"Best PSNR: {best_psnr:.2f} dB")
+            if np.isfinite(best_lpips):
+                print(f"Best LPIPS (tracked): {best_lpips:.4f}")
         print(f"Checkpoints: {save_dir}")
         print("=" * 70)
 

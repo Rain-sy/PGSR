@@ -298,6 +298,16 @@ class DualStreamEvaluator(nn.Module):
         C = D // 4
         x = x.view(B, H // 2, W // 2, C, 2, 2).permute(0, 3, 1, 4, 2, 5)
         return x.reshape(B, C, H, W)
+
+    @staticmethod
+    def _pad_to_even_hw(x):
+        """Pad feature map to even H/W for FLUX pack/unpack."""
+        _, _, h, w = x.shape
+        pad_h = h % 2
+        pad_w = w % 2
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='replicate')
+        return x, pad_h, pad_w
     
     def _img_ids(self, H, W, device, dtype):
         h, w = H // 2, W // 2
@@ -357,11 +367,16 @@ class DualStreamEvaluator(nn.Module):
         else:
             fused_cond = (lr_lat + self.pixel_weight * pixel_feat).to(dtype)
         del pixel_feat
+
+        # FLUX pack() requires even latent H/W. RealSR can produce odd latent sizes.
+        noisy_for_pack, pad_h, pad_w = self._pad_to_even_hw(noisy.to(dtype))
+        fused_for_pack, _, _ = self._pad_to_even_hw(fused_cond)
+        H_pack, W_pack = noisy_for_pack.shape[-2:]
         
-        noisy_packed = self._pack(noisy.to(dtype))
-        fused_packed = self._pack(fused_cond)
+        noisy_packed = self._pack(noisy_for_pack)
+        fused_packed = self._pack(fused_for_pack)
         del fused_cond
-        img_ids = self._img_ids(H, W, device, dtype)
+        img_ids = self._img_ids(H_pack, W_pack, device, dtype)
         
         pooled = self._cached_embeds['pooled'].expand(B, -1)
         prompt = self._cached_embeds['prompt'].expand(B, -1, -1)
@@ -407,8 +422,11 @@ class DualStreamEvaluator(nn.Module):
             return_dict=False,
         )[0]
         del ctrl_out, noisy_packed, img_ids
-        
-        return self._unpack(out, H, W)
+
+        unpacked = self._unpack(out, H_pack, W_pack)
+        if pad_h or pad_w:
+            unpacked = unpacked[:, :, :H, :W]
+        return unpacked
     
     @torch.no_grad()
     def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, strength=0.7):
