@@ -19,7 +19,7 @@ Typical commands:
         --degrade_mode paired --scale 4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --batch_size 4 --epochs 40 --num_crops 2 --lr 1e-5 \
+        --batch_size 4 --epochs 20 --num_crops 2 --lr 1e-5 \
         --strength 1 --pixel_gate_init 4 \
         --lpips_weight 0 \
         --empty_cache_steps 50
@@ -1200,7 +1200,7 @@ def main():
     # Validation/eval start point (img2img-style interpolation from LR + noise)
     parser.add_argument('--strength', type=float, default=1,
                         help='Validation/eval strength (1.0 = pure noise start, 0.8 = skip first 20% steps)')
-    parser.add_argument('--val_num_steps', type=int, default=10)
+    parser.add_argument('--val_num_steps', type=int, default=20)
     
     # Checkpointing
     parser.add_argument('--save_dir', type=str, default='./checkpoints/dual_control')
