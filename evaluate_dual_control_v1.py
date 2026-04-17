@@ -641,10 +641,10 @@ def main():
             args.dataset = 'Urban100'
         elif 'div2k' in hr_lower:
             args.dataset = 'DIV2K'
-        elif 'realsr' in hr_lower:
-            args.dataset = 'RealSR'
         elif 'drealsr' in hr_lower:
             args.dataset = 'DRealSR'
+        elif 'realsr' in hr_lower:
+            args.dataset = 'RealSR'
         else:
             args.dataset = 'Unknown'
     
