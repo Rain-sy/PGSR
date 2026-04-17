@@ -642,14 +642,35 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
             x_positions.append(W - tile_size)
     
     total_tiles = len(y_positions) * len(x_positions)
-    full_blend = torch.ones((1, 1, tile_size, tile_size), dtype=torch.float32)
-    if blend_mode == 'linear':
-        for i in range(min(overlap, tile_size // 2)):
-            factor = i / overlap
-            full_blend[:, :, i, :] *= factor
-            full_blend[:, :, -i-1, :] *= factor
-            full_blend[:, :, :, i] *= factor
-            full_blend[:, :, :, -i-1] *= factor
+
+    def build_tile_blend(tile_h, tile_w, y, y_end, x, x_end):
+        """
+        Boundary-aware blending:
+        - Only taper sides that overlap with neighboring tiles.
+        - Keep image outer borders untapered to avoid dark/gray frame artifacts.
+        """
+        blend = torch.ones((1, 1, tile_h, tile_w), dtype=torch.float32)
+        if blend_mode != 'linear' or overlap <= 0:
+            return blend
+
+        if y > 0:
+            n = min(overlap, tile_h)
+            ramp = torch.linspace(1.0 / (n + 1), n / (n + 1), n, dtype=torch.float32)
+            blend[:, :, :n, :] *= ramp.view(1, 1, n, 1)
+        if y_end < H:
+            n = min(overlap, tile_h)
+            ramp = torch.linspace(n / (n + 1), 1.0 / (n + 1), n, dtype=torch.float32)
+            blend[:, :, -n:, :] *= ramp.view(1, 1, n, 1)
+        if x > 0:
+            n = min(overlap, tile_w)
+            ramp = torch.linspace(1.0 / (n + 1), n / (n + 1), n, dtype=torch.float32)
+            blend[:, :, :, :n] *= ramp.view(1, 1, 1, n)
+        if x_end < W:
+            n = min(overlap, tile_w)
+            ramp = torch.linspace(n / (n + 1), 1.0 / (n + 1), n, dtype=torch.float32)
+            blend[:, :, :, -n:] *= ramp.view(1, 1, 1, n)
+
+        return blend
     
     with tqdm(total=total_tiles, desc="Tiled SR", leave=False) as pbar:
         for y in y_positions:
@@ -674,10 +695,7 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
                 del tile_lat, sr_lat, sr_tile, tile
                 clear_memory(device)
                 
-                if tile_h == tile_size and tile_w == tile_size:
-                    tile_blend = full_blend
-                else:
-                    tile_blend = torch.ones((1, 1, tile_h, tile_w), dtype=torch.float32)
+                tile_blend = build_tile_blend(tile_h, tile_w, y, y_end, x, x_end)
                 
                 out[:, :, y:y_end, x:x_end] += sr_tile_cpu * tile_blend
                 weight[:, :, y:y_end, x:x_end] += tile_blend

@@ -460,7 +460,7 @@ def calculate_psnr(pred, target):
     return 10 * torch.log10(4.0 / mse).item()  # 范围 [-1,1]，max=2
 
 
-def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=20):
+def validate(system, accelerator, val_loader, device, num_samples=10, num_steps=20):
     """Validation"""
     unwrapped = accelerator.unwrap_model(system)
     unwrapped.pixel_extractor.eval()
@@ -757,7 +757,7 @@ def main():
         val_psnr = 0
         if val_loader and (epoch + 1) % args.val_every == 0:
             val_psnr = validate(system, accelerator, val_loader, device,
-                               num_samples=5, num_steps=20)
+                               num_samples=10, num_steps=20)
         
         if is_main:
             print(f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, lr={scheduler.get_last_lr()[0]:.2e}")

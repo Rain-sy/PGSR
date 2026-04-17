@@ -446,7 +446,7 @@ def calculate_psnr(img1, img2):
 
 
 @torch.no_grad()
-def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=20):
+def validate(system, accelerator, val_loader, device, num_samples=10, num_steps=20):
     """Validate the model"""
     # 🌟 必须先脱壳，才能安全访问子模块和自定义方法
     unwrapped_sys = accelerator.unwrap_model(system)
@@ -750,7 +750,7 @@ def main():
         if is_main:
             val_psnr = 0.0
             if val_loader and (epoch + 1) % args.val_interval == 0:
-                val_psnr = validate(system, accelerator, val_loader, device, num_samples=5)
+                val_psnr = validate(system, accelerator, val_loader, device, num_samples=10)
                 history['val_psnr'].append(val_psnr)
                 print(f"[Epoch {epoch+1}] Loss: {avg_loss:.4f}, Val PSNR: {val_psnr:.2f} dB")
                 torch.cuda.empty_cache()

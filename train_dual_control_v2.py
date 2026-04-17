@@ -540,7 +540,7 @@ def calculate_psnr(pred, target):
 
 
 @torch.no_grad()
-def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=20, 
+def validate(system, accelerator, val_loader, device, num_samples=10, num_steps=20, 
              flow_mode='standard'):
     """Validation"""
     unwrapped = accelerator.unwrap_model(system)
@@ -847,7 +847,7 @@ def main():
             val_psnr = 0.0
             if val_loader and (epoch + 1) % args.val_interval == 0:
                 val_psnr = validate(system, accelerator, val_loader, device, 
-                                   num_samples=5, flow_mode=args.flow_mode)
+                                   num_samples=10, flow_mode=args.flow_mode)
             
             # Logging and saving
             lr_current = scheduler.get_last_lr()[0]

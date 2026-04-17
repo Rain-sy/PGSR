@@ -726,7 +726,7 @@ def calculate_psnr(pred, target):
 
 
 @torch.no_grad()
-def validate(system, accelerator, val_loader, device, num_samples=5, 
+def validate(system, accelerator, val_loader, device, num_samples=10, 
              num_steps=20, guidance=3.5, strength=0.7):
     """Validation with scheduler-based inference."""
     unwrapped = accelerator.unwrap_model(system)
@@ -1229,7 +1229,7 @@ def main():
         if val_loader and (epoch + 1) % args.val_interval == 0:
             if is_main:
                 val_psnr = validate(system, accelerator, val_loader, device,
-                                   num_samples=5, num_steps=args.val_num_steps,
+                                   num_samples=10, num_steps=args.val_num_steps,
                                    guidance=args.guidance, strength=args.strength)
         
         if is_main:

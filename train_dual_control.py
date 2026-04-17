@@ -1058,7 +1058,7 @@ def calculate_psnr(pred, target):
 
 
 @torch.no_grad()
-def validate(system, accelerator, val_loader, device, num_samples=5, 
+def validate(system, accelerator, val_loader, device, num_samples=10, 
              num_steps=20, guidance=3.5, strength=0.7, lpips_model=None):
     """验证（使用官方 scheduler）"""
     unwrapped = accelerator.unwrap_model(system)
