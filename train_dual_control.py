@@ -8,34 +8,48 @@ This is the NEW training entry.
 - Supports `--degrade_mode {paired, bicubic, realesrgan}`
 - `realesrgan` mode performs on-the-fly second-order degradation from HR patches
 - Keeps scheduler semantics aligned with official FlowMatch usage
+- FLUX LoRA training is enabled by default
 
-Typical commands:
+Typical commands (DF2K → Mix16K workflow):
 
-1) Stage 1 (recommended): paired bicubic pretraining
+    NOTE on resume semantics:
+    - default `--epochs_mode absolute` (backward compatible): --epochs is target absolute epoch.
+    - `--epochs_mode stage`: --epochs means "epochs to run in THIS stage".
+    lr_scheduler and optimizer restart fresh on resume by default (see
+    --resume_optimizer / --resume_lr_scheduler to override).
+
+1) Stage 1: paired bicubic pretraining on DF2K
     accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
         train_dual_control.py \
-        --hr_dir Data/Mix16K_HR \
-        --lr_dir Data/Mix16K_LR_bicubic_X4 \
+        --hr_dir Data/DF2K_HR \
+        --lr_dir Data/DF2K_LR_bicubic_X4 \
         --degrade_mode paired --scale 4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
         --batch_size 4 --epochs 40 --num_crops 2 --lr 1e-5 \
+        --warmup_epochs 5 \
         --strength 1 --pixel_gate_init 4 \
         --lpips_weight 0 \
         --empty_cache_steps 50
 
-2) Stage 2 (recommended): realesrgan degradation fine-tuning
+2) Stage 2: realesrgan degradation fine-tuning on Mix16K
     accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
         train_dual_control.py \
         --hr_dir Data/Mix16K_HR \
+        --lr_dir Data/Mix16K_LR_bicubic_X4 \
         --degrade_mode realesrgan --scale 4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
         --resume checkpoints/dual_control/<stage1_exp>/best_model.pt \
+        --epochs_mode stage \
+        --reset_pixel_gate --pixel_gate_init 0 \
+        --controlnet_lr_scale 0.1 \
         --batch_size 4 --epochs 20 --num_crops 2 --lr 5e-6 \
         --warmup_epochs 2 \
-        --strength 1 --pixel_gate_init 4 \
+        --strength 1 \
         --lpips_weight 0.05 --lpips_resize 256 --lpips_apply_prob 0.1 \
+        --lpips_max_sigma 0.7 \
+        --realesrgan_paired_prob 0.15 --realesrgan_bicubic_prob 0.10 \
         --usm_mode realesrgan --usm_weight 0.3 \
         --empty_cache_steps 50
 """
@@ -78,10 +92,56 @@ except ImportError:
     lpips = None
     LPIPS_AVAILABLE = False
 
+# PEFT is required because LoRA is enabled by default.
+try:
+    from peft import LoraConfig, get_peft_model
+    from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
+    PEFT_AVAILABLE = True
+except ImportError:
+    LoraConfig = None
+    get_peft_model = None
+    get_peft_model_state_dict = None
+    set_peft_model_state_dict = None
+    PEFT_AVAILABLE = False
+
 if hasattr(Image, "Resampling"):
     PIL_RESAMPLING = Image.Resampling
 else:
     PIL_RESAMPLING = Image
+
+
+# ============================================================================
+# LoRA target module presets
+# ============================================================================
+
+LORA_TARGET_REGEX_OMINICONTROL = (
+    r"(.*(?<!single_)transformer_blocks\.[0-9]+\.norm1\.linear"
+    r"|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_k"
+    r"|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_q"
+    r"|.*single_transformer_blocks\.[0-9]+\.norm\.linear"
+    r"|.*single_transformer_blocks\.[0-9]+\.attn\.to_k"
+    r"|.*single_transformer_blocks\.[0-9]+\.attn\.to_q)"
+)
+
+LORA_TARGET_REGEX_ATTN_QKVO = (
+    r"(.*(?<!single_)transformer_blocks\.[0-9]+\.norm1\.linear"
+    r"|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.(to_q|to_k|to_v|to_out\.0)"
+    r"|.*single_transformer_blocks\.[0-9]+\.norm\.linear"
+    r"|.*single_transformer_blocks\.[0-9]+\.attn\.(to_q|to_k|to_v))"
+)
+
+LORA_TARGET_REGEX_QK_ONLY = (
+    r"(.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_k"
+    r"|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_q"
+    r"|.*single_transformer_blocks\.[0-9]+\.attn\.to_k"
+    r"|.*single_transformer_blocks\.[0-9]+\.attn\.to_q)"
+)
+
+LORA_TARGET_PRESETS = {
+    'ominicontrol': LORA_TARGET_REGEX_OMINICONTROL,
+    'attn_qkvo': LORA_TARGET_REGEX_ATTN_QKVO,
+    'qk_only': LORA_TARGET_REGEX_QK_ONLY,
+}
 
 
 # ============================================================================
@@ -176,8 +236,15 @@ class SRDataset(Dataset):
         }
         self._resample_choices = ['area', 'bilinear', 'bicubic', 'lanczos']
         
-        self.hr_files = sorted([f for f in os.listdir(hr_dir) 
+        self.hr_files = sorted([f for f in os.listdir(hr_dir)
                                 if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+
+        # Real-ESRGAN default sigmas ([0.2, 3.0] / [0.2, 1.5]) are calibrated for
+        # 256px GT. At larger resolutions (e.g. 512), the same sigma produces
+        # visually weaker blur. We multiply by (resolution / 256) unless the
+        # user passes an explicit blur_sigma_scale.
+        cfg_scale = float(self.realesrgan_cfg.get('blur_sigma_scale', 0.0) or 0.0)
+        self._blur_sigma_scale = cfg_scale if cfg_scale > 0 else max(1.0, self.resolution / 256.0)
     
     def __len__(self):
         return len(self.hr_files) * self.num_crops
@@ -433,9 +500,11 @@ class SRDataset(Dataset):
 
     def _degrade_realesrgan(self, hr_crop):
         cfg = self.realesrgan_cfg
+        s = self._blur_sigma_scale
 
         blur_prob = float(cfg.get('blur_prob', 0.8))
-        blur_sigma = cfg.get('blur_sigma', [0.2, 3.0])
+        blur_sigma_raw = cfg.get('blur_sigma', [0.2, 3.0])
+        blur_sigma = [float(blur_sigma_raw[0]) * s, float(blur_sigma_raw[1]) * s]
         resize_prob1 = cfg.get('resize_prob1', [0.2, 0.7, 0.1])
         resize_range1 = cfg.get('resize_range1', [0.15, 1.5])
         gaussian_noise_prob1 = float(cfg.get('gaussian_noise_prob1', 0.5))
@@ -445,7 +514,8 @@ class SRDataset(Dataset):
         jpeg_range1 = cfg.get('jpeg_range1', [30, 95])
 
         second_blur_prob = float(cfg.get('second_blur_prob', 0.8))
-        blur_sigma2 = cfg.get('blur_sigma2', [0.2, 1.5])
+        blur_sigma2_raw = cfg.get('blur_sigma2', [0.2, 1.5])
+        blur_sigma2 = [float(blur_sigma2_raw[0]) * s, float(blur_sigma2_raw[1]) * s]
         resize_prob2 = cfg.get('resize_prob2', [0.3, 0.4, 0.3])
         resize_range2 = cfg.get('resize_range2', [0.3, 1.2])
         gaussian_noise_prob2 = float(cfg.get('gaussian_noise_prob2', 0.5))
@@ -456,17 +526,21 @@ class SRDataset(Dataset):
         final_sinc_prob = float(cfg.get('final_sinc_prob', 0.8))
 
         target_lr = self.resolution // self.scale
+        # Allow intermediate steps to go below target_lr (down to ~half),
+        # so noise/JPEG get applied at genuinely low resolution and pick up
+        # real aliasing/compression artifacts before the final upsample.
+        mid_min = max(8, target_lr // 2)
         lq = hr_crop
 
         if np.random.rand() < blur_prob:
             lq = self._random_blur(lq, blur_sigma)
-        lq = self._random_resize(lq, resize_prob1, resize_range1, min_size=target_lr)
+        lq = self._random_resize(lq, resize_prob1, resize_range1, min_size=mid_min)
         lq = self._random_noise(lq, gaussian_noise_prob1, noise_sigma1, poisson_scale1, gray_noise_prob1)
         lq = self._jpeg_compress(lq, jpeg_range1)
 
         if np.random.rand() < second_blur_prob:
             lq = self._random_blur(lq, blur_sigma2)
-        lq = self._random_resize(lq, resize_prob2, resize_range2, min_size=target_lr)
+        lq = self._random_resize(lq, resize_prob2, resize_range2, min_size=mid_min)
         lq = self._random_noise(lq, gaussian_noise_prob2, noise_sigma2, poisson_scale2, gray_noise_prob2)
 
         if np.random.rand() < 0.5:
@@ -485,7 +559,10 @@ class SRDataset(Dataset):
                 lq = self._apply_kernel(lq, self._build_sinc_kernel(cutoff, k_size))
 
         lq = Image.fromarray(self._clip_uint8(np.array(lq).astype(np.float32)), mode='RGB')
-        return lq.resize((self.resolution, self.resolution), PIL_RESAMPLING.BICUBIC)
+        # Final upsample to HR resolution uses a RANDOM resample kernel so the
+        # model doesn't collapse to "the upsample is always bicubic", which
+        # hides most of the synthesized artifacts at test time.
+        return lq.resize((self.resolution, self.resolution), self._sample_resample())
 
     @staticmethod
     def _random_augment(*imgs):
@@ -533,8 +610,24 @@ class SRDataset(Dataset):
                 lr_up = self._bicubic_degrade(hr_crop)
         else:
             if self.degrade_mode == 'realesrgan':
-                hr_crop = self._crop_hr_only(hr_img)
-                lr_up = self._degrade_realesrgan(hr_crop)
+                mix_paired_prob = float(self.realesrgan_cfg.get('paired_prob', 0.0))
+                mix_bicubic_prob = float(self.realesrgan_cfg.get('bicubic_prob', 0.0))
+                mix_rand = np.random.rand()
+
+                if mix_rand < mix_paired_prob:
+                    lr_path = self._find_lr_file(hr_name)
+                    if lr_path:
+                        lr_img = Image.open(lr_path).convert('RGB')
+                        hr_crop, lr_up = self._paired_crop(hr_img, lr_img)
+                    else:
+                        hr_crop = self._crop_hr_only(hr_img)
+                        lr_up = self._degrade_realesrgan(hr_crop)
+                elif mix_rand < (mix_paired_prob + mix_bicubic_prob):
+                    hr_crop = self._crop_hr_only(hr_img)
+                    lr_up = self._bicubic_degrade(hr_crop)
+                else:
+                    hr_crop = self._crop_hr_only(hr_img)
+                    lr_up = self._degrade_realesrgan(hr_crop)
             elif self.degrade_mode == 'bicubic':
                 hr_crop = self._crop_hr_only(hr_img)
                 lr_up = self._bicubic_degrade(hr_crop)
@@ -582,7 +675,10 @@ class DualStreamFLUXSR(nn.Module):
     def __init__(self, model_name, device, pretrained_controlnet=None,
                  train_controlnet=True, pixel_weight=1.0,
                  control_guidance_start=0.0, control_guidance_end=1.0,
-                 conditioning_scale=1.0):
+                 conditioning_scale=1.0,
+                 use_lora=True, lora_rank=16, lora_alpha=16,
+                 lora_dropout=0.0, lora_target_regex=LORA_TARGET_REGEX_OMINICONTROL,
+                 lora_init_weights='gaussian'):
         super().__init__()
         self.model_name = model_name
         self.device = device
@@ -591,6 +687,14 @@ class DualStreamFLUXSR(nn.Module):
         self.control_guidance_start = control_guidance_start
         self.control_guidance_end = control_guidance_end
         self.conditioning_scale = conditioning_scale
+
+        # LoRA config
+        self.use_lora = bool(use_lora)
+        self.lora_rank = int(lora_rank)
+        self.lora_alpha = int(lora_alpha)
+        self.lora_dropout = float(lora_dropout)
+        self.lora_target_regex = lora_target_regex
+        self.lora_init_weights = lora_init_weights
         
         self.vae = None
         self.transformer = None
@@ -650,6 +754,17 @@ class DualStreamFLUXSR(nn.Module):
         ).to(self.device)
         self.transformer.requires_grad_(False)
         self.transformer.eval()
+        try:
+            # Enable xformers on base Transformer before LoRA wrapping.
+            self.transformer.enable_xformers_memory_efficient_attention()
+            if local_rank == 0:
+                print("[Flash] Enabled xformers memory efficient attention on Transformer")
+        except Exception:
+            if local_rank == 0:
+                print("[Flash] Transformer: using PyTorch 2.0 SDPA")
+
+        if self.use_lora:
+            self._apply_lora_to_transformer(local_rank=local_rank)
 
         # Load ControlNet
         controlnet_path = pretrained_controlnet or "jasperai/Flux.1-dev-Controlnet-Upscaler"
@@ -676,7 +791,6 @@ class DualStreamFLUXSR(nn.Module):
         
         # Enable Flash Attention
         try:
-            self.transformer.enable_xformers_memory_efficient_attention()
             self.controlnet.enable_xformers_memory_efficient_attention()
             if local_rank == 0:
                 print("[Flash] ✓ Enabled xformers memory efficient attention")
@@ -731,11 +845,97 @@ class DualStreamFLUXSR(nn.Module):
             idx = torch.arange(channels, device=self.pixel_fuse_proj.weight.device)
             self.pixel_fuse_proj.weight[idx, idx, 0, 0] = 1.0
 
+    def _apply_lora_to_transformer(self, local_rank=0):
+        """Wrap Transformer with a PEFT LoRA adapter."""
+        if not PEFT_AVAILABLE:
+            raise ImportError(
+                "PEFT is required for LoRA training. Install with: pip install peft>=0.10"
+            )
+
+        if local_rank == 0:
+            print(
+                f"[LoRA] Applying LoRA to Transformer: rank={self.lora_rank}, "
+                f"alpha={self.lora_alpha}, dropout={self.lora_dropout}"
+            )
+            print(f"[LoRA] Target regex: {self.lora_target_regex}")
+
+        lora_config = LoraConfig(
+            r=self.lora_rank,
+            lora_alpha=self.lora_alpha,
+            target_modules=self.lora_target_regex,
+            lora_dropout=self.lora_dropout,
+            bias="none",
+            init_lora_weights=self.lora_init_weights,
+        )
+        self.transformer = get_peft_model(self.transformer, lora_config)
+        self.transformer.train()
+
+        # Validate injection on ALL ranks. If a regex typo matched zero modules,
+        # we want every rank to raise — otherwise non-main ranks would silently
+        # proceed with zero trainable params and the collective would hang
+        # later in accelerator.prepare / optimizer.step.
+        try:
+            lora_sd = get_peft_model_state_dict(self.transformer)
+            n_lora_tensors = len(lora_sd)
+        except Exception as e:
+            n_lora_tensors = 0
+            if local_rank == 0:
+                print(f"[LoRA][WARN] get_peft_model_state_dict failed: {e}")
+        n_trainable = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
+        if n_trainable == 0 or n_lora_tensors == 0:
+            raise RuntimeError(
+                f"[LoRA] target_modules matched zero modules "
+                f"(trainable={n_trainable}, state_tensors={n_lora_tensors}). "
+                f"Check --lora_target_preset / regex."
+            )
+        if local_rank == 0:
+            print(f"[LoRA] trainable params: {n_trainable:,}, state tensors: {n_lora_tensors}")
+
+    def _get_transformer_base(self):
+        """Return base FluxTransformer2DModel regardless of PEFT wrapping."""
+        if not self.use_lora:
+            return self.transformer
+        if hasattr(self.transformer, "get_base_model"):
+            try:
+                return self.transformer.get_base_model()
+            except Exception:
+                pass
+        if hasattr(self.transformer, "base_model") and hasattr(self.transformer.base_model, "model"):
+            return self.transformer.base_model.model
+        return self.transformer
+
+    def enable_transformer_gradient_checkpointing(self):
+        base = self._get_transformer_base()
+        if hasattr(base, "enable_gradient_checkpointing"):
+            base.enable_gradient_checkpointing()
+            # PEFT + gradient checkpointing: if the base model is frozen and
+            # hidden_states entering a checkpointed block has requires_grad=False,
+            # reentrant checkpointing can silently drop LoRA grads. Force the
+            # inputs to require grad so the recomputed graph reaches LoRA params.
+            if self.use_lora and hasattr(base, "enable_input_require_grads"):
+                try:
+                    base.enable_input_require_grads()
+                except Exception:
+                    pass
+            return True
+        return False
+
+    def enable_controlnet_gradient_checkpointing(self):
+        if hasattr(self.controlnet, "enable_gradient_checkpointing"):
+            self.controlnet.enable_gradient_checkpointing()
+            return True
+        return False
+
     def get_pixel_branch_params(self):
         params = list(self.pixel_extractor.parameters())
         params += list(self.pixel_fuse_proj.parameters())
         params.append(self.pixel_gate_logit)
         return params
+
+    def get_lora_params(self):
+        if not self.use_lora:
+            return []
+        return [p for p in self.transformer.parameters() if p.requires_grad]
     
     def encode(self, img):
         """Encode image to latent (FLUX VAE with shift_factor)"""
@@ -961,6 +1161,8 @@ class DualStreamFLUXSR(nn.Module):
         params = self.get_pixel_branch_params()
         if self.train_controlnet:
             params += list(self.controlnet.parameters())
+        if self.use_lora:
+            params += self.get_lora_params()
         return params
 
 
@@ -980,6 +1182,7 @@ def compute_flow_matching_loss(
     lpips_weight=0.0,
     lpips_resize=256,
     lpips_apply_prob=0.25,
+    lpips_max_sigma=0.7,
 ):
     """
     Flow Matching Loss - 对齐官方 Scheduler 的 timestep 格式
@@ -1023,10 +1226,15 @@ def compute_flow_matching_loss(
     loss = F.mse_loss(v_pred.float(), target_v.float())
 
     # Optional perceptual regularizer in pixel space.
+    # Only apply when sigma is low enough that the one-step reconstruction
+    # (pred_hr = noisy - sigma * v_pred) is meaningful -- at high sigma the
+    # decoded image is essentially noise and LPIPS contributes garbage grads.
+    sigma_mean = float(sigma.float().mean().item())
     do_lpips = (
         lpips_model is not None
         and lpips_weight > 0
         and hr_pixel is not None
+        and sigma_mean < float(lpips_max_sigma)
         and (lpips_apply_prob >= 1.0 or torch.rand(1, device=device).item() < lpips_apply_prob)
     )
     if do_lpips:
@@ -1065,6 +1273,8 @@ def validate(system, accelerator, val_loader, device, num_samples=10,
     unwrapped.pixel_extractor.eval()
     unwrapped.pixel_fuse_proj.eval()
     unwrapped.controlnet.eval()
+    if unwrapped.use_lora:
+        unwrapped.transformer.eval()
     
     psnr_list = []
     lpips_list = []
@@ -1099,6 +1309,8 @@ def validate(system, accelerator, val_loader, device, num_samples=10,
     unwrapped.pixel_fuse_proj.train()
     if unwrapped.train_controlnet:
         unwrapped.controlnet.train()
+    if unwrapped.use_lora:
+        unwrapped.transformer.train()
     gc.collect()
     if device.type == 'cuda':
         torch.cuda.empty_cache()
@@ -1112,9 +1324,18 @@ def validate(system, accelerator, val_loader, device, num_samples=10,
 def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, strength,
                     control_guidance_start, control_guidance_end, path,
                     lpips_weight=0.0, lpips_apply_prob=0.25,
-                    val_lpips=None, best_metric='psnr', best_metric_value=None):
+                    val_lpips=None, best_metric='psnr', best_metric_value=None,
+                    lora_config=None,
+                    optimizer=None, lr_scheduler=None, global_step=None):
+    """Save training checkpoint.
+
+    Also persists optimizer / lr_scheduler state and global_step so resume
+    preserves AdamW momentum, warmup position, and cosine schedule phase.
+    This matters in particular for LoRA runs, which typically rely on warmup;
+    without these, resume would reset LR and momentum, wiping the adapter.
+    """
     unwrapped = accelerator.unwrap_model(system)
-    torch.save({
+    payload = {
         'epoch': epoch,
         'loss': loss,
         'psnr': psnr,
@@ -1132,7 +1353,36 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
         'pixel_fuse_proj': unwrapped.pixel_fuse_proj.state_dict(),
         'pixel_gate_logit': unwrapped.pixel_gate_logit.detach().cpu(),
         'controlnet': unwrapped.controlnet.state_dict(),
-    }, path)
+        'use_lora': unwrapped.use_lora,
+    }
+    if unwrapped.use_lora:
+        lora_state = get_peft_model_state_dict(unwrapped.transformer)
+        payload['lora_state_dict'] = {k: v.detach().cpu() for k, v in lora_state.items()}
+        payload['lora_config'] = lora_config or {
+            'rank': unwrapped.lora_rank,
+            'alpha': unwrapped.lora_alpha,
+            'dropout': unwrapped.lora_dropout,
+            'target_regex': unwrapped.lora_target_regex,
+            'init_weights': unwrapped.lora_init_weights,
+        }
+        try:
+            import peft as _peft
+            payload['peft_version'] = getattr(_peft, '__version__', None)
+        except Exception:
+            pass
+    if optimizer is not None:
+        try:
+            payload['optimizer_state_dict'] = optimizer.state_dict()
+        except Exception as e:
+            print(f"[Checkpoint][WARN] failed to serialize optimizer state: {e}")
+    if lr_scheduler is not None:
+        try:
+            payload['lr_scheduler_state_dict'] = lr_scheduler.state_dict()
+        except Exception as e:
+            print(f"[Checkpoint][WARN] failed to serialize lr_scheduler state: {e}")
+    if global_step is not None:
+        payload['global_step'] = int(global_step)
+    torch.save(payload, path)
 
 
 # ============================================================================
@@ -1174,6 +1424,10 @@ def main():
     parser.add_argument('--realesrgan_poisson_scale2', type=float, nargs=2, default=[0.05, 2.5])
     parser.add_argument('--realesrgan_jpeg_range1', type=int, nargs=2, default=[30, 95])
     parser.add_argument('--realesrgan_jpeg_range2', type=int, nargs=2, default=[30, 95])
+    parser.add_argument('--realesrgan_paired_prob', type=float, default=0.0,
+                        help='In realesrgan mode, probability of using paired LR when available (quality-anchor mix)')
+    parser.add_argument('--realesrgan_bicubic_prob', type=float, default=0.0,
+                        help='In realesrgan mode, probability of using bicubic degradation (stability mix)')
     
     # Model
     parser.add_argument('--model_name', type=str, default='black-forest-labs/FLUX.1-dev')
@@ -1184,6 +1438,8 @@ def main():
     # Training
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=150)
+    parser.add_argument('--epochs_mode', type=str, default='absolute', choices=['absolute', 'stage'],
+                        help='Epoch interpretation on resume: absolute=target global epoch (legacy), stage=run this many additional epochs.')
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--warmup_epochs', type=int, default=5)
     parser.add_argument('--guidance', type=float, default=3.5)
@@ -1214,7 +1470,7 @@ def main():
     
     # Validation/eval start point (img2img-style interpolation from LR + noise)
     parser.add_argument('--strength', type=float, default=1,
-                        help='Validation/eval strength (1.0 = pure noise start, 0.8 = skip first 20% steps)')
+                        help='Validation/eval strength (1.0 = pure noise start, 0.8 = skip first 20%% steps)')
     parser.add_argument('--val_num_steps', type=int, default=10)
     parser.add_argument('--val_num_samples', type=int, default=5,
                         help='Number of validation samples per epoch (<=0 means full validation set)')
@@ -1224,13 +1480,45 @@ def main():
                         help='Metric used for best checkpoint selection')
     parser.add_argument('--reset_best_on_resume', action='store_true',
                         help='When resuming (e.g., Stage2), reset best metric tracking instead of inheriting Stage1 best')
+
+    # LoRA (always-on by default; keep hidden flag for backward compatibility)
+    parser.add_argument('--use_lora', action='store_true', default=True, help=argparse.SUPPRESS)
+    parser.add_argument('--lora_rank', type=int, default=16)
+    parser.add_argument('--lora_alpha', type=int, default=16)
+    parser.add_argument('--lora_dropout', type=float, default=0.0)
+    parser.add_argument('--lora_lr', type=float, default=1e-4,
+                        help='Learning rate for LoRA params (typically > --lr)')
+    parser.add_argument('--lora_target_preset', type=str, default='ominicontrol',
+                        choices=list(LORA_TARGET_PRESETS.keys()),
+                        help='Which preset of target modules regex to use')
+    parser.add_argument('--lora_init_weights', type=str, default='gaussian',
+                        choices=['gaussian', 'default', 'true', 'false'],
+                        help='PEFT init_lora_weights option')
+    parser.add_argument('--dry_run_lora', action='store_true', default=False,
+                        help='Initialize model + LoRA, print matched modules and exit')
     
     # Checkpointing
     parser.add_argument('--save_dir', type=str, default='./checkpoints/dual_control')
     parser.add_argument('--save_interval', type=int, default=10)
     parser.add_argument('--val_interval', type=int, default=1)
     parser.add_argument('--resume', type=str, default=None)
-    
+    parser.add_argument('--resume_optimizer', action='store_true', default=False,
+                        help='When resuming, also restore optimizer momentum (default: off; Stage 2 typically wants a fresh optimizer).')
+    parser.add_argument('--resume_lr_scheduler', action='store_true', default=False,
+                        help='When resuming, restore the LambdaLR step counter. Default OFF: the new stage gets a fresh warmup + cosine over --epochs.')
+    parser.add_argument('--reset_pixel_gate', action='store_true', default=False,
+                        help='On resume, force pixel_gate_logit back to --pixel_gate_init instead of inheriting from checkpoint.')
+    parser.add_argument('--controlnet_lr_scale', type=float, default=1.0,
+                        help='Multiplier applied to --lr for the ControlNet param group (use <1 for Stage 2 fine-tuning, e.g. 0.1).')
+
+    # Degradation: resolution-aware scaling
+    parser.add_argument('--blur_sigma_scale', type=float, default=0.0,
+                        help='Multiplier applied to realesrgan_blur_sigma1/2. 0.0 = auto (resolution/256).')
+
+    # LPIPS: only apply when denoising is mostly done (low sigma)
+    parser.add_argument('--lpips_max_sigma', type=float, default=0.7,
+                        help='Only compute LPIPS when sampled sigma < this threshold (decoded pred_hr is garbage at high sigma).')
+
     # Other
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--train_controlnet', action='store_true', default=True)
@@ -1240,6 +1528,8 @@ def main():
 
     if args.scale < 1:
         parser.error("--scale must be >= 1")
+    if args.epochs < 1:
+        parser.error("--epochs must be >= 1")
     if args.resolution % args.scale != 0:
         parser.error("--resolution must be divisible by --scale")
     if args.usm_weight < 0:
@@ -1248,6 +1538,18 @@ def main():
         parser.error("--usm_radius must be >= 0")
     if not (0.0 <= args.usm_apply_prob <= 1.0):
         parser.error("--usm_apply_prob must be within [0, 1]")
+    if not (0.0 <= args.realesrgan_paired_prob <= 1.0):
+        parser.error("--realesrgan_paired_prob must be within [0, 1]")
+    if not (0.0 <= args.realesrgan_bicubic_prob <= 1.0):
+        parser.error("--realesrgan_bicubic_prob must be within [0, 1]")
+    if args.realesrgan_paired_prob + args.realesrgan_bicubic_prob > 1.0:
+        parser.error("--realesrgan_paired_prob + --realesrgan_bicubic_prob must be <= 1")
+    if args.controlnet_lr_scale < 0:
+        parser.error("--controlnet_lr_scale must be >= 0")
+    if args.blur_sigma_scale < 0:
+        parser.error("--blur_sigma_scale must be >= 0")
+    if args.lpips_max_sigma < 0:
+        parser.error("--lpips_max_sigma must be >= 0")
     if args.degrade_mode == 'paired' and not args.lr_dir:
         parser.error("--lr_dir is required when --degrade_mode is 'paired'")
     if args.best_metric == 'lpips':
@@ -1257,6 +1559,17 @@ def main():
     
     if args.freeze_controlnet:
         args.train_controlnet = False
+
+    lora_target_regex = LORA_TARGET_PRESETS[args.lora_target_preset]
+    if args.lora_init_weights in ('true', 'false'):
+        lora_init_weights = (args.lora_init_weights == 'true')
+    else:
+        lora_init_weights = args.lora_init_weights
+    args.use_lora = True
+    if not PEFT_AVAILABLE:
+        raise ImportError(
+            "PEFT is required for LoRA training. Install with: pip install peft>=0.10"
+        )
     
     accelerator = Accelerator(mixed_precision='bf16')
     device = accelerator.device
@@ -1304,6 +1617,15 @@ def main():
         f"_bm{_fmt_tag(args.best_metric)}"
         f"_crop{args.num_crops}"
     )
+    if args.use_lora:
+        exp_name += (
+            f"_lora"
+            f"_r{args.lora_rank}"
+            f"_a{args.lora_alpha}"
+            f"_d{_fmt_tag(args.lora_dropout)}"
+            f"_llr{_fmt_tag(args.lora_lr)}"
+            f"_tp{args.lora_target_preset}"
+        )
     save_dir = os.path.join(args.save_dir, exp_name)
     
     if is_main:
@@ -1337,11 +1659,23 @@ def main():
         print(f"Validation: steps={args.val_num_steps}, samples={args.val_num_samples}, lpips={args.val_calc_lpips}")
         print(f"Best Metric: {args.best_metric}, Reset Best On Resume: {args.reset_best_on_resume}")
         print(f"Learning Rate: {args.lr} (Pixel branch: {args.lr * 10})")
+        if args.use_lora:
+            print(
+                f"LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}, "
+                f"dropout={args.lora_dropout}, lr={args.lora_lr}, "
+                f"preset={args.lora_target_preset}"
+            )
+        else:
+            print("LoRA: disabled")
         if args.degrade_mode == 'realesrgan':
             print(
                 f"RealESRGAN Degrade: blur_p={args.realesrgan_blur_prob}, "
                 f"second_blur_p={args.realesrgan_second_blur_prob}, "
                 f"final_sinc_p={args.realesrgan_final_sinc_prob}"
+            )
+            print(
+                f"RealESRGAN Mix: paired_p={args.realesrgan_paired_prob}, "
+                f"bicubic_p={args.realesrgan_bicubic_prob}"
             )
         print(f"Save Dir: {save_dir}")
         print("=" * 70 + "\n")
@@ -1353,9 +1687,34 @@ def main():
         control_guidance_start=args.control_guidance_start,
         control_guidance_end=args.control_guidance_end,
         conditioning_scale=args.conditioning_scale,
+        use_lora=args.use_lora,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_target_regex=lora_target_regex,
+        lora_init_weights=lora_init_weights,
     )
     with torch.no_grad():
         system.pixel_gate_logit.fill_(args.pixel_gate_init)
+
+    if args.dry_run_lora:
+        if is_main:
+            wrapped = []
+            for n, m in system.transformer.named_modules():
+                if hasattr(m, 'lora_A'):
+                    try:
+                        if len(m.lora_A) > 0:
+                            wrapped.append(n)
+                    except TypeError:
+                        wrapped.append(n)
+            print("\n[dry_run_lora] LoRA regex diagnostic")
+            print(f"Target preset: {args.lora_target_preset}")
+            print(f"Wrapped modules: {len(wrapped)}")
+            for n in wrapped[:200]:
+                print(f"  {n}")
+            if len(wrapped) > 200:
+                print(f"  ... ({len(wrapped) - 200} more)")
+        raise SystemExit(0)
 
     lpips_model = None
     if args.lpips_weight > 0:
@@ -1388,26 +1747,48 @@ def main():
             print("[Val] LPIPS metric enabled for validation.")
     
     # Enable gradient checkpointing
-    if hasattr(system.transformer, 'enable_gradient_checkpointing'):
-        system.transformer.enable_gradient_checkpointing()
-    if hasattr(system.controlnet, 'enable_gradient_checkpointing'):
-        system.controlnet.enable_gradient_checkpointing()
+    if system.enable_transformer_gradient_checkpointing() and is_main:
+        print("[GradCkpt] Transformer gradient checkpointing enabled")
+    if system.enable_controlnet_gradient_checkpointing() and is_main:
+        print("[GradCkpt] ControlNet gradient checkpointing enabled")
     
-    # Optimizer groups (pixel branch 10x LR)
+    # Optimizer groups (pixel branch 10x LR; controlnet optionally scaled down for Stage 2)
     pixel_branch_params = system.get_pixel_branch_params()
+    lora_params = system.get_lora_params()
+    controlnet_lr = args.lr * float(args.controlnet_lr_scale)
+    optimizer_grouped_parameters = []
     if args.train_controlnet:
-        optimizer_grouped_parameters = [
-            {"params": system.controlnet.parameters(), "lr": args.lr},
-            {"params": pixel_branch_params, "lr": args.lr * 10.0}
-        ]
-    else:
-        optimizer_grouped_parameters = [
-            {"params": pixel_branch_params, "lr": args.lr * 10.0}
-        ]
+        optimizer_grouped_parameters.append(
+            {"params": system.controlnet.parameters(), "lr": controlnet_lr}
+        )
+    optimizer_grouped_parameters.append(
+        {"params": pixel_branch_params, "lr": args.lr * 10.0}
+    )
+    if args.use_lora:
+        if len(lora_params) == 0:
+            raise RuntimeError(
+                "[LoRA] no trainable LoRA params were found. "
+                "Check target_modules regex vs. Transformer module names."
+            )
+        optimizer_grouped_parameters.append(
+            {"params": lora_params, "lr": args.lora_lr}
+        )
+    if is_main:
+        print(
+            f"[Training] LR groups: controlnet={controlnet_lr:.2e} "
+            f"(scale={args.controlnet_lr_scale}), pixel={args.lr * 10.0:.2e}, "
+            f"lora={args.lora_lr:.2e}"
+        )
     
     if is_main:
         total_params = sum(p.numel() for p in system.get_trainable_params())
-        print(f"[Training] Trainable parameters: {total_params:,}")
+        n_pixel = sum(p.numel() for p in pixel_branch_params)
+        n_cn = sum(p.numel() for p in system.controlnet.parameters()) if args.train_controlnet else 0
+        n_lora = sum(p.numel() for p in lora_params)
+        print(
+            f"[Training] Trainable params: total={total_params:,} "
+            f"(controlnet={n_cn:,}, pixel={n_pixel:,}, lora={n_lora:,})"
+        )
     
     # Datasets
     realesrgan_cfg = {
@@ -1430,8 +1811,19 @@ def main():
         'poisson_scale2': args.realesrgan_poisson_scale2,
         'jpeg_range1': args.realesrgan_jpeg_range1,
         'jpeg_range2': args.realesrgan_jpeg_range2,
+        'paired_prob': args.realesrgan_paired_prob,
+        'bicubic_prob': args.realesrgan_bicubic_prob,
+        'blur_sigma_scale': args.blur_sigma_scale,
     }
-    train_lr_dir = args.lr_dir if args.degrade_mode == 'paired' else None
+    # In realesrgan mode we still want lr_dir available for the paired-mix
+    # branch (paired_prob / bicubic_prob). Previously we silently set it to
+    # None, so --realesrgan_paired_prob had no effect.
+    if args.degrade_mode == 'paired':
+        train_lr_dir = args.lr_dir
+    elif args.degrade_mode == 'realesrgan':
+        train_lr_dir = args.lr_dir  # optional; _find_lr_file handles missing files
+    else:
+        train_lr_dir = None
     train_dataset = SRDataset(
         args.hr_dir, train_lr_dir, args.resolution,
         num_crops=args.num_crops, is_val=False,
@@ -1495,7 +1887,7 @@ def main():
         if is_main:
             print(f"[Resume] Loading from {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        
+
         unwrapped = accelerator.unwrap_model(system)
         if 'pixel_extractor' in ckpt:
             state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
@@ -1503,7 +1895,17 @@ def main():
         if 'pixel_fuse_proj' in ckpt:
             state = {k.replace('module.', ''): v for k, v in ckpt['pixel_fuse_proj'].items()}
             unwrapped.pixel_fuse_proj.load_state_dict(state)
-        if 'pixel_gate_logit' in ckpt:
+        if args.reset_pixel_gate:
+            # Stage-2 fine-tune often wants to let the model re-decide how much
+            # to trust pixel features (Stage-1 usually saturates gate near 1.0,
+            # killing sigmoid gradient). --reset_pixel_gate forces the gate back
+            # to --pixel_gate_init regardless of what the checkpoint stored.
+            with torch.no_grad():
+                unwrapped.pixel_gate_logit.fill_(float(args.pixel_gate_init))
+            if is_main:
+                gate_val = float(torch.sigmoid(unwrapped.pixel_gate_logit.detach().float()).item())
+                print(f"[Resume] --reset_pixel_gate: pixel_gate_logit reset to {args.pixel_gate_init} (sigmoid={gate_val:.4f})")
+        elif 'pixel_gate_logit' in ckpt:
             gate = ckpt['pixel_gate_logit']
             if isinstance(gate, torch.Tensor):
                 gate = gate.to(device=unwrapped.pixel_gate_logit.device, dtype=unwrapped.pixel_gate_logit.dtype)
@@ -1525,7 +1927,70 @@ def main():
         if args.train_controlnet and 'controlnet' in ckpt:
             state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
             unwrapped.controlnet.load_state_dict(state)
-        
+
+        ckpt_uses_lora = bool(ckpt.get('use_lora', False)) and ('lora_state_dict' in ckpt)
+        if unwrapped.use_lora and ckpt_uses_lora:
+            ckpt_cfg = ckpt.get('lora_config', {}) or {}
+            cur_cfg = {
+                'rank': unwrapped.lora_rank,
+                'alpha': unwrapped.lora_alpha,
+                'target_regex': unwrapped.lora_target_regex,
+                'target_preset': args.lora_target_preset,
+            }
+            # Hard-check rank + alpha + regex. Alpha matters because PEFT
+            # scaling = alpha / rank; silently changing alpha at resume would
+            # rescale every adapter delta. target_preset is redundant with
+            # target_regex but we check both for clearer error messages.
+            hard_mismatch = []
+            for key in ('rank', 'alpha', 'target_regex', 'target_preset'):
+                if key in ckpt_cfg and ckpt_cfg[key] != cur_cfg[key]:
+                    hard_mismatch.append((key, ckpt_cfg[key], cur_cfg[key]))
+            if hard_mismatch:
+                raise RuntimeError(
+                    "[LoRA][Resume] Incompatible LoRA config:\n"
+                    + "\n".join([f"  - {k}: ckpt={v1!r}, current={v2!r}" for k, v1, v2 in hard_mismatch])
+                )
+            if set_peft_model_state_dict is None:
+                raise ImportError("PEFT is required to resume a LoRA checkpoint.")
+            set_peft_model_state_dict(unwrapped.transformer, ckpt['lora_state_dict'])
+            if is_main:
+                print(
+                    f"[Resume] Loaded LoRA adapter: {len(ckpt['lora_state_dict'])} tensors, "
+                    f"config={ckpt.get('lora_config', {})}"
+                )
+        elif unwrapped.use_lora and not ckpt_uses_lora:
+            if is_main:
+                print("[Resume] Current run uses LoRA but checkpoint has no LoRA state; LoRA stays at init.")
+        # Optimizer / lr_scheduler restore policy for 2-stage workflows:
+        # Stage 2 typically wants a fresh warmup + fresh cosine over the new
+        # --epochs (different LR, different data, different duration). So by
+        # default we do NOT restore optimizer / lr_scheduler state on resume.
+        # Pass --resume_optimizer / --resume_lr_scheduler to keep old behavior.
+        if args.resume_optimizer and 'optimizer_state_dict' in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                if is_main:
+                    print("[Resume] Restored optimizer state (--resume_optimizer).")
+            except Exception as e:
+                if is_main:
+                    print(f"[Resume][WARN] optimizer state_dict load failed ({e}); optimizer starts fresh.")
+        elif is_main:
+            print("[Resume] Optimizer starts fresh (pass --resume_optimizer to keep AdamW momentum).")
+        if args.resume_lr_scheduler and 'lr_scheduler_state_dict' in ckpt:
+            try:
+                lr_scheduler.load_state_dict(ckpt['lr_scheduler_state_dict'])
+                if is_main:
+                    print(f"[Resume] Restored lr_scheduler (last_lr={lr_scheduler.get_last_lr()}).")
+            except Exception as e:
+                if is_main:
+                    print(f"[Resume][WARN] lr_scheduler state_dict load failed ({e}); scheduler starts fresh.")
+        elif is_main:
+            print(
+                "[Resume] lr_scheduler starts fresh (warmup + cosine over --epochs of this run). "
+                "Pass --resume_lr_scheduler to carry over the old cosine phase."
+            )
+        resumed_global_step = int(ckpt.get('global_step', 0) or 0)
+
         start_epoch = ckpt.get('epoch', 0) + 1
         best_psnr = ckpt.get('psnr', 0.0)
         ckpt_lpips = ckpt.get('val_lpips', None)
@@ -1586,23 +2051,64 @@ def main():
                     f"n1={args.realesrgan_noise_sigma1}, n2={args.realesrgan_noise_sigma2}, "
                     f"j1={args.realesrgan_jpeg_range1}, j2={args.realesrgan_jpeg_range2}\n\n"
                 )
+                f.write(
+                    "RealESRGAN Mix: "
+                    f"paired_p={args.realesrgan_paired_prob}, "
+                    f"bicubic_p={args.realesrgan_bicubic_prob}\n\n"
+                )
             f.write(f"Empty Cache Steps: {args.empty_cache_steps}\n\n")
             f.write(f"Conditioning Scale: {args.conditioning_scale}\n")
-            f.write(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]\n\n")
+            f.write(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]\n")
+            if args.use_lora:
+                f.write(
+                    f"LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}, "
+                    f"dropout={args.lora_dropout}, lr={args.lora_lr}, "
+                    f"preset={args.lora_target_preset}\n\n"
+                )
+            else:
+                f.write("LoRA: disabled\n\n")
     
     # Training loop
     if is_main:
         print("\n[Training] Starting...\n")
-    global_step = 0
-    for epoch in range(start_epoch, args.epochs):
+    # Resume global_step so empty_cache cycles and any step-indexed logic stay
+    # consistent across restarts; 0 on a fresh run.
+    global_step = resumed_global_step if args.resume else 0
+    if args.resume and is_main:
+        print(f"[Resume] global_step resumed at {global_step}")
+
+    if args.epochs_mode == 'stage':
+        # Stage semantics: run `args.epochs` more epochs from start_epoch.
+        end_epoch = start_epoch + args.epochs
+        if is_main:
+            print(
+                f"[Training] epochs_mode=stage: {start_epoch} -> {end_epoch} "
+                f"(this run: {args.epochs} epochs)"
+            )
+    else:
+        # Legacy absolute semantics: --epochs is target global end epoch.
+        end_epoch = args.epochs
+        if end_epoch <= start_epoch:
+            raise RuntimeError(
+                f"--epochs_mode=absolute but --epochs={args.epochs} <= resumed start_epoch={start_epoch}. "
+                "Increase --epochs or use --epochs_mode stage."
+            )
+        if is_main:
+            print(
+                f"[Training] epochs_mode=absolute: {start_epoch} -> {end_epoch} "
+                f"(target absolute epoch={args.epochs})"
+            )
+    for epoch in range(start_epoch, end_epoch):
         unwrapped = accelerator.unwrap_model(system)
         unwrapped.pixel_extractor.train()
         unwrapped.pixel_fuse_proj.train()
         if args.train_controlnet:
             unwrapped.controlnet.train()
+        if args.use_lora:
+            unwrapped.transformer.train()
         
         epoch_losses = []
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=not is_main)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{end_epoch}", disable=not is_main)
         
         for batch in pbar:
             hr = batch['hr'].to(device).to(torch.bfloat16)
@@ -1625,6 +2131,7 @@ def main():
                     lpips_weight=args.lpips_weight,
                     lpips_resize=args.lpips_resize,
                     lpips_apply_prob=args.lpips_apply_prob,
+                    lpips_max_sigma=args.lpips_max_sigma,
                 )
                 
                 accelerator.backward(loss)
@@ -1636,7 +2143,10 @@ def main():
             
             loss_item = loss.item()
             epoch_losses.append(loss_item)
-            pbar.set_postfix({'loss': f'{loss_item:.4f}', 'lr': f'{lr_scheduler.get_last_lr()[0]:.2e}'})
+            postfix = {'loss': f'{loss_item:.4f}', 'lr': f'{lr_scheduler.get_last_lr()[0]:.2e}'}
+            if args.use_lora and len(lr_scheduler.get_last_lr()) >= 2:
+                postfix['lora_lr'] = f'{lr_scheduler.get_last_lr()[-1]:.2e}'
+            pbar.set_postfix(postfix)
             global_step += 1
 
             del hr, lr, hr_lat, lr_lat, loss
@@ -1674,6 +2184,8 @@ def main():
                     f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, "
                     f"LR={lr_current:.2e}, Gate={gate_value:.4f}\n"
                 )
+            if args.use_lora and len(lr_scheduler.get_last_lr()) >= 2:
+                log_line = log_line.rstrip("\n") + f", LoRA_LR={lr_scheduler.get_last_lr()[-1]:.2e}\n"
             with open(log_path, 'a') as f:
                 f.write(log_line)
             
@@ -1681,11 +2193,13 @@ def main():
                 print(
                     f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, "
                     f"val_lpips={val_lpips:.4f}, lr={lr_current:.2e}, gate={gate_value:.4f}"
+                    + (f", lora_lr={lr_scheduler.get_last_lr()[-1]:.2e}" if args.use_lora and len(lr_scheduler.get_last_lr()) >= 2 else "")
                 )
             else:
                 print(
                     f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, "
                     f"lr={lr_current:.2e}, gate={gate_value:.4f}"
+                    + (f", lora_lr={lr_scheduler.get_last_lr()[-1]:.2e}" if args.use_lora and len(lr_scheduler.get_last_lr()) >= 2 else "")
                 )
             
             improved = False
@@ -1700,6 +2214,18 @@ def main():
                     improved = True
                 best_value = best_lpips if np.isfinite(best_lpips) else None
 
+            lora_cfg_for_ckpt = None
+            if args.use_lora:
+                lora_cfg_for_ckpt = {
+                    'rank': args.lora_rank,
+                    'alpha': args.lora_alpha,
+                    'dropout': args.lora_dropout,
+                    'target_regex': lora_target_regex,
+                    'target_preset': args.lora_target_preset,
+                    'init_weights': args.lora_init_weights,
+                    'lora_lr': args.lora_lr,
+                }
+
             if improved:
                 save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr,
                                args.pixel_weight, args.strength,
@@ -1709,12 +2235,16 @@ def main():
                                lpips_apply_prob=args.lpips_apply_prob,
                                val_lpips=val_lpips,
                                best_metric=args.best_metric,
-                               best_metric_value=best_value)
+                               best_metric_value=best_value,
+                               lora_config=lora_cfg_for_ckpt,
+                               optimizer=optimizer,
+                               lr_scheduler=lr_scheduler,
+                               global_step=global_step)
                 if args.best_metric == 'lpips' and best_value is not None:
                     print(f"  -> New best LPIPS: {best_value:.4f}")
                 else:
                     print(f"  -> New best PSNR: {best_value:.2f} dB")
-            
+
             if (epoch + 1) % args.save_interval == 0:
                 save_checkpoint(system, accelerator, epoch, avg_loss, val_psnr,
                                args.pixel_weight, args.strength,
@@ -1724,7 +2254,11 @@ def main():
                                lpips_apply_prob=args.lpips_apply_prob,
                                val_lpips=val_lpips,
                                best_metric=args.best_metric,
-                               best_metric_value=(val_lpips if args.best_metric == 'lpips' else val_psnr))
+                               best_metric_value=(val_lpips if args.best_metric == 'lpips' else val_psnr),
+                               lora_config=lora_cfg_for_ckpt,
+                               optimizer=optimizer,
+                               lr_scheduler=lr_scheduler,
+                               global_step=global_step)
             
         gc.collect()
         if device.type == 'cuda':
@@ -1737,7 +2271,18 @@ def main():
         if not np.isfinite(best_psnr):
             best_psnr = 0.0
         final_best_value = best_psnr if args.best_metric == 'psnr' else (best_lpips if np.isfinite(best_lpips) else None)
-        save_checkpoint(system, accelerator, args.epochs - 1, avg_loss, best_psnr,
+        lora_cfg_for_ckpt = None
+        if args.use_lora:
+            lora_cfg_for_ckpt = {
+                'rank': args.lora_rank,
+                'alpha': args.lora_alpha,
+                'dropout': args.lora_dropout,
+                'target_regex': lora_target_regex,
+                'target_preset': args.lora_target_preset,
+                'init_weights': args.lora_init_weights,
+                'lora_lr': args.lora_lr,
+            }
+        save_checkpoint(system, accelerator, end_epoch - 1, avg_loss, best_psnr,
                        args.pixel_weight, args.strength,
                        args.control_guidance_start, args.control_guidance_end,
                        os.path.join(save_dir, 'final_model.pt'),
@@ -1745,7 +2290,11 @@ def main():
                        lpips_apply_prob=args.lpips_apply_prob,
                        val_lpips=(best_lpips if np.isfinite(best_lpips) else None),
                        best_metric=args.best_metric,
-                       best_metric_value=final_best_value)
+                       best_metric_value=final_best_value,
+                       lora_config=lora_cfg_for_ckpt,
+                       optimizer=optimizer,
+                       lr_scheduler=lr_scheduler,
+                       global_step=global_step)
         
         print("\n" + "=" * 70)
         print("Training Complete!")
