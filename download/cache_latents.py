@@ -6,15 +6,15 @@ Latent Caching Script for FLUX SR Training
 
 Usage:
     python cache_latents.py \
-        --hr_dir Data/Mix15K_HR \
-        --lr_dir Data/Mix15K_LR_bicubic_X4 \
-        --output_dir Data/Mix15K_latents \
+        --hr_dir Data/Mix16K_HR \
+        --lr_dir Data/Mix16K_LR_bicubic_X4 \
+        --output_dir Data/Mix16K_latents \
         --resolution 512
 
 效果：
     - 训练时跳过 VAE 编码，每个 batch 省 ~0.5s
     - 无需加载 VAE 到 GPU，省 ~3GB 显存
-    - Mix15K (15000张) 预处理约需 30-60 分钟
+    - Mix16K (16000张) 预处理约需 30-60 分钟
 """
 
 import os

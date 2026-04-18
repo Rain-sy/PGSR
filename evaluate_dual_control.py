@@ -18,6 +18,7 @@ Usage:
 
 import os
 import gc
+import math
 import argparse
 import numpy as np
 from PIL import Image
@@ -200,8 +201,7 @@ class DualStreamEvaluator(nn.Module):
         self.controlnet = None
         self.pixel_extractor = None
         self.pixel_fuse_proj = None
-        self.pixel_gate_logit = None
-        self.use_gated_fusion = False
+        self.fusion_source = 'identity'  # 'concat' | 'migrated' | 'identity'
         self.scheduler = None
         self._cached_embeds = None
         self.strength = 0.7
@@ -256,11 +256,11 @@ class DualStreamEvaluator(nn.Module):
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         self.pixel_extractor.requires_grad_(False)
         self.pixel_extractor.eval()
-        self.pixel_fuse_proj = nn.Conv2d(16, 16, kernel_size=1).to(self.device).to(dtype)
+        # Concat-based fusion: [lr_lat || pixel_feat] (32ch) -> 16ch.
+        self.pixel_fuse_proj = nn.Conv2d(32, 16, kernel_size=1).to(self.device).to(dtype)
         self._reset_pixel_fuse_proj_to_identity()
         self.pixel_fuse_proj.requires_grad_(False)
         self.pixel_fuse_proj.eval()
-        self.pixel_gate_logit = nn.Parameter(torch.tensor(-1.0, device=self.device), requires_grad=False)
 
         print("Loading checkpoint...")
         ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
@@ -273,18 +273,7 @@ class DualStreamEvaluator(nn.Module):
             state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
             self.controlnet.load_state_dict(state)
 
-        if 'pixel_fuse_proj' in ckpt and 'pixel_gate_logit' in ckpt:
-            state = {k.replace('module.', ''): v for k, v in ckpt['pixel_fuse_proj'].items()}
-            self.pixel_fuse_proj.load_state_dict(state)
-            gate = ckpt['pixel_gate_logit']
-            if isinstance(gate, torch.Tensor):
-                gate = gate.to(device=self.pixel_gate_logit.device, dtype=self.pixel_gate_logit.dtype)
-                self.pixel_gate_logit.data.copy_(gate)
-            else:
-                self.pixel_gate_logit.data.fill_(float(gate))
-            self.use_gated_fusion = True
-        else:
-            self.use_gated_fusion = False
+        self._load_pixel_fuse_proj_with_migration(ckpt)
 
         if 'pixel_weight' in ckpt:
             self.pixel_weight = ckpt['pixel_weight']
@@ -297,11 +286,7 @@ class DualStreamEvaluator(nn.Module):
 
         print(f"Checkpoint: epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', 0):.2f}")
         print(f"Pixel Weight: {self.pixel_weight}, Strength: {self.strength}")
-        if self.use_gated_fusion:
-            gate_val = torch.sigmoid(self.pixel_gate_logit).item()
-            print(f"Pixel Fusion: gated (gate={gate_val:.4f})")
-        else:
-            print("Pixel Fusion: legacy direct-add (old checkpoint format)")
+        print(f"Pixel Fusion: concat+1x1 conv (source={self.fusion_source})")
         print(f"Train LPIPS: weight={self.train_lpips_weight}, prob={self.train_lpips_apply_prob}")
         print(f"Conditioning Scale: {self.conditioning_scale}")
         print(f"Control Guidance Window: [{self.control_guidance_start}, {self.control_guidance_end}]")
@@ -355,14 +340,72 @@ class DualStreamEvaluator(nn.Module):
             print("[LoRA] inactive (checkpoint has no adapter)")
 
     def _reset_pixel_fuse_proj_to_identity(self):
+        """Identity-init lr_lat passthrough (first 16 in-channels); zero pixel branch."""
         if self.pixel_fuse_proj is None:
             return
         with torch.no_grad():
             self.pixel_fuse_proj.weight.zero_()
             self.pixel_fuse_proj.bias.zero_()
-            channels = min(self.pixel_fuse_proj.out_channels, self.pixel_fuse_proj.in_channels)
-            idx = torch.arange(channels, device=self.pixel_fuse_proj.weight.device)
+            out_ch = self.pixel_fuse_proj.out_channels
+            in_ch = self.pixel_fuse_proj.in_channels
+            passthrough = min(out_ch, in_ch // 2 if in_ch >= 2 * out_ch else in_ch)
+            idx = torch.arange(passthrough, device=self.pixel_fuse_proj.weight.device)
             self.pixel_fuse_proj.weight[idx, idx, 0, 0] = 1.0
+
+    def _load_pixel_fuse_proj_with_migration(self, ckpt):
+        """Load pixel_fuse_proj from ckpt; migrate legacy gated-fusion format if needed."""
+        if 'pixel_fuse_proj' not in ckpt:
+            self.fusion_source = 'identity'
+            print("[Eval] pixel_fuse_proj missing in checkpoint; using identity init.")
+            return
+
+        state = {k.replace('module.', ''): v for k, v in ckpt['pixel_fuse_proj'].items()}
+        target = self.pixel_fuse_proj
+        target_w = target.weight
+        src_w = state.get('weight')
+        src_b = state.get('bias')
+
+        is_legacy = (
+            src_w is not None
+            and src_w.shape == (16, 16, 1, 1)
+            and target_w.shape == (16, 32, 1, 1)
+        )
+
+        if not is_legacy and src_w is not None and src_w.shape == target_w.shape:
+            target.load_state_dict(state)
+            self.fusion_source = ckpt.get('fusion_type', 'concat')
+            return
+
+        if is_legacy:
+            gate_raw = ckpt.get('pixel_gate_logit', None)
+            if gate_raw is None:
+                gate_sig = 1.0
+            else:
+                if isinstance(gate_raw, torch.Tensor):
+                    gate_val = float(gate_raw.detach().float().item())
+                else:
+                    gate_val = float(gate_raw)
+                gate_sig = 1.0 / (1.0 + math.exp(-gate_val))
+            with torch.no_grad():
+                target.weight.zero_()
+                target.bias.zero_()
+                idx = torch.arange(16, device=target_w.device)
+                target.weight[idx, idx, 0, 0] = 1.0
+                legacy_w = src_w.to(device=target_w.device, dtype=target_w.dtype) * gate_sig
+                target.weight[:, 16:32, :, :].copy_(legacy_w)
+                if src_b is not None:
+                    legacy_b = src_b.to(device=target.bias.device, dtype=target.bias.dtype) * gate_sig
+                    target.bias.copy_(legacy_b)
+            self.fusion_source = f'migrated(gate={gate_sig:.3f})'
+            print(f"[Eval] Legacy gated-fusion checkpoint migrated to concat layout (sigmoid(gate)={gate_sig:.4f}).")
+            return
+
+        self.fusion_source = 'identity'
+        print(
+            f"[Eval][WARN] pixel_fuse_proj shape mismatch: "
+            f"ckpt={tuple(src_w.shape) if src_w is not None else None}, "
+            f"model={tuple(target_w.shape)}. Using identity init."
+        )
     
     def _cache_text_embeddings(self):
         from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
@@ -482,12 +525,10 @@ class DualStreamEvaluator(nn.Module):
                 pixel_feat, size=lr_lat.shape[-2:], mode='bilinear', align_corners=False
             )
 
-        if self.use_gated_fusion:
-            pixel_feat = self.pixel_fuse_proj(pixel_feat.to(dtype))
-            pixel_gate = torch.sigmoid(self.pixel_gate_logit).to(dtype)
-            fused_cond = (lr_lat + self.pixel_weight * pixel_gate * pixel_feat).to(dtype)
-        else:
-            fused_cond = (lr_lat + self.pixel_weight * pixel_feat).to(dtype)
+        # Concat fusion: [lr_lat || pixel_weight*pixel_feat] -> 1x1 conv -> 16ch.
+        fused_cond = self.pixel_fuse_proj(
+            torch.cat([lr_lat.to(dtype), (self.pixel_weight * pixel_feat).to(dtype)], dim=1)
+        ).to(dtype)
         del pixel_feat
 
         # FLUX pack() requires even latent H/W. RealSR can produce odd latent sizes.
@@ -828,8 +869,7 @@ def main():
     if args.exp_name:
         exp_name = args.exp_name
     else:
-        fusion_tag = "gated" if evaluator.use_gated_fusion else "legacy"
-        gate_val = float(torch.sigmoid(evaluator.pixel_gate_logit).item()) if evaluator.use_gated_fusion else 1.0
+        fusion_tag = "concat"
         exp_name = (
             f"{ts}"
             f"_str{_fmt_tag(strength)}"
@@ -995,10 +1035,7 @@ def main():
     print("=" * 70)
     print(f"Strength: {strength}")
     print(f"Pixel Weight: {evaluator.pixel_weight}")
-    if evaluator.use_gated_fusion:
-        print(f"Pixel Fusion: gated (gate={torch.sigmoid(evaluator.pixel_gate_logit).item():.4f})")
-    else:
-        print("Pixel Fusion: legacy direct-add")
+    print(f"Pixel Fusion: concat+1x1 conv (source={evaluator.fusion_source})")
     if lpips_fn:
         print(f"Bicubic:  PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}")
         print(f"SR:       PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
@@ -1019,10 +1056,7 @@ def main():
         f.write(f"Pixel Weight: {evaluator.pixel_weight}\n")
         f.write(f"Train LPIPS Weight: {evaluator.train_lpips_weight}\n")
         f.write(f"Train LPIPS Apply Prob: {evaluator.train_lpips_apply_prob}\n")
-        if evaluator.use_gated_fusion:
-            f.write(f"Pixel Fusion: gated (gate={torch.sigmoid(evaluator.pixel_gate_logit).item():.6f})\n")
-        else:
-            f.write("Pixel Fusion: legacy direct-add\n")
+        f.write(f"Pixel Fusion: concat+1x1 conv (source={evaluator.fusion_source})\n")
         f.write(f"Dataset: {args.dataset}\n")
         f.write(f"Images: {len(psnr_list)}\n")
         f.write(f"Steps: {args.num_steps}, Guidance: {args.guidance}\n")
