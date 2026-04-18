@@ -1329,8 +1329,6 @@ def validate(system, accelerator, val_loader, device, num_samples=10,
         'psnr': float(np.mean(psnr_list)) if psnr_list else 0.0,
         'lpips': float(np.mean(lpips_list)) if lpips_list else None,
     }
-
-
 def _load_pixel_fuse_proj_with_migration(unwrapped, ckpt, is_main=False):
     """Load pixel_fuse_proj from a checkpoint, migrating legacy gated-fusion
     checkpoints to the new concat-based layout.
@@ -1790,6 +1788,25 @@ def main():
         lora_target_regex=lora_target_regex,
         lora_init_weights=lora_init_weights,
     )
+    if args.dry_run_lora:
+        if is_main:
+            wrapped = []
+            for n, m in system.transformer.named_modules():
+                if hasattr(m, 'lora_A'):
+                    try:
+                        if len(m.lora_A) > 0:
+                            wrapped.append(n)
+                    except TypeError:
+                        wrapped.append(n)
+            print("\n[dry_run_lora] LoRA regex diagnostic")
+            print(f"Target preset: {args.lora_target_preset}")
+            print(f"Wrapped modules: {len(wrapped)}")
+            for n in wrapped[:200]:
+                print(f"  {n}")
+            if len(wrapped) > 200:
+                print(f"  ... ({len(wrapped) - 200} more)")
+        raise SystemExit(0)
+
     if args.dry_run_lora:
         if is_main:
             wrapped = []
