@@ -5,6 +5,8 @@ Dual-Stream FLUX SR Evaluation - aligned with official Diffusers pipeline
 ======================================================================
 
 Companion script for train_dual_control.py
+Automatically detects and loads LoRA adapters when checkpoint contains
+`use_lora=True` and `lora_state_dict`.
 
 Usage:
     python evaluate_dual_control.py \
@@ -34,6 +36,56 @@ try:
 except ImportError:
     LPIPS_AVAILABLE = False
     print("Note: lpips not installed. Run: pip install lpips")
+
+try:
+    from skimage.metrics import structural_similarity as sk_ssim
+    SKIMAGE_AVAILABLE = True
+except ImportError:
+    sk_ssim = None
+    SKIMAGE_AVAILABLE = False
+    print("Note: scikit-image not installed; falling back to global SSIM. Run: pip install scikit-image")
+
+# PEFT is optional; only required when checkpoint contains a LoRA adapter.
+try:
+    from peft import LoraConfig, get_peft_model
+    from peft.utils import set_peft_model_state_dict
+    PEFT_AVAILABLE = True
+except ImportError:
+    LoraConfig = None
+    get_peft_model = None
+    set_peft_model_state_dict = None
+    PEFT_AVAILABLE = False
+
+
+# ============================================================================
+# LoRA target module presets
+# ============================================================================
+
+LORA_TARGET_REGEX_OMINICONTROL = (
+    r"(.*(?<!single_)transformer_blocks\.[0-9]+\.norm1\.linear"
+    r"|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_k"
+    r"|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_q"
+    r"|.*single_transformer_blocks\.[0-9]+\.norm\.linear"
+    r"|.*single_transformer_blocks\.[0-9]+\.attn\.to_k"
+    r"|.*single_transformer_blocks\.[0-9]+\.attn\.to_q)"
+)
+LORA_TARGET_REGEX_ATTN_QKVO = (
+    r"(.*(?<!single_)transformer_blocks\.[0-9]+\.norm1\.linear"
+    r"|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.(to_q|to_k|to_v|to_out\.0)"
+    r"|.*single_transformer_blocks\.[0-9]+\.norm\.linear"
+    r"|.*single_transformer_blocks\.[0-9]+\.attn\.(to_q|to_k|to_v))"
+)
+LORA_TARGET_REGEX_QK_ONLY = (
+    r"(.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_k"
+    r"|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_q"
+    r"|.*single_transformer_blocks\.[0-9]+\.attn\.to_k"
+    r"|.*single_transformer_blocks\.[0-9]+\.attn\.to_q)"
+)
+LORA_TARGET_PRESETS = {
+    'ominicontrol': LORA_TARGET_REGEX_OMINICONTROL,
+    'attn_qkvo': LORA_TARGET_REGEX_ATTN_QKVO,
+    'qk_only': LORA_TARGET_REGEX_QK_ONLY,
+}
 
 
 # ============================================================================
@@ -88,16 +140,41 @@ def calculate_psnr(img1, img2):
 
 
 def calculate_ssim(img1, img2):
-    C1 = (0.01 * 255) ** 2
-    C2 = (0.03 * 255) ** 2
-    img1 = img1.astype(np.float64)
-    img2 = img2.astype(np.float64)
-    mu1, mu2 = img1.mean(), img2.mean()
-    sigma1_sq, sigma2_sq = img1.var(), img2.var()
-    sigma12 = ((img1 - mu1) * (img2 - mu2)).mean()
-    ssim = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / \
-           ((mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2))
-    return ssim
+    """SSIM on uint8 RGB images. Prefers scikit-image's 11x11 sliding-window
+    implementation (standard in SR benchmarks); falls back to a single-window
+    global SSIM only if skimage is unavailable."""
+    def _global_ssim():
+        C1 = (0.01 * 255) ** 2
+        C2 = (0.03 * 255) ** 2
+        x = img1.astype(np.float64)
+        y = img2.astype(np.float64)
+        mu1, mu2 = x.mean(), y.mean()
+        sigma1_sq, sigma2_sq = x.var(), y.var()
+        sigma12 = ((x - mu1) * (y - mu2)).mean()
+        ssim_val = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / \
+                   ((mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2))
+        return float(ssim_val)
+
+    if SKIMAGE_AVAILABLE:
+        min_side = min(img1.shape[0], img1.shape[1])
+        if min_side < 3:
+            return _global_ssim()
+        win_size = min(11, int(min_side))
+        if win_size % 2 == 0:
+            win_size -= 1
+        if win_size < 3:
+            return _global_ssim()
+        # channel_axis API differs between skimage versions; try both.
+        try:
+            return float(sk_ssim(img1, img2, data_range=255, channel_axis=-1, win_size=win_size))
+        except TypeError:
+            try:
+                return float(sk_ssim(img1, img2, data_range=255, multichannel=True, win_size=win_size))
+            except ValueError:
+                return _global_ssim()
+        except ValueError:
+            return _global_ssim()
+    return _global_ssim()
 
 def clear_memory(device):
     """Aggressively clear Python/CUDA memory."""
@@ -133,6 +210,9 @@ class DualStreamEvaluator(nn.Module):
         self.conditioning_scale = 1.0
         self.train_lpips_weight = 0.0
         self.train_lpips_apply_prob = 0.0
+        self.use_lora = False
+        self.lora_config_ckpt = None
+        self.lora_state_tensors = 0
     
     def load(self):
         from diffusers import FluxTransformer2DModel, AutoencoderKL, FluxControlNetModel
@@ -231,6 +311,48 @@ class DualStreamEvaluator(nn.Module):
             self.controlnet.enable_xformers_memory_efficient_attention()
         except:
             pass
+
+        self.use_lora = bool(ckpt.get('use_lora', False)) and ('lora_state_dict' in ckpt)
+        if self.use_lora:
+            if not PEFT_AVAILABLE:
+                raise ImportError(
+                    "[LoRA] Checkpoint contains a LoRA adapter but `peft` is not installed. "
+                    "Install with: pip install peft>=0.10"
+                )
+            self.lora_config_ckpt = ckpt.get('lora_config') or {}
+            ckpt_rank = int(self.lora_config_ckpt.get('rank', 16))
+            ckpt_alpha = int(self.lora_config_ckpt.get('alpha', ckpt_rank))
+            ckpt_regex = self.lora_config_ckpt.get('target_regex')
+            ckpt_preset = self.lora_config_ckpt.get('target_preset')
+            ckpt_init = self.lora_config_ckpt.get('init_weights', 'gaussian')
+            if ckpt_init in ('true', 'false'):
+                ckpt_init = (ckpt_init == 'true')
+            if not ckpt_regex and ckpt_preset in LORA_TARGET_PRESETS:
+                ckpt_regex = LORA_TARGET_PRESETS[ckpt_preset]
+            elif not ckpt_regex:
+                ckpt_regex = LORA_TARGET_REGEX_OMINICONTROL
+
+            lora_cfg = LoraConfig(
+                r=ckpt_rank,
+                lora_alpha=ckpt_alpha,
+                target_modules=ckpt_regex,
+                lora_dropout=0.0,
+                bias="none",
+                init_lora_weights=ckpt_init,
+            )
+            self.transformer = get_peft_model(self.transformer, lora_cfg)
+            self.transformer.eval()
+            self.transformer.requires_grad_(False)
+
+            lora_state = {k: v.to(self.device) for k, v in ckpt['lora_state_dict'].items()}
+            set_peft_model_state_dict(self.transformer, lora_state)
+            self.lora_state_tensors = len(lora_state)
+            print(
+                f"[LoRA] ACTIVE: loaded {self.lora_state_tensors} tensors "
+                f"(rank={ckpt_rank}, alpha={ckpt_alpha}, preset={ckpt_preset})"
+            )
+        else:
+            print("[LoRA] inactive (checkpoint has no adapter)")
 
     def _reset_pixel_fuse_proj_to_identity(self):
         if self.pixel_fuse_proj is None:
@@ -627,7 +749,8 @@ def main():
     parser.add_argument('--pixel_weight', type=float, default=None)
     parser.add_argument('--strength', type=float, default=None,
                         help='Inference start strength (omit to use checkpoint value)')
-    parser.add_argument('--tile_size', type=int, default=640)
+    parser.add_argument('--tile_size', type=int, default=512,
+                        help='Tile size for inference. Should match training resolution (512 by default) -- running at a different size shifts the FlowMatch dynamic_shifting sigma schedule and FLUX RoPE positions.')
     parser.add_argument('--min_tile_size', type=int, default=256)
     parser.add_argument('--overlap', type=int, default=64)
     parser.add_argument('--calc_lpips', dest='calc_lpips', action='store_true',
@@ -699,8 +822,17 @@ def main():
             f"_gate{_fmt_tag(gate_val)}"
             f"_trlpw{_fmt_tag(evaluator.train_lpips_weight)}"
         )
+        if evaluator.use_lora:
+            cfg = evaluator.lora_config_ckpt or {}
+            exp_name += (
+                f"_lora"
+                f"_r{cfg.get('rank', '?')}"
+                f"_a{cfg.get('alpha', '?')}"
+                f"_tp{cfg.get('target_preset', '?')}"
+            )
     
-    output_dir = os.path.join(args.output_base, args.dataset, 'DualControl', exp_name)
+    method_tag = 'DualLoRA' if evaluator.use_lora else 'DualControl'
+    output_dir = os.path.join(args.output_base, args.dataset, method_tag, exp_name)
     os.makedirs(output_dir, exist_ok=True)
     if args.save_images:
         os.makedirs(os.path.join(output_dir, 'predictions'), exist_ok=True)
@@ -717,6 +849,15 @@ def main():
     print(f"Pixel Weight: {evaluator.pixel_weight}")
     print(f"Train LPIPS: weight={evaluator.train_lpips_weight}, prob={evaluator.train_lpips_apply_prob}")
     print(f"Steps: {args.num_steps}, Guidance: {args.guidance}")
+    if evaluator.use_lora:
+        cfg = evaluator.lora_config_ckpt or {}
+        print(
+            f"LoRA: ACTIVE (tensors={evaluator.lora_state_tensors}, "
+            f"rank={cfg.get('rank', '?')}, alpha={cfg.get('alpha', '?')}, "
+            f"preset={cfg.get('target_preset', '?')})"
+        )
+    else:
+        print("LoRA: inactive")
     print(f"Output: {output_dir}")
     print("=" * 70)
     
@@ -867,6 +1008,15 @@ def main():
         f.write(f"Dataset: {args.dataset}\n")
         f.write(f"Images: {len(psnr_list)}\n")
         f.write(f"Steps: {args.num_steps}, Guidance: {args.guidance}\n")
+        if evaluator.use_lora:
+            cfg = evaluator.lora_config_ckpt or {}
+            f.write(
+                f"LoRA: ACTIVE (tensors={evaluator.lora_state_tensors}, "
+                f"rank={cfg.get('rank', '?')}, alpha={cfg.get('alpha', '?')}, "
+                f"preset={cfg.get('target_preset', '?')})\n"
+            )
+        else:
+            f.write("LoRA: inactive\n")
         f.write("\n" + "=" * 60 + "\n")
         f.write("Summary:\n")
         if lpips_fn:
