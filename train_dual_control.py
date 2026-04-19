@@ -775,7 +775,8 @@ class DualStreamFLUXSR(nn.Module):
                  lora_dropout=0.0, lora_target_regex=LORA_TARGET_REGEX_OMINICONTROL,
                  lora_init_weights='gaussian',
                  use_dfm=False, dfm_pixel_weight=0.05, dfm_lpips_weight=0.0,
-                 dfm_sigma_min=0.05, dfm_sigma_gate=0.0):
+                 dfm_sigma_min=0.05, dfm_sigma_gate=0.7,
+                 dfm_detach_v=False):
         super().__init__()
         self.model_name = model_name
         self.device = device
@@ -804,6 +805,12 @@ class DualStreamFLUXSR(nn.Module):
         # above `dfm_sigma_gate`.
         self.dfm_sigma_min = float(dfm_sigma_min)
         self.dfm_sigma_gate = float(dfm_sigma_gate)
+        # When True, the v_pred used for z0_pred reconstruction inside
+        # decode_with_dfm is detached. This isolates DFM adapter gradients from
+        # the FM head and keeps the LPIPS/L1 signal from back-propagating into
+        # the transformer / ControlNet. Defaults to False so the pixel-space
+        # grounding also refines the FM head.
+        self.dfm_detach_v = bool(dfm_detach_v)
 
         self.vae = None
         self.transformer = None
@@ -1160,10 +1167,13 @@ class DualStreamFLUXSR(nn.Module):
         Returns:
             (B, 3, H, W) image in the VAE's output range.
         """
-        if not self.use_dfm or len(self.dfm_adapters) == 0:
+        if not self.use_dfm or len(self.dfm_adapters) == 0 or pixel_taps is None:
             # Fallback: identical to self.decode(lat), but do it here so the
             # caller can uniformly call decode_with_dfm whether or not DFM is
             # enabled (makes eval-path branching simpler).
+            # We also fall back when ``pixel_taps`` is None -- e.g. during
+            # validate() before the first inference() call populates
+            # self._last_pixel_taps, or after we explicitly cleared the cache.
             return self.decode(lat)
 
         # --- un-scale (matches self.decode) ---
@@ -1208,10 +1218,20 @@ class DualStreamFLUXSR(nn.Module):
             else:
                 sample = up_block(sample, None)
 
-        # post-process (latent_embeds is always None on FLUX VAE)
-        sample = dec.conv_norm_out(sample)
-        sample = dec.conv_act(sample)
-        sample = dec.conv_out(sample)
+        # post-process (latent_embeds is always None on FLUX VAE). The tail
+        # holds a full H×W activation, so during training we also run it
+        # through gradient checkpointing to cap peak memory.
+        if use_ckpt:
+            def _tail(x, dec=dec):
+                x = dec.conv_norm_out(x)
+                x = dec.conv_act(x)
+                x = dec.conv_out(x)
+                return x
+            sample = torch.utils.checkpoint.checkpoint(_tail, sample, use_reentrant=False)
+        else:
+            sample = dec.conv_norm_out(sample)
+            sample = dec.conv_act(sample)
+            sample = dec.conv_out(sample)
         return sample
 
     def _pack(self, x):
@@ -1515,19 +1535,107 @@ def compute_flow_matching_loss(
     # Base FM loss
     loss = F.mse_loss(v_pred.float(), target_v.float())
 
-    # Optional perceptual regularizer in pixel space.
-    # Only apply when sigma is low enough that the one-step reconstruction
-    # (pred_hr = noisy - sigma * v_pred) is meaningful -- at high sigma the
-    # decoded image is essentially noise and LPIPS contributes garbage grads.
-    sigma_mean = float(sigma.float().mean().item())
-    do_lpips = (
+    # -------------------------------------------------------------------------
+    # Pixel-space losses (baseline LPIPS + DFM L1/LPIPS)
+    # -------------------------------------------------------------------------
+    # Both terms live on ``pred_hr = decode(pred_hr_lat)`` where
+    #   pred_hr_lat = noisy - sigma_expand * v_pred   (algebraically exact)
+    #
+    # To avoid running the VAE decoder twice per step when DFM is on, we
+    # merge the two decode paths:
+    #   - DFM OFF: keep baseline LPIPS path (uses unwrapped.decode -> vae.decoder).
+    #   - DFM ON: decode through ``decode_with_dfm`` once. At init DFM is the
+    #     identity (zero-init scale/shift), so this is numerically identical
+    #     to ``decode`` and can carry BOTH the pixel-L1 supervision (for DFM
+    #     adapters) and the optional LPIPS term. We therefore skip the extra
+    #     baseline LPIPS decode.
+    #
+    # Gating:
+    #   - Baseline LPIPS uses the existing batch-mean ``lpips_max_sigma`` +
+    #     random ``lpips_apply_prob`` gate (original behaviour).
+    #   - DFM pixel loss uses a PER-SAMPLE sigma mask so ranks stay in sync
+    #     under DDP even when a subset of samples is above the gate. The
+    #     decode ALWAYS runs when DFM is on (to keep the grad graph shape
+    #     consistent across ranks) -- we just zero out the contribution of
+    #     high-sigma samples.
+    sigma_flt = sigma.float()
+    do_dfm_pixel = (
+        use_dfm
+        and unwrapped.dfm_pixel_weight > 0
+        and pixel_taps is not None
+    )
+
+    # Baseline LPIPS trigger (only used when DFM is OFF, to avoid double decode).
+    do_baseline_lpips = (
         lpips_model is not None
         and lpips_weight > 0
         and hr_pixel is not None
-        and sigma_mean < float(lpips_max_sigma)
+        and not do_dfm_pixel
+        and float(sigma_flt.mean().item()) < float(lpips_max_sigma)
         and (lpips_apply_prob >= 1.0 or torch.rand(1, device=device).item() < lpips_apply_prob)
     )
-    if do_lpips:
+
+    if do_dfm_pixel:
+        # --- Merged DFM pixel decode ---
+        # FM identity: z_hr = noisy - sigma * v  (no division, numerically
+        # exact for any sigma in [0, 1]).
+        v_for_decode = v_pred.detach() if unwrapped.dfm_detach_v else v_pred
+        z0_pred = noisy - sigma_expand * v_for_decode
+        pixel_pred = unwrapped.decode_with_dfm(z0_pred, pixel_taps)
+
+        pred_f = pixel_pred.float()
+        target_f = hr_pixel.float()
+
+        # Per-sample mask: 1 where sigma <= dfm_sigma_gate, else 0. DDP-safe.
+        gate = float(getattr(unwrapped, 'dfm_sigma_gate', 0.0))
+        if gate > 0.0:
+            mask = (sigma_flt <= gate).view(B, 1, 1, 1).to(pred_f.dtype)
+            mask_sum = mask.sum().clamp(min=1.0)
+            numel_per_sample = pred_f.shape[1] * pred_f.shape[2] * pred_f.shape[3]
+            pix_l1 = (mask * (pred_f - target_f).abs()).sum() / (mask_sum * numel_per_sample)
+        else:
+            # gate <= 0 -> never gate; equivalent to standard F.l1_loss (mean
+            # over all elements, matches legacy behaviour for A/B parity).
+            pix_l1 = F.l1_loss(pred_f, target_f)
+
+        dfm_loss_term = pix_l1
+
+        # DFM LPIPS term (re-uses the same decoded tensor -> no double decode)
+        dfm_lpips_w = float(getattr(unwrapped, 'dfm_lpips_weight', 0.0))
+        if lpips_model is not None and dfm_lpips_w > 0:
+            pp = pred_f.clamp(-1, 1)
+            tt = target_f.clamp(-1, 1)
+            if lpips_resize is not None and lpips_resize > 0:
+                size = (int(lpips_resize), int(lpips_resize))
+                pp = F.interpolate(pp, size=size, mode='bilinear', align_corners=False)
+                tt = F.interpolate(tt, size=size, mode='bilinear', align_corners=False)
+            dfm_loss_term = dfm_loss_term + dfm_lpips_w * lpips_model(pp, tt).mean().float()
+            del pp, tt
+
+        # Baseline LPIPS can piggy-back on the SAME decode (pred_hr == pixel_pred
+        # at DFM init; after training they differ by the DFM modulation, but
+        # the LPIPS objective is still "decoded pred should look like HR").
+        if (
+            lpips_model is not None
+            and lpips_weight > 0
+            and hr_pixel is not None
+            and float(sigma_flt.mean().item()) < float(lpips_max_sigma)
+            and (lpips_apply_prob >= 1.0 or torch.rand(1, device=device).item() < lpips_apply_prob)
+        ):
+            pp = pred_f.clamp(-1, 1)
+            tt = target_f.clamp(-1, 1)
+            if lpips_resize is not None and lpips_resize > 0:
+                size = (int(lpips_resize), int(lpips_resize))
+                pp = F.interpolate(pp, size=size, mode='bilinear', align_corners=False)
+                tt = F.interpolate(tt, size=size, mode='bilinear', align_corners=False)
+            loss = loss + float(lpips_weight) * lpips_model(pp, tt).mean().float()
+            del pp, tt
+
+        loss = loss + float(unwrapped.dfm_pixel_weight) * dfm_loss_term
+        del z0_pred, pixel_pred, pred_f, target_f, pix_l1, dfm_loss_term, v_for_decode
+
+    elif do_baseline_lpips:
+        # DFM off: original baseline LPIPS path (single decode, no DFM).
         pred_hr_lat = noisy - sigma_expand * v_pred
         pred_hr = unwrapped.decode(pred_hr_lat)
 
@@ -1541,49 +1649,6 @@ def compute_flow_matching_loss(
         lpips_term = lpips_model(pred_lp, target_lp).mean().float()
         loss = loss + float(lpips_weight) * lpips_term
         del pred_hr_lat, pred_hr, pred_lp, target_lp, lpips_term
-
-    # --- DFM pixel-space loss (Phase 1.4) ---
-    # We decode z0_pred = noisy - sigma * v_pred through ``decode_with_dfm``
-    # and match the result to ``hr_pixel`` with L1 (+ optional LPIPS). This
-    # is the *only* path that routes gradient into self.dfm_adapters.
-    #
-    # Numerical guard:
-    #   - ``dfm_sigma_gate`` (default 0.0 = never gate) skips the pixel loss
-    #     when the batch-mean sigma is above the gate, because at very high
-    #     sigma the z0_pred estimate is dominated by noise and pixel-space
-    #     L1 is largely useless gradient.
-    if (
-        use_dfm
-        and unwrapped.dfm_pixel_weight > 0
-        and pixel_taps is not None
-    ):
-        sigma_mean_float = float(sigma.float().mean().item())
-        gate = float(getattr(unwrapped, 'dfm_sigma_gate', 0.0))
-        if gate <= 0.0 or sigma_mean_float <= gate:
-            # FM identity: noisy = (1-sigma)*z_hr + sigma*noise, v = noise - z_hr
-            # => z_hr = noisy - sigma * v  (algebraically exact)
-            z0_pred = noisy - sigma_expand * v_pred
-            pixel_pred = unwrapped.decode_with_dfm(z0_pred, pixel_taps)
-
-            pix_l1 = F.l1_loss(pixel_pred.float(), hr_pixel.float())
-            dfm_loss_term = pix_l1
-
-            if (
-                lpips_model is not None
-                and float(getattr(unwrapped, 'dfm_lpips_weight', 0.0)) > 0
-            ):
-                pp = pixel_pred.float().clamp(-1, 1)
-                tt = hr_pixel.float().clamp(-1, 1)
-                if lpips_resize is not None and lpips_resize > 0:
-                    size = (int(lpips_resize), int(lpips_resize))
-                    pp = F.interpolate(pp, size=size, mode='bilinear', align_corners=False)
-                    tt = F.interpolate(tt, size=size, mode='bilinear', align_corners=False)
-                dfm_loss_term = dfm_loss_term + float(unwrapped.dfm_lpips_weight) * \
-                    lpips_model(pp, tt).mean().float()
-                del pp, tt
-
-            loss = loss + float(unwrapped.dfm_pixel_weight) * dfm_loss_term
-            del z0_pred, pixel_pred, pix_l1, dfm_loss_term
 
     del target_v, noise, sigma_expand, noisy, v_pred
     return loss
@@ -1644,6 +1709,12 @@ def validate(system, accelerator, val_loader, device, num_samples=10,
         unwrapped.controlnet.train()
     if unwrapped.use_lora:
         unwrapped.transformer.train()
+    # Release the cached pixel taps dict from the last inference() call so
+    # large H/2/H/4/H/8 tensors don't sit on the GPU between val and the next
+    # training step. Any future decode_with_dfm() call with None falls back to
+    # plain decode() (see patch in that method).
+    if hasattr(unwrapped, '_last_pixel_taps'):
+        unwrapped._last_pixel_taps = None
     gc.collect()
     if device.type == 'cuda':
         torch.cuda.empty_cache()
@@ -1781,6 +1852,7 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
             'lpips_weight': unwrapped.dfm_lpips_weight,
             'sigma_min': unwrapped.dfm_sigma_min,
             'sigma_gate': unwrapped.dfm_sigma_gate,
+            'detach_v': bool(getattr(unwrapped, 'dfm_detach_v', False)),
             'up_to_tap': dict(unwrapped._dfm_up_to_tap),
         }
     if unwrapped.use_lora:
@@ -1942,10 +2014,22 @@ def main():
     parser.add_argument('--dfm_sigma_min', type=float, default=0.05,
                         help='[Deprecated] kept for checkpoint compatibility; '
                              'z0 reconstruction now always uses raw sampled sigma.')
-    parser.add_argument('--dfm_sigma_gate', type=float, default=0.0,
-                        help='If > 0, skip DFM pixel loss on batches whose mean sigma '
-                             'exceeds this gate (at high sigma z0_pred is mostly noise). '
-                             '0 = never gate.')
+    parser.add_argument('--dfm_sigma_gate', type=float, default=0.7,
+                        help='Per-sample sigma gate for DFM pixel loss: samples with '
+                             'sigma > gate contribute 0 (decoded z0 is mostly noise). '
+                             '0 or negative disables gating. Default 0.7 keeps the low/mid '
+                             'sigma half of each batch and is DDP-safe (per-sample mask, '
+                             'decode always runs so the grad graph is the same on every rank).')
+    parser.add_argument('--dfm_detach_v', action='store_true', default=False,
+                        help='Detach v_pred before reconstructing z0 for the DFM decode. '
+                             'Isolates DFM adapter gradients from the FM head + transformer; '
+                             'use when you want to tune DFM without perturbing the diffusion '
+                             'backbone (e.g. frozen Stage-2).')
+    parser.add_argument('--test_dfm_identity', action='store_true', default=False,
+                        help='Sanity test: with freshly zero-initialized DFM adapters, '
+                             '``decode_with_dfm`` must equal ``decode`` up to bf16 roundoff. '
+                             'Prints the max absolute diff in both fp32 and bf16 and exits '
+                             'non-zero if the bf16 diff exceeds 1e-3.')
 
     # Checkpointing
     parser.add_argument('--save_dir', type=str, default='./checkpoints/dual_control')
@@ -2076,6 +2160,8 @@ def main():
             f"_dlw{_fmt_tag(args.dfm_lpips_weight)}"
             f"_dsg{_fmt_tag(args.dfm_sigma_gate)}"
         )
+        if args.dfm_detach_v:
+            exp_name += "_detachv"
     if args.use_lora:
         exp_name += (
             f"_lora"
@@ -2120,7 +2206,8 @@ def main():
         if args.use_dfm:
             print(
                 f"DFM: ON (pixel_w={args.dfm_pixel_weight}, "
-                f"lpips_w={args.dfm_lpips_weight}, sigma_gate={args.dfm_sigma_gate})"
+                f"lpips_w={args.dfm_lpips_weight}, sigma_gate={args.dfm_sigma_gate}, "
+                f"detach_v={args.dfm_detach_v})"
             )
         else:
             print("DFM: OFF")
@@ -2163,6 +2250,7 @@ def main():
         dfm_lpips_weight=args.dfm_lpips_weight,
         dfm_sigma_min=args.dfm_sigma_min,
         dfm_sigma_gate=args.dfm_sigma_gate,
+        dfm_detach_v=args.dfm_detach_v,
     )
     if args.dry_run_lora:
         if is_main:
@@ -2182,6 +2270,45 @@ def main():
             if len(wrapped) > 200:
                 print(f"  ... ({len(wrapped) - 200} more)")
         raise SystemExit(0)
+
+    # --- Identity sanity test for freshly-initialized DFM adapters -----------
+    # With zero-init scale/shift convs, ``decode_with_dfm`` must numerically
+    # equal ``decode``. We compare in fp32 (informational) and bf16 (matches
+    # the training dtype) and fail hard if the bf16 diff is large.
+    if args.test_dfm_identity:
+        if not args.use_dfm:
+            if is_main:
+                print("[test_dfm_identity] --use_dfm must be ON. Exiting.")
+            raise SystemExit(2)
+        if is_main:
+            print("\n[test_dfm_identity] Running DFM identity sanity test...")
+        system.eval()
+        with torch.no_grad():
+            # random latent + pseudo pixel taps at the right shapes/channels.
+            B, H_hr, W_hr = 1, 512, 512
+            lat = torch.randn(B, 16, H_hr // 8, W_hr // 8, device=device, dtype=torch.bfloat16)
+            dummy_lr = torch.zeros(B, 3, H_hr, W_hr, device=device, dtype=torch.bfloat16)
+            _, taps = system.pixel_extractor(dummy_lr, return_features=True)
+
+            # --- bf16 path (training dtype) ---
+            out_std = system.decode(lat)
+            out_dfm = system.decode_with_dfm(lat, taps)
+            diff_bf16 = (out_std.float() - out_dfm.float()).abs().max().item()
+
+            # --- fp32 path (informational) ---
+            # Temporarily cast adapters + vae decoder to fp32 for a tight bound.
+            out_std_fp32 = system.decode(lat.float().to(system.vae.dtype))
+            out_dfm_fp32 = system.decode_with_dfm(lat.float().to(system.vae.dtype), taps)
+            diff_fp32 = (out_std_fp32.float() - out_dfm_fp32.float()).abs().max().item()
+
+        if is_main:
+            print(f"[test_dfm_identity] max |decode - decode_with_dfm| (bf16): {diff_bf16:.2e}")
+            print(f"[test_dfm_identity] max |decode - decode_with_dfm| (fp32 input): {diff_fp32:.2e}")
+            if diff_bf16 > 1e-3:
+                print(f"[test_dfm_identity] FAIL: bf16 diff > 1e-3 -> zero-init not identity.")
+            else:
+                print("[test_dfm_identity] OK: zero-init DFM == plain decode within tolerance.")
+        raise SystemExit(0 if diff_bf16 <= 1e-3 else 1)
 
     lpips_model = None
     if args.lpips_weight > 0:
@@ -2533,7 +2660,8 @@ def main():
             if args.use_dfm:
                 f.write(
                     f"DFM: ON, pixel_w={args.dfm_pixel_weight}, "
-                    f"lpips_w={args.dfm_lpips_weight}, sigma_gate={args.dfm_sigma_gate}\n"
+                    f"lpips_w={args.dfm_lpips_weight}, sigma_gate={args.dfm_sigma_gate}, "
+                    f"detach_v={args.dfm_detach_v}\n"
                 )
             else:
                 f.write("DFM: OFF\n")
