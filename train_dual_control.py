@@ -152,44 +152,139 @@ class PixelFeatureExtractor(nn.Module):
     """
     从原始像素空间提取高频特征，映射到 Latent 空间维度
     使用 Zero Conv 确保初始化时不破坏预训练 ControlNet
+
+    Submodules are kept inside a flat ``self.encoder`` nn.Sequential so that
+    checkpoints saved before the DFM refactor still load 1:1 with the same
+    parameter keys (e.g. ``encoder.0.weight`` ... ``encoder.17.bias``).
+
+    Intermediate taps (for decoder-side DFM) are exposed via
+    ``forward(..., return_features=True)`` using these hard-coded indices:
+        - after encoder[5]  : 32ch  at H/2   -> "s1"
+        - after encoder[11] : 64ch  at H/4   -> "s2"
+        - after encoder[14] : 128ch at H/8   -> "s3" (pre final proj)
     """
+
+    # Index boundaries inside ``self.encoder``. If the encoder layout changes,
+    # update these together with any DFM adapter channels.
+    _TAP_IDX = {'s1': 5, 's2': 11, 's3': 14}
+    _TAP_CHANNELS = {'s1': 32, 's2': 64, 's3': 128}
+
     def __init__(self, latent_channels=16):
         super().__init__()
-        
+
         self.encoder = nn.Sequential(
-            # 512 → 256
-            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
-            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
-            
-            # 256 → 128
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.SiLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.SiLU(),
-            
-            # 128 → 64
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 128),
-            nn.SiLU(),
-            nn.Conv2d(128, latent_channels, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(4, latent_channels),
-            nn.SiLU(),
+            # 512 → 256 (s1 tap after idx 5)
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),      # 0
+            nn.GroupNorm(8, 32),                                        # 1
+            nn.SiLU(),                                                  # 2
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),     # 3
+            nn.GroupNorm(8, 32),                                        # 4
+            nn.SiLU(),                                                  # 5 <- s1: 32ch H/2
+
+            # 256 → 128 (s2 tap after idx 11)
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),     # 6
+            nn.GroupNorm(8, 64),                                        # 7
+            nn.SiLU(),                                                  # 8
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),     # 9
+            nn.GroupNorm(8, 64),                                        # 10
+            nn.SiLU(),                                                  # 11 <- s2: 64ch H/4
+
+            # 128 → 64 (s3 tap after idx 14; final proj at 15-17)
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),    # 12
+            nn.GroupNorm(8, 128),                                       # 13
+            nn.SiLU(),                                                  # 14 <- s3: 128ch H/8
+            nn.Conv2d(128, latent_channels, kernel_size=3, stride=1, padding=1),  # 15
+            nn.GroupNorm(4, latent_channels),                           # 16
+            nn.SiLU(),                                                  # 17
         )
-        
+
         # Zero Conv
         self.zero_conv = nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
         nn.init.zeros_(self.zero_conv.weight)
         nn.init.zeros_(self.zero_conv.bias)
-    
-    def forward(self, x):
-        feat = self.encoder(x)
-        return self.zero_conv(feat)
+
+    def forward(self, x, return_features=False):
+        """Forward.
+
+        Args:
+            x: (B, 3, H, W) pixel input in [-1, 1].
+            return_features: if True, also return a dict of intermediate taps
+                {'s1': 32ch H/2, 's2': 64ch H/4, 's3': 128ch H/8} usable as
+                DFM conditioning. Ordering follows ``_TAP_IDX``.
+        """
+        if not return_features:
+            feat = self.encoder(x)
+            return self.zero_conv(feat)
+
+        taps = {}
+        h = x
+        tap_end = max(self._TAP_IDX.values())
+        idx_to_name = {v: k for k, v in self._TAP_IDX.items()}
+        for i, layer in enumerate(self.encoder):
+            h = layer(h)
+            if i in idx_to_name:
+                # Clone to guarantee taps are independent of downstream mutations
+                # (no in-place op expected in the rest of the encoder, but cheap
+                # insurance against future refactors).
+                taps[idx_to_name[i]] = h
+            if i == len(self.encoder) - 1:
+                break
+        out = self.zero_conv(h)
+        return out, taps
+
+
+class DFMAdapter(nn.Module):
+    """Decoder-side Feature Modulation (SPADE-style).
+
+    Applies a conditional affine transform to a VAE-decoder activation using
+    a pixel-space feature tap from :class:`PixelFeatureExtractor`:
+
+        decoder_feat <- decoder_feat * (1 + scale(pixel_feat)) + shift(pixel_feat)
+
+    ``to_scale`` and ``to_shift`` are zero-initialised, so at init the module
+    is an exact identity and DFM does not perturb the frozen VAE decoder.
+    This is the property we use for the bit-wise equivalence unit test.
+
+    Args:
+        feat_ch:    channel count of the incoming pixel feature map
+                    (e.g. 128/64/32 for s3/s2/s1 taps).
+        decoder_ch: channel count of the VAE decoder activation at the
+                    injection point. Read at runtime from
+                    ``vae.decoder.up_blocks[i].resnets[0].conv1.in_channels``
+                    so we do not hard-code it for different VAE variants.
+    """
+
+    def __init__(self, feat_ch: int, decoder_ch: int):
+        super().__init__()
+        self.align = nn.Conv2d(feat_ch, decoder_ch, kernel_size=3, padding=1)
+        self.to_scale = nn.Conv2d(decoder_ch, decoder_ch, kernel_size=1)
+        self.to_shift = nn.Conv2d(decoder_ch, decoder_ch, kernel_size=1)
+
+        # Identity-at-init: zero out scale/shift heads.
+        nn.init.zeros_(self.to_scale.weight)
+        nn.init.zeros_(self.to_scale.bias)
+        nn.init.zeros_(self.to_shift.weight)
+        nn.init.zeros_(self.to_shift.bias)
+        # ``align`` is allowed to be non-zero since its output feeds both heads,
+        # which are themselves zero-init -> overall contribution is still zero.
+        nn.init.kaiming_normal_(self.align.weight, nonlinearity='relu')
+        nn.init.zeros_(self.align.bias)
+
+    def forward(self, decoder_feat: torch.Tensor, pixel_feat: torch.Tensor) -> torch.Tensor:
+        if pixel_feat.shape[-2:] != decoder_feat.shape[-2:]:
+            pixel_feat = F.interpolate(
+                pixel_feat,
+                size=decoder_feat.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+        # Cast pixel_feat to decoder_feat dtype (decoder may run in fp16/bf16).
+        if pixel_feat.dtype != decoder_feat.dtype:
+            pixel_feat = pixel_feat.to(decoder_feat.dtype)
+        h = F.silu(self.align(pixel_feat))
+        scale = self.to_scale(h)
+        shift = self.to_shift(h)
+        return decoder_feat * (1.0 + scale) + shift
 
 
 # ============================================================================
@@ -678,7 +773,9 @@ class DualStreamFLUXSR(nn.Module):
                  conditioning_scale=1.0,
                  use_lora=True, lora_rank=16, lora_alpha=16,
                  lora_dropout=0.0, lora_target_regex=LORA_TARGET_REGEX_OMINICONTROL,
-                 lora_init_weights='gaussian'):
+                 lora_init_weights='gaussian',
+                 use_dfm=False, dfm_pixel_weight=0.05, dfm_lpips_weight=0.0,
+                 dfm_sigma_min=0.05, dfm_sigma_gate=0.0):
         super().__init__()
         self.model_name = model_name
         self.device = device
@@ -695,7 +792,19 @@ class DualStreamFLUXSR(nn.Module):
         self.lora_dropout = float(lora_dropout)
         self.lora_target_regex = lora_target_regex
         self.lora_init_weights = lora_init_weights
-        
+
+        # DFM config (see Phase 1 of plan). Kept in the system so checkpoint /
+        # resume / eval paths can discover what was trained with.
+        self.use_dfm = bool(use_dfm)
+        self.dfm_pixel_weight = float(dfm_pixel_weight)
+        self.dfm_lpips_weight = float(dfm_lpips_weight)
+        # Pixel-space loss numerical guard: we recover z0_pred from a predicted v
+        # via z0 = z_sigma - sigma * v, which blows up at small sigma. Clamp the
+        # sigma used in that formula and (optionally) gate the loss to steps
+        # above `dfm_sigma_gate`.
+        self.dfm_sigma_min = float(dfm_sigma_min)
+        self.dfm_sigma_gate = float(dfm_sigma_gate)
+
         self.vae = None
         self.transformer = None
         self.controlnet = None
@@ -703,7 +812,14 @@ class DualStreamFLUXSR(nn.Module):
         self.pixel_fuse_proj = None
         self.scheduler = None
         self._cached_embeds = None
-        
+        # DFM adapter dict: key is 'up0'/'up1'/'up2', value is DFMAdapter.
+        # Populated inside _load_models after the VAE is on device.
+        self.dfm_adapters = nn.ModuleDict()
+        # Ordered mapping from VAE decoder up_block index -> PixelFeatureExtractor tap.
+        # up_blocks[0] (H/8) <- s3 (128ch), [1] (H/4) <- s2 (64ch), [2] (H/2) <- s1 (32ch).
+        # up_blocks[3] (H) has no matching tap and is left untouched.
+        self._dfm_up_to_tap = {0: 's3', 1: 's2', 2: 's1'}
+
         self._load_models(pretrained_controlnet)
 
     @staticmethod
@@ -790,6 +906,12 @@ class DualStreamFLUXSR(nn.Module):
         self._reset_pixel_fuse_proj_to_identity()
         self.pixel_extractor.train()
         self.pixel_fuse_proj.train()
+
+        # DFM adapters — registered after VAE + pixel_extractor exist so that
+        # decoder channel counts can be read from the live module rather than
+        # hard-coded. The VAE decoder is kept frozen; only the adapters train.
+        if self.use_dfm:
+            self._build_dfm_adapters(dtype=dtype, local_rank=local_rank)
         
         # Enable Flash Attention
         try:
@@ -938,7 +1060,20 @@ class DualStreamFLUXSR(nn.Module):
     def get_pixel_branch_params(self):
         params = list(self.pixel_extractor.parameters())
         params += list(self.pixel_fuse_proj.parameters())
+        # DFM adapters live on the pixel-side branch conceptually
+        # (they consume pixel features to modulate the decoder).
+        if self.use_dfm and len(self.dfm_adapters) > 0:
+            params += list(self.dfm_adapters.parameters())
         return params
+
+    def get_dfm_params(self):
+        """Return DFM adapter params only (empty list if DFM disabled).
+
+        Exposed separately in case the optimizer wants its own LR group.
+        """
+        if not self.use_dfm or len(self.dfm_adapters) == 0:
+            return []
+        return list(self.dfm_adapters.parameters())
 
     def get_lora_params(self):
         if not self.use_lora:
@@ -961,7 +1096,124 @@ class DualStreamFLUXSR(nn.Module):
         else:
             lat = lat / self.vae.config.scaling_factor
         return self.vae.decode(lat.to(self.vae.dtype)).sample
-    
+
+    # ------------------------------------------------------------------ DFM
+    def _build_dfm_adapters(self, dtype, local_rank: int = 0):
+        """Instantiate DFM adapters by reading decoder channels at runtime.
+
+        Requires ``self.vae`` and ``self.pixel_extractor`` to already exist.
+        Channels:
+            - pixel-side feat_ch comes from PixelFeatureExtractor._TAP_CHANNELS
+              (s1=32, s2=64, s3=128).
+            - decoder-side decoder_ch is
+              ``self.vae.decoder.up_blocks[i].resnets[0].conv1.in_channels`` —
+              introspected so the code keeps working across VAE variants.
+        """
+        decoder = self.vae.decoder
+        tap_ch = PixelFeatureExtractor._TAP_CHANNELS  # {'s1':32,'s2':64,'s3':128}
+
+        for up_idx, tap_name in self._dfm_up_to_tap.items():
+            if up_idx >= len(decoder.up_blocks):
+                if local_rank == 0:
+                    print(f"[DFM][WARN] up_blocks[{up_idx}] does not exist; skipping")
+                continue
+            up_block = decoder.up_blocks[up_idx]
+            try:
+                dec_ch = up_block.resnets[0].conv1.in_channels
+            except AttributeError as e:
+                raise RuntimeError(
+                    f"[DFM] cannot infer decoder in_channels at up_blocks[{up_idx}]: {e}. "
+                    f"Update DFM introspection for this VAE variant."
+                )
+
+            adapter = DFMAdapter(feat_ch=tap_ch[tap_name], decoder_ch=dec_ch)
+            adapter = adapter.to(self.device).to(dtype)
+            # DFM adapters are the only thing bringing gradient into the
+            # otherwise-frozen VAE decoder path. Keep them in train mode.
+            adapter.train()
+            self.dfm_adapters[f'up{up_idx}'] = adapter
+            if local_rank == 0:
+                print(
+                    f"[DFM] up_blocks[{up_idx}] <- tap {tap_name}: "
+                    f"feat_ch={tap_ch[tap_name]} -> decoder_ch={dec_ch}"
+                )
+
+        if local_rank == 0:
+            n_params = sum(p.numel() for p in self.dfm_adapters.parameters())
+            print(f"[DFM] total adapter params: {n_params:,}")
+
+    def decode_with_dfm(self, lat, pixel_taps):
+        """Decode latent to image, injecting DFM modulation before each up_block.
+
+        Mirrors :meth:`decode` for the latent-space scaling convention:
+        ``lat`` is assumed to be in the same (scaled) space as ``self.encode``
+        returns. We un-scale, then replay
+        :func:`diffusers.models.autoencoders.vae.Decoder.forward` with DFM
+        adapters applied just before each up_block listed in
+        ``self._dfm_up_to_tap``.
+
+        Args:
+            lat:         (B, 16, H/8, W/8) latent in the *scaled* convention.
+            pixel_taps:  dict with keys 's1'/'s2'/'s3' from
+                         ``PixelFeatureExtractor(..., return_features=True)``.
+
+        Returns:
+            (B, 3, H, W) image in the VAE's output range.
+        """
+        if not self.use_dfm or len(self.dfm_adapters) == 0:
+            # Fallback: identical to self.decode(lat), but do it here so the
+            # caller can uniformly call decode_with_dfm whether or not DFM is
+            # enabled (makes eval-path branching simpler).
+            return self.decode(lat)
+
+        # --- un-scale (matches self.decode) ---
+        if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
+            z = (lat / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+        else:
+            z = lat / self.vae.config.scaling_factor
+        z = z.to(self.vae.dtype)
+
+        # --- replay Decoder.forward (diffusers>=0.30) with DFM hooks ---
+        dec = self.vae.decoder
+        # Use gradient checkpointing on up_blocks during training to keep the
+        # extra decoder forward memory-affordable (the VAE decoder on 512px HR
+        # holds ~1-2 GB of activations without ckpt). We do it manually here
+        # since ``vae.decoder.forward`` only turns on ckpt when both flags
+        # ``self.training and self.gradient_checkpointing`` are True, and the
+        # VAE is kept in eval() with frozen weights -- we don't want to flip
+        # those flags on the shared module.
+        use_ckpt = self.training and torch.is_grad_enabled()
+
+        sample = dec.conv_in(z)
+        # mid_block signature: (sample, latent_embeds=None)
+        if use_ckpt:
+            sample = torch.utils.checkpoint.checkpoint(
+                dec.mid_block, sample, None, use_reentrant=False,
+            )
+        else:
+            sample = dec.mid_block(sample, None)
+        upscale_dtype = next(iter(dec.up_blocks.parameters())).dtype
+        sample = sample.to(upscale_dtype)
+
+        for i, up_block in enumerate(dec.up_blocks):
+            tap_name = self._dfm_up_to_tap.get(i)
+            if tap_name is not None and f'up{i}' in self.dfm_adapters:
+                feat = pixel_taps.get(tap_name)
+                if feat is not None:
+                    sample = self.dfm_adapters[f'up{i}'](sample, feat)
+            if use_ckpt:
+                sample = torch.utils.checkpoint.checkpoint(
+                    up_block, sample, None, use_reentrant=False,
+                )
+            else:
+                sample = up_block(sample, None)
+
+        # post-process (latent_embeds is always None on FLUX VAE)
+        sample = dec.conv_norm_out(sample)
+        sample = dec.conv_act(sample)
+        sample = dec.conv_out(sample)
+        return sample
+
     def _pack(self, x):
         """Pack latent: [B, C, H, W] -> [B, H*W/4, C*4]"""
         B, C, H, W = x.shape
@@ -1015,23 +1267,35 @@ class DualStreamFLUXSR(nn.Module):
                 pass
         self.scheduler.set_timesteps(num_steps, device=device)
     
-    def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5, controlnet_scale=1.0):
+    def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5, controlnet_scale=1.0,
+                return_dfm_taps=False):
         """
         Forward pass: predict velocity
-        
+
         Args:
             noisy: 当前 noisy latent
             lr_lat: LR 图像的 latent
             lr_pixel: LR 图像的 pixel tensor
             timestep: 🌟 官方格式的 timestep（已经 / 1000）
             guidance: CFG guidance scale
+            return_dfm_taps: if True, also return the pixel-extractor multi-scale
+                taps dict (keys s1/s2/s3). Used by the DFM pixel-space loss to
+                avoid re-running the pixel extractor.
         """
         B, C, H, W = noisy.shape
         device = noisy.device
         dtype = torch.bfloat16
-        
-        # Pixel features
-        pixel_feat = self.pixel_extractor(lr_pixel)
+
+        # Pixel features -- collect multi-scale taps only when explicitly
+        # requested (training DFM loss path). In inference/validation we cache
+        # taps once in `inference()` to avoid per-step extractor overhead.
+        need_taps = bool(return_dfm_taps)
+        if need_taps:
+            pixel_feat, pixel_taps = self.pixel_extractor(lr_pixel, return_features=True)
+        else:
+            pixel_feat = self.pixel_extractor(lr_pixel)
+            pixel_taps = None
+
         if pixel_feat.shape[-2:] != lr_lat.shape[-2:]:
             pixel_feat = F.interpolate(
                 pixel_feat, size=lr_lat.shape[-2:], mode='bilinear', align_corners=False
@@ -1096,8 +1360,11 @@ class DualStreamFLUXSR(nn.Module):
             controlnet_single_block_samples=ctrl_out[1],
             return_dict=False,
         )[0]
-        
-        return self._unpack(out, H, W)
+
+        v_pred = self._unpack(out, H, W)
+        if return_dfm_taps:
+            return v_pred, pixel_taps
+        return v_pred
     
     @torch.no_grad()
     def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, strength=0.7):
@@ -1115,6 +1382,12 @@ class DualStreamFLUXSR(nn.Module):
         
         lr_lat = lr_lat.to(dtype)
         lr_pixel = lr_pixel.to(dtype)
+
+        # Cache taps once per sample for downstream decode_with_dfm().
+        if self.use_dfm:
+            _, self._last_pixel_taps = self.pixel_extractor(lr_pixel, return_features=True)
+        else:
+            self._last_pixel_taps = None
         
         # 设置 timesteps（dynamic shifting 时需要 mu）
         self._set_scheduler_timesteps(num_steps, device, lr_lat)
@@ -1230,8 +1503,15 @@ def compute_flow_matching_loss(
     
     # 🌟 传给模型的 timestep = sigma（因为官方是 timestep / 1000，而 timestep = sigma * 1000）
     # IMPORTANT: keep forward on wrapped `system` so DDP/DeepSpeed hooks remain active.
-    v_pred = system(noisy, lr_lat, lr_pixel, sigma, guidance)
-    
+    use_dfm = bool(getattr(unwrapped, 'use_dfm', False)) and hr_pixel is not None
+    if use_dfm:
+        v_pred, pixel_taps = system(
+            noisy, lr_lat, lr_pixel, sigma, guidance, return_dfm_taps=True
+        )
+    else:
+        v_pred = system(noisy, lr_lat, lr_pixel, sigma, guidance)
+        pixel_taps = None
+
     # Base FM loss
     loss = F.mse_loss(v_pred.float(), target_v.float())
 
@@ -1261,6 +1541,49 @@ def compute_flow_matching_loss(
         lpips_term = lpips_model(pred_lp, target_lp).mean().float()
         loss = loss + float(lpips_weight) * lpips_term
         del pred_hr_lat, pred_hr, pred_lp, target_lp, lpips_term
+
+    # --- DFM pixel-space loss (Phase 1.4) ---
+    # We decode z0_pred = noisy - sigma * v_pred through ``decode_with_dfm``
+    # and match the result to ``hr_pixel`` with L1 (+ optional LPIPS). This
+    # is the *only* path that routes gradient into self.dfm_adapters.
+    #
+    # Numerical guard:
+    #   - ``dfm_sigma_gate`` (default 0.0 = never gate) skips the pixel loss
+    #     when the batch-mean sigma is above the gate, because at very high
+    #     sigma the z0_pred estimate is dominated by noise and pixel-space
+    #     L1 is largely useless gradient.
+    if (
+        use_dfm
+        and unwrapped.dfm_pixel_weight > 0
+        and pixel_taps is not None
+    ):
+        sigma_mean_float = float(sigma.float().mean().item())
+        gate = float(getattr(unwrapped, 'dfm_sigma_gate', 0.0))
+        if gate <= 0.0 or sigma_mean_float <= gate:
+            # FM identity: noisy = (1-sigma)*z_hr + sigma*noise, v = noise - z_hr
+            # => z_hr = noisy - sigma * v  (algebraically exact)
+            z0_pred = noisy - sigma_expand * v_pred
+            pixel_pred = unwrapped.decode_with_dfm(z0_pred, pixel_taps)
+
+            pix_l1 = F.l1_loss(pixel_pred.float(), hr_pixel.float())
+            dfm_loss_term = pix_l1
+
+            if (
+                lpips_model is not None
+                and float(getattr(unwrapped, 'dfm_lpips_weight', 0.0)) > 0
+            ):
+                pp = pixel_pred.float().clamp(-1, 1)
+                tt = hr_pixel.float().clamp(-1, 1)
+                if lpips_resize is not None and lpips_resize > 0:
+                    size = (int(lpips_resize), int(lpips_resize))
+                    pp = F.interpolate(pp, size=size, mode='bilinear', align_corners=False)
+                    tt = F.interpolate(tt, size=size, mode='bilinear', align_corners=False)
+                dfm_loss_term = dfm_loss_term + float(unwrapped.dfm_lpips_weight) * \
+                    lpips_model(pp, tt).mean().float()
+                del pp, tt
+
+            loss = loss + float(unwrapped.dfm_pixel_weight) * dfm_loss_term
+            del z0_pred, pixel_pred, pix_l1, dfm_loss_term
 
     del target_v, noise, sigma_expand, noisy, v_pred
     return loss
@@ -1301,7 +1624,7 @@ def validate(system, accelerator, val_loader, device, num_samples=10,
         lr_lat = unwrapped.encode(lr)
         
         sr_lat = unwrapped.inference(lr_lat, lr, num_steps=num_steps, guidance=guidance, strength=strength)
-        sr = unwrapped.decode(sr_lat)
+        sr = unwrapped.decode_with_dfm(sr_lat, getattr(unwrapped, '_last_pixel_taps', None))
         
         psnr_list.append(calculate_psnr(sr.float(), hr.float()))
         if lpips_model is not None:
@@ -1446,7 +1769,20 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
         'fusion_type': 'concat',
         'controlnet': unwrapped.controlnet.state_dict(),
         'use_lora': unwrapped.use_lora,
+        'use_dfm': bool(getattr(unwrapped, 'use_dfm', False)),
     }
+    # DFM state + config (see Phase 1.5). We persist both so that resume can
+    # (a) reload adapter weights verbatim and (b) refuse to mix DFM-trained
+    # adapters into a run that declares --use_dfm=0.
+    if getattr(unwrapped, 'use_dfm', False):
+        payload['dfm_adapters'] = unwrapped.dfm_adapters.state_dict()
+        payload['dfm_config'] = {
+            'pixel_weight': unwrapped.dfm_pixel_weight,
+            'lpips_weight': unwrapped.dfm_lpips_weight,
+            'sigma_min': unwrapped.dfm_sigma_min,
+            'sigma_gate': unwrapped.dfm_sigma_gate,
+            'up_to_tap': dict(unwrapped._dfm_up_to_tap),
+        }
     if unwrapped.use_lora:
         lora_state = get_peft_model_state_dict(unwrapped.transformer)
         payload['lora_state_dict'] = {k: v.detach().cpu() for k, v in lora_state.items()}
@@ -1589,7 +1925,28 @@ def main():
                         help='PEFT init_lora_weights option')
     parser.add_argument('--dry_run_lora', action='store_true', default=False,
                         help='Initialize model + LoRA, print matched modules and exit')
-    
+
+    # DFM (Decoder-side Feature Modulation; see Phase 1 of improvement plan).
+    # DFM injects a SPADE-style affine transform into the VAE decoder using
+    # multi-scale taps from the PixelFeatureExtractor. Gradient only flows into
+    # the adapters via a pixel-space L1/LPIPS loss on z0_pred = noisy - sigma*v.
+    parser.add_argument('--use_dfm', action='store_true', default=False,
+                        help='Enable Decoder-side Feature Modulation (Phase 1). '
+                             'Registers DFM adapters before VAE decoder up_blocks[0..2].')
+    parser.add_argument('--dfm_pixel_weight', type=float, default=0.05,
+                        help='Weight on DFM pixel-space L1 loss (relative to FM MSE). '
+                             'Start at 0.05; too large can overwhelm the FM signal.')
+    parser.add_argument('--dfm_lpips_weight', type=float, default=0.0,
+                        help='Optional LPIPS term inside the DFM pixel loss (reuses '
+                             '--use_lpips model). 0 disables.')
+    parser.add_argument('--dfm_sigma_min', type=float, default=0.05,
+                        help='[Deprecated] kept for checkpoint compatibility; '
+                             'z0 reconstruction now always uses raw sampled sigma.')
+    parser.add_argument('--dfm_sigma_gate', type=float, default=0.0,
+                        help='If > 0, skip DFM pixel loss on batches whose mean sigma '
+                             'exceeds this gate (at high sigma z0_pred is mostly noise). '
+                             '0 = never gate.')
+
     # Checkpointing
     parser.add_argument('--save_dir', type=str, default='./checkpoints/dual_control')
     parser.add_argument('--save_interval', type=int, default=10)
@@ -1712,6 +2069,13 @@ def main():
         f"_bm{_fmt_tag(args.best_metric)}"
         f"_crop{args.num_crops}"
     )
+    if args.use_dfm:
+        exp_name += (
+            f"_dfm"
+            f"_dpw{_fmt_tag(args.dfm_pixel_weight)}"
+            f"_dlw{_fmt_tag(args.dfm_lpips_weight)}"
+            f"_dsg{_fmt_tag(args.dfm_sigma_gate)}"
+        )
     if args.use_lora:
         exp_name += (
             f"_lora"
@@ -1753,6 +2117,13 @@ def main():
         print(f"Validation: steps={args.val_num_steps}, samples={args.val_num_samples}, lpips={args.val_calc_lpips}")
         print(f"Best Metric: {args.best_metric}, Reset Best On Resume: {args.reset_best_on_resume}")
         print(f"Learning Rate: {args.lr} (Pixel branch: {args.lr * 10})")
+        if args.use_dfm:
+            print(
+                f"DFM: ON (pixel_w={args.dfm_pixel_weight}, "
+                f"lpips_w={args.dfm_lpips_weight}, sigma_gate={args.dfm_sigma_gate})"
+            )
+        else:
+            print("DFM: OFF")
         if args.use_lora:
             print(
                 f"LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}, "
@@ -1787,6 +2158,11 @@ def main():
         lora_dropout=args.lora_dropout,
         lora_target_regex=lora_target_regex,
         lora_init_weights=lora_init_weights,
+        use_dfm=args.use_dfm,
+        dfm_pixel_weight=args.dfm_pixel_weight,
+        dfm_lpips_weight=args.dfm_lpips_weight,
+        dfm_sigma_min=args.dfm_sigma_min,
+        dfm_sigma_gate=args.dfm_sigma_gate,
     )
     if args.dry_run_lora:
         if is_main:
@@ -2026,6 +2402,37 @@ def main():
         elif unwrapped.use_lora and not ckpt_uses_lora:
             if is_main:
                 print("[Resume] Current run uses LoRA but checkpoint has no LoRA state; LoRA stays at init.")
+
+        # --- DFM resume (Phase 1.5) ---
+        ckpt_uses_dfm = bool(ckpt.get('use_dfm', False)) and ('dfm_adapters' in ckpt)
+        if unwrapped.use_dfm and ckpt_uses_dfm:
+            ckpt_dfm_cfg = ckpt.get('dfm_config', {}) or {}
+            # Check that the up_block -> tap mapping matches; if the mapping
+            # changed, adapter keys won't line up and silent reload would give
+            # nonsense at the wrong VAE stage.
+            ckpt_map = dict(ckpt_dfm_cfg.get('up_to_tap', {}) or {})
+            # Coerce ckpt_map keys to int (json/pickle roundtrip may preserve int,
+            # but be defensive).
+            ckpt_map = {int(k): v for k, v in ckpt_map.items()}
+            if ckpt_map and ckpt_map != unwrapped._dfm_up_to_tap:
+                raise RuntimeError(
+                    f"[DFM][Resume] up_block->tap mapping changed: "
+                    f"ckpt={ckpt_map}, current={unwrapped._dfm_up_to_tap}"
+                )
+            try:
+                state = {k.replace('module.', ''): v for k, v in ckpt['dfm_adapters'].items()}
+                unwrapped.dfm_adapters.load_state_dict(state, strict=True)
+                if is_main:
+                    print(f"[Resume] Loaded DFM adapters: {len(state)} tensors, config={ckpt_dfm_cfg}")
+            except Exception as e:
+                raise RuntimeError(f"[DFM][Resume] failed to load dfm_adapters: {e}")
+        elif unwrapped.use_dfm and not ckpt_uses_dfm:
+            if is_main:
+                print("[Resume] Current run uses DFM but checkpoint has no DFM state; "
+                      "adapters stay at zero-init (safe identity).")
+        elif (not unwrapped.use_dfm) and ckpt_uses_dfm:
+            if is_main:
+                print("[Resume][WARN] Checkpoint has DFM state but --use_dfm=0; DFM state ignored.")
         # Optimizer / lr_scheduler restore policy for 2-stage workflows:
         # Stage 2 typically wants a fresh warmup + fresh cosine over the new
         # --epochs (different LR, different data, different duration). So by
@@ -2123,6 +2530,13 @@ def main():
             f.write(f"Empty Cache Steps: {args.empty_cache_steps}\n\n")
             f.write(f"Conditioning Scale: {args.conditioning_scale}\n")
             f.write(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]\n")
+            if args.use_dfm:
+                f.write(
+                    f"DFM: ON, pixel_w={args.dfm_pixel_weight}, "
+                    f"lpips_w={args.dfm_lpips_weight}, sigma_gate={args.dfm_sigma_gate}\n"
+                )
+            else:
+                f.write("DFM: OFF\n")
             if args.use_lora:
                 f.write(
                     f"LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}, "

@@ -94,9 +94,17 @@ LORA_TARGET_PRESETS = {
 # ============================================================================
 
 class PixelFeatureExtractor(nn.Module):
+    """Inference-time pixel feature extractor. Mirror of the training version
+    in ``train_dual_control.py`` so state_dicts load 1:1 and DFM taps can be
+    collected at the same encoder indices (s1=5, s2=11, s3=14).
+    """
+
+    _TAP_IDX = {'s1': 5, 's2': 11, 's3': 14}
+    _TAP_CHANNELS = {'s1': 32, 's2': 64, 's3': 128}
+
     def __init__(self, latent_channels=16):
         super().__init__()
-        
+
         self.encoder = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 32),
@@ -104,14 +112,14 @@ class PixelFeatureExtractor(nn.Module):
             nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
             nn.GroupNorm(8, 32),
             nn.SiLU(),
-            
+
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 64),
             nn.SiLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
             nn.GroupNorm(8, 64),
             nn.SiLU(),
-            
+
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 128),
             nn.SiLU(),
@@ -119,14 +127,52 @@ class PixelFeatureExtractor(nn.Module):
             nn.GroupNorm(4, latent_channels),
             nn.SiLU(),
         )
-        
+
         self.zero_conv = nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
         nn.init.zeros_(self.zero_conv.weight)
         nn.init.zeros_(self.zero_conv.bias)
-    
-    def forward(self, x):
-        feat = self.encoder(x)
-        return self.zero_conv(feat)
+
+    def forward(self, x, return_features=False):
+        if not return_features:
+            feat = self.encoder(x)
+            return self.zero_conv(feat)
+
+        taps = {}
+        idx_to_name = {v: k for k, v in self._TAP_IDX.items()}
+        h = x
+        for i, layer in enumerate(self.encoder):
+            h = layer(h)
+            if i in idx_to_name:
+                taps[idx_to_name[i]] = h
+        out = self.zero_conv(h)
+        return out, taps
+
+
+class DFMAdapter(nn.Module):
+    """Inference-time DFM adapter (mirror of train_dual_control.DFMAdapter)."""
+
+    def __init__(self, feat_ch: int, decoder_ch: int):
+        super().__init__()
+        self.align = nn.Conv2d(feat_ch, decoder_ch, kernel_size=3, padding=1)
+        self.to_scale = nn.Conv2d(decoder_ch, decoder_ch, kernel_size=1)
+        self.to_shift = nn.Conv2d(decoder_ch, decoder_ch, kernel_size=1)
+        # Matches train-side init. If we load from checkpoint these values are
+        # overwritten immediately.
+        nn.init.zeros_(self.to_scale.weight); nn.init.zeros_(self.to_scale.bias)
+        nn.init.zeros_(self.to_shift.weight); nn.init.zeros_(self.to_shift.bias)
+        nn.init.kaiming_normal_(self.align.weight, nonlinearity='relu')
+        nn.init.zeros_(self.align.bias)
+
+    def forward(self, decoder_feat: torch.Tensor, pixel_feat: torch.Tensor) -> torch.Tensor:
+        if pixel_feat.shape[-2:] != decoder_feat.shape[-2:]:
+            pixel_feat = F.interpolate(
+                pixel_feat, size=decoder_feat.shape[-2:],
+                mode='bilinear', align_corners=False,
+            )
+        if pixel_feat.dtype != decoder_feat.dtype:
+            pixel_feat = pixel_feat.to(decoder_feat.dtype)
+        h = F.silu(self.align(pixel_feat))
+        return decoder_feat * (1.0 + self.to_scale(h)) + self.to_shift(h)
 
 
 # ============================================================================
@@ -213,6 +259,11 @@ class DualStreamEvaluator(nn.Module):
         self.use_lora = False
         self.lora_config_ckpt = None
         self.lora_state_tensors = 0
+
+        # DFM state (filled in by .load() if checkpoint carries dfm_adapters)
+        self.use_dfm = False
+        self.dfm_adapters = nn.ModuleDict()
+        self._dfm_up_to_tap = {0: 's3', 1: 's2', 2: 's1'}
     
     def load(self):
         from diffusers import FluxTransformer2DModel, AutoencoderKL, FluxControlNetModel
@@ -339,6 +390,36 @@ class DualStreamEvaluator(nn.Module):
         else:
             print("[LoRA] inactive (checkpoint has no adapter)")
 
+        # --- DFM adapter load (Phase 1.5, eval side) ---
+        self.use_dfm = bool(ckpt.get('use_dfm', False)) and ('dfm_adapters' in ckpt)
+        if self.use_dfm:
+            dfm_cfg = ckpt.get('dfm_config', {}) or {}
+            ckpt_map = dict(dfm_cfg.get('up_to_tap', {}) or {})
+            ckpt_map = {int(k): v for k, v in ckpt_map.items()}
+            if ckpt_map:
+                self._dfm_up_to_tap = ckpt_map
+
+            decoder = self.vae.decoder
+            tap_ch = PixelFeatureExtractor._TAP_CHANNELS
+            self.dfm_adapters = nn.ModuleDict()
+            for up_idx, tap_name in self._dfm_up_to_tap.items():
+                if up_idx >= len(decoder.up_blocks):
+                    print(f"[DFM][WARN] up_blocks[{up_idx}] missing; skipping")
+                    continue
+                dec_ch = decoder.up_blocks[up_idx].resnets[0].conv1.in_channels
+                adapter = DFMAdapter(feat_ch=tap_ch[tap_name], decoder_ch=dec_ch)
+                self.dfm_adapters[f'up{up_idx}'] = adapter.to(self.device).to(dtype)
+
+            state = {k.replace('module.', ''): v for k, v in ckpt['dfm_adapters'].items()}
+            self.dfm_adapters.load_state_dict(state, strict=True)
+            self.dfm_adapters.eval()
+            self.dfm_adapters.requires_grad_(False)
+            n_params = sum(p.numel() for p in self.dfm_adapters.parameters())
+            print(f"[DFM] ACTIVE: loaded {len(state)} tensors ({n_params:,} params), "
+                  f"up_to_tap={self._dfm_up_to_tap}")
+        else:
+            print("[DFM] inactive (checkpoint has no adapters)")
+
     def _reset_pixel_fuse_proj_to_identity(self):
         """Identity-init lr_lat passthrough (first 16 in-channels); zero pixel branch."""
         if self.pixel_fuse_proj is None:
@@ -452,6 +533,39 @@ class DualStreamEvaluator(nn.Module):
         else:
             lat = lat / self.vae.config.scaling_factor
         return self.vae.decode(lat.to(self.vae.dtype)).sample
+
+    @torch.no_grad()
+    def decode_with_dfm(self, lat, pixel_taps):
+        """Decode latent with DFM injection (inference-time mirror of training
+        ``DualStreamFLUXSR.decode_with_dfm``). Falls back to :meth:`decode`
+        when DFM adapters are not loaded."""
+        if not self.use_dfm or len(self.dfm_adapters) == 0 or pixel_taps is None:
+            return self.decode(lat)
+
+        if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
+            z = (lat / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+        else:
+            z = lat / self.vae.config.scaling_factor
+        z = z.to(self.vae.dtype)
+
+        dec = self.vae.decoder
+        sample = dec.conv_in(z)
+        sample = dec.mid_block(sample, None)
+        upscale_dtype = next(iter(dec.up_blocks.parameters())).dtype
+        sample = sample.to(upscale_dtype)
+
+        for i, up_block in enumerate(dec.up_blocks):
+            tap_name = self._dfm_up_to_tap.get(i)
+            if tap_name is not None and f'up{i}' in self.dfm_adapters:
+                feat = pixel_taps.get(tap_name)
+                if feat is not None:
+                    sample = self.dfm_adapters[f'up{i}'](sample, feat)
+            sample = up_block(sample, None)
+
+        sample = dec.conv_norm_out(sample)
+        sample = dec.conv_act(sample)
+        sample = dec.conv_out(sample)
+        return sample
     
     def _pack(self, x):
         B, C, H, W = x.shape
@@ -593,13 +707,26 @@ class DualStreamEvaluator(nn.Module):
     
     @torch.no_grad()
     def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, strength=0.7):
-        """Inference using the official scheduler."""
+        """Inference using the official scheduler.
+
+        As a side effect, caches the pixel-extractor multi-scale taps on
+        ``self._last_pixel_taps`` so the caller can later do
+        ``decode_with_dfm(sr_lat, evaluator._last_pixel_taps)``.
+        Taps only depend on ``lr_pixel`` and are invariant across denoising
+        steps, so we compute them once up front.
+        """
         B = lr_lat.shape[0]
         device = lr_lat.device
         dtype = torch.bfloat16
-        
+
         lr_lat = lr_lat.to(dtype)
         lr_pixel = lr_pixel.to(dtype)
+
+        # Stash taps for downstream decode_with_dfm (harmless when DFM off).
+        if self.use_dfm:
+            _, self._last_pixel_taps = self.pixel_extractor(lr_pixel, return_features=True)
+        else:
+            self._last_pixel_taps = None
         
         # Set timesteps (dynamic shifting may require mu)
         self._set_scheduler_timesteps(num_steps, device, lr_lat)
@@ -658,9 +785,10 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
     
     if H <= tile_size and W <= tile_size:
         lr_lat = evaluator.encode(lr_t)
-        sr_lat = evaluator.inference(lr_lat, lr_t, num_steps=num_steps, 
+        sr_lat = evaluator.inference(lr_lat, lr_t, num_steps=num_steps,
                                      guidance=guidance, strength=strength)
-        result = evaluator.decode(sr_lat)
+        # decode_with_dfm auto-falls-back to decode() when DFM is off.
+        result = evaluator.decode_with_dfm(sr_lat, getattr(evaluator, '_last_pixel_taps', None))
         del lr_lat, sr_lat
         return result
     
@@ -733,9 +861,13 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
                     tile = padded
                 
                 tile_lat = evaluator.encode(tile)
-                sr_lat = evaluator.inference(tile_lat, tile, num_steps=num_steps, 
+                sr_lat = evaluator.inference(tile_lat, tile, num_steps=num_steps,
                                             guidance=guidance, strength=strength)
-                sr_tile = evaluator.decode(sr_lat)
+                # Each tile re-runs inference, which refreshes _last_pixel_taps
+                # on the evaluator. Safe to reuse here.
+                sr_tile = evaluator.decode_with_dfm(
+                    sr_lat, getattr(evaluator, '_last_pixel_taps', None)
+                )
                 sr_tile_cpu = sr_tile[:, :, :tile_h, :tile_w].float().cpu()
                 del tile_lat, sr_lat, sr_tile, tile
                 clear_memory(device)
@@ -808,6 +940,12 @@ def main():
     parser.add_argument('--pixel_weight', type=float, default=None)
     parser.add_argument('--strength', type=float, default=None,
                         help='Inference start strength (omit to use checkpoint value)')
+    parser.add_argument('--control_guidance_start', type=float, default=None,
+                        help='Override ControlNet guidance start ratio in [0,1]. '
+                             'Omit to use checkpoint value.')
+    parser.add_argument('--control_guidance_end', type=float, default=None,
+                        help='Override ControlNet guidance end ratio in [0,1]. '
+                             'Omit to use checkpoint value.')
     parser.add_argument('--tile_size', type=int, default=512,
                         help='Tile size for inference. Should match training resolution (512 by default) -- running at a different size shifts the FlowMatch dynamic_shifting sigma schedule and FLUX RoPE positions.')
     parser.add_argument('--min_tile_size', type=int, default=256)
@@ -829,6 +967,16 @@ def main():
     parser.add_argument('--device', type=str, default='cuda')
     
     args = parser.parse_args()
+    if args.control_guidance_start is not None and not (0.0 <= args.control_guidance_start <= 1.0):
+        parser.error("--control_guidance_start must be within [0, 1]")
+    if args.control_guidance_end is not None and not (0.0 <= args.control_guidance_end <= 1.0):
+        parser.error("--control_guidance_end must be within [0, 1]")
+    if (
+        args.control_guidance_start is not None
+        and args.control_guidance_end is not None
+        and args.control_guidance_start > args.control_guidance_end
+    ):
+        parser.error("--control_guidance_start must be <= --control_guidance_end")
     
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     
@@ -855,9 +1003,16 @@ def main():
         evaluator.pixel_weight = args.pixel_weight
     
     strength = args.strength if args.strength is not None else evaluator.strength
-    # SR default: keep ControlNet active through the whole denoising process.
-    control_guidance_start = 0.0
-    control_guidance_end = 1.0
+    control_guidance_start = (
+        args.control_guidance_start
+        if args.control_guidance_start is not None
+        else evaluator.control_guidance_start
+    )
+    control_guidance_end = (
+        args.control_guidance_end
+        if args.control_guidance_end is not None
+        else evaluator.control_guidance_end
+    )
     evaluator.control_guidance_start = control_guidance_start
     evaluator.control_guidance_end = control_guidance_end
     
@@ -879,6 +1034,8 @@ def main():
             f"_step{args.num_steps}"
             f"_g{_fmt_tag(args.guidance)}"
             f"_pw{_fmt_tag(evaluator.pixel_weight)}"
+            f"_cgs{_fmt_tag(control_guidance_start)}"
+            f"_cge{_fmt_tag(control_guidance_end)}"
             f"_{fusion_tag}"
             f"_fus{fusion_source_tag}"
             f"_trlpw{_fmt_tag(evaluator.train_lpips_weight)}"
@@ -910,6 +1067,7 @@ def main():
     print(f"Pixel Weight: {evaluator.pixel_weight}")
     print(f"Train LPIPS: weight={evaluator.train_lpips_weight}, prob={evaluator.train_lpips_apply_prob}")
     print(f"Steps: {args.num_steps}, Guidance: {args.guidance}")
+    print(f"DFM: {'ACTIVE' if evaluator.use_dfm else 'inactive'}")
     if evaluator.use_lora:
         cfg = evaluator.lora_config_ckpt or {}
         print(

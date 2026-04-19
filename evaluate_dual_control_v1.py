@@ -5,6 +5,8 @@ Dual-Stream FLUX SR Evaluation - aligned with official Diffusers pipeline
 ======================================================================
 
 Companion script for train_dual_control.py
+Automatically detects and loads LoRA adapters when checkpoint contains
+`use_lora=True` and `lora_state_dict`.
 
 Usage:
     python evaluate_dual_control.py \
@@ -16,6 +18,7 @@ Usage:
 
 import os
 import gc
+import math
 import argparse
 import numpy as np
 from PIL import Image
@@ -34,6 +37,56 @@ try:
 except ImportError:
     LPIPS_AVAILABLE = False
     print("Note: lpips not installed. Run: pip install lpips")
+
+try:
+    from skimage.metrics import structural_similarity as sk_ssim
+    SKIMAGE_AVAILABLE = True
+except ImportError:
+    sk_ssim = None
+    SKIMAGE_AVAILABLE = False
+    print("Note: scikit-image not installed; falling back to global SSIM. Run: pip install scikit-image")
+
+# PEFT is optional; only required when checkpoint contains a LoRA adapter.
+try:
+    from peft import LoraConfig, get_peft_model
+    from peft.utils import set_peft_model_state_dict
+    PEFT_AVAILABLE = True
+except ImportError:
+    LoraConfig = None
+    get_peft_model = None
+    set_peft_model_state_dict = None
+    PEFT_AVAILABLE = False
+
+
+# ============================================================================
+# LoRA target module presets
+# ============================================================================
+
+LORA_TARGET_REGEX_OMINICONTROL = (
+    r"(.*(?<!single_)transformer_blocks\.[0-9]+\.norm1\.linear"
+    r"|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_k"
+    r"|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_q"
+    r"|.*single_transformer_blocks\.[0-9]+\.norm\.linear"
+    r"|.*single_transformer_blocks\.[0-9]+\.attn\.to_k"
+    r"|.*single_transformer_blocks\.[0-9]+\.attn\.to_q)"
+)
+LORA_TARGET_REGEX_ATTN_QKVO = (
+    r"(.*(?<!single_)transformer_blocks\.[0-9]+\.norm1\.linear"
+    r"|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.(to_q|to_k|to_v|to_out\.0)"
+    r"|.*single_transformer_blocks\.[0-9]+\.norm\.linear"
+    r"|.*single_transformer_blocks\.[0-9]+\.attn\.(to_q|to_k|to_v))"
+)
+LORA_TARGET_REGEX_QK_ONLY = (
+    r"(.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_k"
+    r"|.*(?<!single_)transformer_blocks\.[0-9]+\.attn\.to_q"
+    r"|.*single_transformer_blocks\.[0-9]+\.attn\.to_k"
+    r"|.*single_transformer_blocks\.[0-9]+\.attn\.to_q)"
+)
+LORA_TARGET_PRESETS = {
+    'ominicontrol': LORA_TARGET_REGEX_OMINICONTROL,
+    'attn_qkvo': LORA_TARGET_REGEX_ATTN_QKVO,
+    'qk_only': LORA_TARGET_REGEX_QK_ONLY,
+}
 
 
 # ============================================================================
@@ -88,16 +141,41 @@ def calculate_psnr(img1, img2):
 
 
 def calculate_ssim(img1, img2):
-    C1 = (0.01 * 255) ** 2
-    C2 = (0.03 * 255) ** 2
-    img1 = img1.astype(np.float64)
-    img2 = img2.astype(np.float64)
-    mu1, mu2 = img1.mean(), img2.mean()
-    sigma1_sq, sigma2_sq = img1.var(), img2.var()
-    sigma12 = ((img1 - mu1) * (img2 - mu2)).mean()
-    ssim = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / \
-           ((mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2))
-    return ssim
+    """SSIM on uint8 RGB images. Prefers scikit-image's 11x11 sliding-window
+    implementation (standard in SR benchmarks); falls back to a single-window
+    global SSIM only if skimage is unavailable."""
+    def _global_ssim():
+        C1 = (0.01 * 255) ** 2
+        C2 = (0.03 * 255) ** 2
+        x = img1.astype(np.float64)
+        y = img2.astype(np.float64)
+        mu1, mu2 = x.mean(), y.mean()
+        sigma1_sq, sigma2_sq = x.var(), y.var()
+        sigma12 = ((x - mu1) * (y - mu2)).mean()
+        ssim_val = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / \
+                   ((mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2))
+        return float(ssim_val)
+
+    if SKIMAGE_AVAILABLE:
+        min_side = min(img1.shape[0], img1.shape[1])
+        if min_side < 3:
+            return _global_ssim()
+        win_size = min(11, int(min_side))
+        if win_size % 2 == 0:
+            win_size -= 1
+        if win_size < 3:
+            return _global_ssim()
+        # channel_axis API differs between skimage versions; try both.
+        try:
+            return float(sk_ssim(img1, img2, data_range=255, channel_axis=-1, win_size=win_size))
+        except TypeError:
+            try:
+                return float(sk_ssim(img1, img2, data_range=255, multichannel=True, win_size=win_size))
+            except ValueError:
+                return _global_ssim()
+        except ValueError:
+            return _global_ssim()
+    return _global_ssim()
 
 def clear_memory(device):
     """Aggressively clear Python/CUDA memory."""
@@ -123,8 +201,7 @@ class DualStreamEvaluator(nn.Module):
         self.controlnet = None
         self.pixel_extractor = None
         self.pixel_fuse_proj = None
-        self.pixel_gate_logit = None
-        self.use_gated_fusion = False
+        self.fusion_source = 'identity'  # 'concat' | 'migrated' | 'identity'
         self.scheduler = None
         self._cached_embeds = None
         self.strength = 0.7
@@ -133,6 +210,9 @@ class DualStreamEvaluator(nn.Module):
         self.conditioning_scale = 1.0
         self.train_lpips_weight = 0.0
         self.train_lpips_apply_prob = 0.0
+        self.use_lora = False
+        self.lora_config_ckpt = None
+        self.lora_state_tensors = 0
     
     def load(self):
         from diffusers import FluxTransformer2DModel, AutoencoderKL, FluxControlNetModel
@@ -176,11 +256,11 @@ class DualStreamEvaluator(nn.Module):
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         self.pixel_extractor.requires_grad_(False)
         self.pixel_extractor.eval()
-        self.pixel_fuse_proj = nn.Conv2d(16, 16, kernel_size=1).to(self.device).to(dtype)
+        # Concat-based fusion: [lr_lat || pixel_feat] (32ch) -> 16ch.
+        self.pixel_fuse_proj = nn.Conv2d(32, 16, kernel_size=1).to(self.device).to(dtype)
         self._reset_pixel_fuse_proj_to_identity()
         self.pixel_fuse_proj.requires_grad_(False)
         self.pixel_fuse_proj.eval()
-        self.pixel_gate_logit = nn.Parameter(torch.tensor(-1.0, device=self.device), requires_grad=False)
 
         print("Loading checkpoint...")
         ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
@@ -193,18 +273,7 @@ class DualStreamEvaluator(nn.Module):
             state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
             self.controlnet.load_state_dict(state)
 
-        if 'pixel_fuse_proj' in ckpt and 'pixel_gate_logit' in ckpt:
-            state = {k.replace('module.', ''): v for k, v in ckpt['pixel_fuse_proj'].items()}
-            self.pixel_fuse_proj.load_state_dict(state)
-            gate = ckpt['pixel_gate_logit']
-            if isinstance(gate, torch.Tensor):
-                gate = gate.to(device=self.pixel_gate_logit.device, dtype=self.pixel_gate_logit.dtype)
-                self.pixel_gate_logit.data.copy_(gate)
-            else:
-                self.pixel_gate_logit.data.fill_(float(gate))
-            self.use_gated_fusion = True
-        else:
-            self.use_gated_fusion = False
+        self._load_pixel_fuse_proj_with_migration(ckpt)
 
         if 'pixel_weight' in ckpt:
             self.pixel_weight = ckpt['pixel_weight']
@@ -217,11 +286,7 @@ class DualStreamEvaluator(nn.Module):
 
         print(f"Checkpoint: epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', 0):.2f}")
         print(f"Pixel Weight: {self.pixel_weight}, Strength: {self.strength}")
-        if self.use_gated_fusion:
-            gate_val = torch.sigmoid(self.pixel_gate_logit).item()
-            print(f"Pixel Fusion: gated (gate={gate_val:.4f})")
-        else:
-            print("Pixel Fusion: legacy direct-add (old checkpoint format)")
+        print(f"Pixel Fusion: concat+1x1 conv (source={self.fusion_source})")
         print(f"Train LPIPS: weight={self.train_lpips_weight}, prob={self.train_lpips_apply_prob}")
         print(f"Conditioning Scale: {self.conditioning_scale}")
         print(f"Control Guidance Window: [{self.control_guidance_start}, {self.control_guidance_end}]")
@@ -232,15 +297,115 @@ class DualStreamEvaluator(nn.Module):
         except:
             pass
 
+        self.use_lora = bool(ckpt.get('use_lora', False)) and ('lora_state_dict' in ckpt)
+        if self.use_lora:
+            if not PEFT_AVAILABLE:
+                raise ImportError(
+                    "[LoRA] Checkpoint contains a LoRA adapter but `peft` is not installed. "
+                    "Install with: pip install peft>=0.10"
+                )
+            self.lora_config_ckpt = ckpt.get('lora_config') or {}
+            ckpt_rank = int(self.lora_config_ckpt.get('rank', 16))
+            ckpt_alpha = int(self.lora_config_ckpt.get('alpha', ckpt_rank))
+            ckpt_regex = self.lora_config_ckpt.get('target_regex')
+            ckpt_preset = self.lora_config_ckpt.get('target_preset')
+            ckpt_init = self.lora_config_ckpt.get('init_weights', 'gaussian')
+            if ckpt_init in ('true', 'false'):
+                ckpt_init = (ckpt_init == 'true')
+            if not ckpt_regex and ckpt_preset in LORA_TARGET_PRESETS:
+                ckpt_regex = LORA_TARGET_PRESETS[ckpt_preset]
+            elif not ckpt_regex:
+                ckpt_regex = LORA_TARGET_REGEX_OMINICONTROL
+
+            lora_cfg = LoraConfig(
+                r=ckpt_rank,
+                lora_alpha=ckpt_alpha,
+                target_modules=ckpt_regex,
+                lora_dropout=0.0,
+                bias="none",
+                init_lora_weights=ckpt_init,
+            )
+            self.transformer = get_peft_model(self.transformer, lora_cfg)
+            self.transformer.eval()
+            self.transformer.requires_grad_(False)
+
+            lora_state = {k: v.to(self.device) for k, v in ckpt['lora_state_dict'].items()}
+            set_peft_model_state_dict(self.transformer, lora_state)
+            self.lora_state_tensors = len(lora_state)
+            print(
+                f"[LoRA] ACTIVE: loaded {self.lora_state_tensors} tensors "
+                f"(rank={ckpt_rank}, alpha={ckpt_alpha}, preset={ckpt_preset})"
+            )
+        else:
+            print("[LoRA] inactive (checkpoint has no adapter)")
+
     def _reset_pixel_fuse_proj_to_identity(self):
+        """Identity-init lr_lat passthrough (first 16 in-channels); zero pixel branch."""
         if self.pixel_fuse_proj is None:
             return
         with torch.no_grad():
             self.pixel_fuse_proj.weight.zero_()
             self.pixel_fuse_proj.bias.zero_()
-            channels = min(self.pixel_fuse_proj.out_channels, self.pixel_fuse_proj.in_channels)
-            idx = torch.arange(channels, device=self.pixel_fuse_proj.weight.device)
+            out_ch = self.pixel_fuse_proj.out_channels
+            in_ch = self.pixel_fuse_proj.in_channels
+            passthrough = min(out_ch, in_ch // 2 if in_ch >= 2 * out_ch else in_ch)
+            idx = torch.arange(passthrough, device=self.pixel_fuse_proj.weight.device)
             self.pixel_fuse_proj.weight[idx, idx, 0, 0] = 1.0
+
+    def _load_pixel_fuse_proj_with_migration(self, ckpt):
+        """Load pixel_fuse_proj from ckpt; migrate legacy gated-fusion format if needed."""
+        if 'pixel_fuse_proj' not in ckpt:
+            self.fusion_source = 'identity'
+            print("[Eval] pixel_fuse_proj missing in checkpoint; using identity init.")
+            return
+
+        state = {k.replace('module.', ''): v for k, v in ckpt['pixel_fuse_proj'].items()}
+        target = self.pixel_fuse_proj
+        target_w = target.weight
+        src_w = state.get('weight')
+        src_b = state.get('bias')
+
+        is_legacy = (
+            src_w is not None
+            and src_w.shape == (16, 16, 1, 1)
+            and target_w.shape == (16, 32, 1, 1)
+        )
+
+        if not is_legacy and src_w is not None and src_w.shape == target_w.shape:
+            target.load_state_dict(state)
+            self.fusion_source = ckpt.get('fusion_type', 'concat')
+            return
+
+        if is_legacy:
+            gate_raw = ckpt.get('pixel_gate_logit', None)
+            if gate_raw is None:
+                gate_sig = 1.0
+            else:
+                if isinstance(gate_raw, torch.Tensor):
+                    gate_val = float(gate_raw.detach().float().item())
+                else:
+                    gate_val = float(gate_raw)
+                gate_sig = 1.0 / (1.0 + math.exp(-gate_val))
+            with torch.no_grad():
+                target.weight.zero_()
+                target.bias.zero_()
+                idx = torch.arange(16, device=target_w.device)
+                target.weight[idx, idx, 0, 0] = 1.0
+                legacy_w = src_w.to(device=target_w.device, dtype=target_w.dtype) * gate_sig
+                target.weight[:, 16:32, :, :].copy_(legacy_w)
+                if src_b is not None:
+                    legacy_b = src_b.to(device=target.bias.device, dtype=target.bias.dtype) * gate_sig
+                    target.bias.copy_(legacy_b)
+            self.fusion_source = f'migrated(gate={gate_sig:.3f})'
+            print(f"[Eval] Legacy gated-fusion checkpoint migrated to concat layout (sigmoid(gate)={gate_sig:.4f}).")
+            return
+
+        self.fusion_source = 'identity'
+        print(
+            f"[Eval][WARN] pixel_fuse_proj shape mismatch: "
+            f"ckpt={tuple(src_w.shape) if src_w is not None else None}, "
+            f"model={tuple(target_w.shape)}. Using identity init."
+        )
     
     def _cache_text_embeddings(self):
         from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
@@ -298,6 +463,16 @@ class DualStreamEvaluator(nn.Module):
         C = D // 4
         x = x.view(B, H // 2, W // 2, C, 2, 2).permute(0, 3, 1, 4, 2, 5)
         return x.reshape(B, C, H, W)
+
+    @staticmethod
+    def _pad_to_even_hw(x):
+        """Pad feature map to even H/W for FLUX pack/unpack."""
+        _, _, h, w = x.shape
+        pad_h = h % 2
+        pad_w = w % 2
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='replicate')
+        return x, pad_h, pad_w
     
     def _img_ids(self, H, W, device, dtype):
         h, w = H // 2, W // 2
@@ -350,18 +525,21 @@ class DualStreamEvaluator(nn.Module):
                 pixel_feat, size=lr_lat.shape[-2:], mode='bilinear', align_corners=False
             )
 
-        if self.use_gated_fusion:
-            pixel_feat = self.pixel_fuse_proj(pixel_feat.to(dtype))
-            pixel_gate = torch.sigmoid(self.pixel_gate_logit).to(dtype)
-            fused_cond = (lr_lat + self.pixel_weight * pixel_gate * pixel_feat).to(dtype)
-        else:
-            fused_cond = (lr_lat + self.pixel_weight * pixel_feat).to(dtype)
+        # Concat fusion: [lr_lat || pixel_weight*pixel_feat] -> 1x1 conv -> 16ch.
+        fused_cond = self.pixel_fuse_proj(
+            torch.cat([lr_lat.to(dtype), (self.pixel_weight * pixel_feat).to(dtype)], dim=1)
+        ).to(dtype)
         del pixel_feat
+
+        # FLUX pack() requires even latent H/W. RealSR can produce odd latent sizes.
+        noisy_for_pack, pad_h, pad_w = self._pad_to_even_hw(noisy.to(dtype))
+        fused_for_pack, _, _ = self._pad_to_even_hw(fused_cond)
+        H_pack, W_pack = noisy_for_pack.shape[-2:]
         
-        noisy_packed = self._pack(noisy.to(dtype))
-        fused_packed = self._pack(fused_cond)
+        noisy_packed = self._pack(noisy_for_pack)
+        fused_packed = self._pack(fused_for_pack)
         del fused_cond
-        img_ids = self._img_ids(H, W, device, dtype)
+        img_ids = self._img_ids(H_pack, W_pack, device, dtype)
         
         pooled = self._cached_embeds['pooled'].expand(B, -1)
         prompt = self._cached_embeds['prompt'].expand(B, -1, -1)
@@ -407,8 +585,11 @@ class DualStreamEvaluator(nn.Module):
             return_dict=False,
         )[0]
         del ctrl_out, noisy_packed, img_ids
-        
-        return self._unpack(out, H, W)
+
+        unpacked = self._unpack(out, H_pack, W_pack)
+        if pad_h or pad_w:
+            unpacked = unpacked[:, :, :H, :W]
+        return unpacked
     
     @torch.no_grad()
     def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, strength=0.7):
@@ -472,7 +653,7 @@ class DualStreamEvaluator(nn.Module):
 
 @torch.no_grad()
 def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
-                 tile_size=512, overlap=64, blend_mode='linear', strength=0.7):
+                 tile_size=640, overlap=64, strength=0.7):
     _, _, H, W = lr_t.shape
     
     if H <= tile_size and W <= tile_size:
@@ -506,14 +687,35 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
             x_positions.append(W - tile_size)
     
     total_tiles = len(y_positions) * len(x_positions)
-    full_blend = torch.ones((1, 1, tile_size, tile_size), dtype=torch.float32)
-    if blend_mode == 'linear':
-        for i in range(min(overlap, tile_size // 2)):
-            factor = i / overlap
-            full_blend[:, :, i, :] *= factor
-            full_blend[:, :, -i-1, :] *= factor
-            full_blend[:, :, :, i] *= factor
-            full_blend[:, :, :, -i-1] *= factor
+
+    def build_tile_blend(tile_h, tile_w, y, y_end, x, x_end):
+        """
+        Boundary-aware linear blending:
+        - Only taper sides that overlap with neighboring tiles.
+        - Keep image outer borders untapered to avoid dark/gray frame artifacts.
+        """
+        blend = torch.ones((1, 1, tile_h, tile_w), dtype=torch.float32)
+        if overlap <= 0:
+            return blend
+
+        if y > 0:
+            n = min(overlap, tile_h)
+            ramp = torch.linspace(1.0 / (n + 1), n / (n + 1), n, dtype=torch.float32)
+            blend[:, :, :n, :] *= ramp.view(1, 1, n, 1)
+        if y_end < H:
+            n = min(overlap, tile_h)
+            ramp = torch.linspace(n / (n + 1), 1.0 / (n + 1), n, dtype=torch.float32)
+            blend[:, :, -n:, :] *= ramp.view(1, 1, n, 1)
+        if x > 0:
+            n = min(overlap, tile_w)
+            ramp = torch.linspace(1.0 / (n + 1), n / (n + 1), n, dtype=torch.float32)
+            blend[:, :, :, :n] *= ramp.view(1, 1, 1, n)
+        if x_end < W:
+            n = min(overlap, tile_w)
+            ramp = torch.linspace(n / (n + 1), 1.0 / (n + 1), n, dtype=torch.float32)
+            blend[:, :, :, -n:] *= ramp.view(1, 1, 1, n)
+
+        return blend
     
     with tqdm(total=total_tiles, desc="Tiled SR", leave=False) as pbar:
         for y in y_positions:
@@ -538,10 +740,7 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
                 del tile_lat, sr_lat, sr_tile, tile
                 clear_memory(device)
                 
-                if tile_h == tile_size and tile_w == tile_size:
-                    tile_blend = full_blend
-                else:
-                    tile_blend = torch.ones((1, 1, tile_h, tile_w), dtype=torch.float32)
+                tile_blend = build_tile_blend(tile_h, tile_w, y, y_end, x, x_end)
                 
                 out[:, :, y:y_end, x:x_end] += sr_tile_cpu * tile_blend
                 weight[:, :, y:y_end, x:x_end] += tile_blend
@@ -555,7 +754,7 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
 @torch.no_grad()
 def run_sr_tiled_with_oom_retry(
     evaluator, lr_t, device, num_steps=20, guidance=3.5,
-    tile_size=512, overlap=64, blend_mode='linear', strength=0.7,
+    tile_size=640, overlap=64, strength=0.7,
     min_tile_size=256
 ):
     """
@@ -571,7 +770,7 @@ def run_sr_tiled_with_oom_retry(
             return run_sr_tiled(
                 evaluator, lr_t, device, num_steps=num_steps, guidance=guidance,
                 tile_size=current_tile, overlap=min(overlap, max(0, current_tile // 4)),
-                blend_mode=blend_mode, strength=strength
+                strength=strength
             )
         except Exception as e:
             is_oom = isinstance(e, torch.OutOfMemoryError)
@@ -609,13 +808,10 @@ def main():
     parser.add_argument('--pixel_weight', type=float, default=None)
     parser.add_argument('--strength', type=float, default=None,
                         help='Inference start strength (omit to use checkpoint value)')
-    parser.add_argument('--control_guidance_start', type=float, default=None)
-    parser.add_argument('--control_guidance_end', type=float, default=None)
-    
-    parser.add_argument('--tile_size', type=int, default=512)
+    parser.add_argument('--tile_size', type=int, default=512,
+                        help='Tile size for inference. Should match training resolution (512 by default) -- running at a different size shifts the FlowMatch dynamic_shifting sigma schedule and FLUX RoPE positions.')
     parser.add_argument('--min_tile_size', type=int, default=256)
     parser.add_argument('--overlap', type=int, default=64)
-    parser.add_argument('--blend_mode', type=str, default='linear')
     parser.add_argument('--calc_lpips', dest='calc_lpips', action='store_true',
                         help='Enable LPIPS calculation (default: enabled if lpips package is available)')
     parser.add_argument('--no_calc_lpips', dest='calc_lpips', action='store_false',
@@ -626,8 +822,10 @@ def main():
     parser.add_argument('--output_base', type=str, default='./outputs')
     parser.add_argument('--dataset', type=str, default=None)
     parser.add_argument('--exp_name', type=str, default=None)
-    parser.add_argument('--save_images', action='store_true', default=True)
-    parser.add_argument('--save_comparisons', action='store_true', default=True)
+    parser.add_argument('--save_images', dest='save_images', action='store_true', default=True)
+    parser.add_argument('--no_save_images', dest='save_images', action='store_false')
+    parser.add_argument('--save_comparisons', dest='save_comparisons', action='store_true', default=True)
+    parser.add_argument('--no_save_comparisons', dest='save_comparisons', action='store_false')
     parser.add_argument('--device', type=str, default='cuda')
     
     args = parser.parse_args()
@@ -657,16 +855,9 @@ def main():
         evaluator.pixel_weight = args.pixel_weight
     
     strength = args.strength if args.strength is not None else evaluator.strength
-    control_guidance_start = (
-        args.control_guidance_start
-        if args.control_guidance_start is not None
-        else evaluator.control_guidance_start
-    )
-    control_guidance_end = (
-        args.control_guidance_end
-        if args.control_guidance_end is not None
-        else evaluator.control_guidance_end
-    )
+    # SR default: keep ControlNet active through the whole denoising process.
+    control_guidance_start = 0.0
+    control_guidance_end = 1.0
     evaluator.control_guidance_start = control_guidance_start
     evaluator.control_guidance_end = control_guidance_end
     
@@ -680,8 +871,8 @@ def main():
     if args.exp_name:
         exp_name = args.exp_name
     else:
-        fusion_tag = "gated" if evaluator.use_gated_fusion else "legacy"
-        gate_val = float(torch.sigmoid(evaluator.pixel_gate_logit).item()) if evaluator.use_gated_fusion else 1.0
+        fusion_tag = "concat"
+        fusion_source_tag = str(evaluator.fusion_source).replace("(", "").replace(")", "").replace(" ", "_")
         exp_name = (
             f"{ts}"
             f"_str{_fmt_tag(strength)}"
@@ -689,11 +880,20 @@ def main():
             f"_g{_fmt_tag(args.guidance)}"
             f"_pw{_fmt_tag(evaluator.pixel_weight)}"
             f"_{fusion_tag}"
-            f"_gate{_fmt_tag(gate_val)}"
+            f"_fus{fusion_source_tag}"
             f"_trlpw{_fmt_tag(evaluator.train_lpips_weight)}"
         )
+        if evaluator.use_lora:
+            cfg = evaluator.lora_config_ckpt or {}
+            exp_name += (
+                f"_lora"
+                f"_r{cfg.get('rank', '?')}"
+                f"_a{cfg.get('alpha', '?')}"
+                f"_tp{cfg.get('target_preset', '?')}"
+            )
     
-    output_dir = os.path.join(args.output_base, args.dataset, 'DualControl', exp_name)
+    method_tag = 'DualLoRA' if evaluator.use_lora else 'DualControl'
+    output_dir = os.path.join(args.output_base, args.dataset, method_tag, exp_name)
     os.makedirs(output_dir, exist_ok=True)
     if args.save_images:
         os.makedirs(os.path.join(output_dir, 'predictions'), exist_ok=True)
@@ -710,6 +910,15 @@ def main():
     print(f"Pixel Weight: {evaluator.pixel_weight}")
     print(f"Train LPIPS: weight={evaluator.train_lpips_weight}, prob={evaluator.train_lpips_apply_prob}")
     print(f"Steps: {args.num_steps}, Guidance: {args.guidance}")
+    if evaluator.use_lora:
+        cfg = evaluator.lora_config_ckpt or {}
+        print(
+            f"LoRA: ACTIVE (tensors={evaluator.lora_state_tensors}, "
+            f"rank={cfg.get('rank', '?')}, alpha={cfg.get('alpha', '?')}, "
+            f"preset={cfg.get('target_preset', '?')})"
+        )
+    else:
+        print("LoRA: inactive")
     print(f"Output: {output_dir}")
     print("=" * 70)
     
@@ -773,7 +982,6 @@ def main():
             tile_size=args.tile_size,
             min_tile_size=args.min_tile_size,
             overlap=args.overlap,
-            blend_mode=args.blend_mode,
             strength=strength
         )
         
@@ -830,10 +1038,7 @@ def main():
     print("=" * 70)
     print(f"Strength: {strength}")
     print(f"Pixel Weight: {evaluator.pixel_weight}")
-    if evaluator.use_gated_fusion:
-        print(f"Pixel Fusion: gated (gate={torch.sigmoid(evaluator.pixel_gate_logit).item():.4f})")
-    else:
-        print("Pixel Fusion: legacy direct-add")
+    print(f"Pixel Fusion: concat+1x1 conv (source={evaluator.fusion_source})")
     if lpips_fn:
         print(f"Bicubic:  PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}")
         print(f"SR:       PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
@@ -854,13 +1059,19 @@ def main():
         f.write(f"Pixel Weight: {evaluator.pixel_weight}\n")
         f.write(f"Train LPIPS Weight: {evaluator.train_lpips_weight}\n")
         f.write(f"Train LPIPS Apply Prob: {evaluator.train_lpips_apply_prob}\n")
-        if evaluator.use_gated_fusion:
-            f.write(f"Pixel Fusion: gated (gate={torch.sigmoid(evaluator.pixel_gate_logit).item():.6f})\n")
-        else:
-            f.write("Pixel Fusion: legacy direct-add\n")
+        f.write(f"Pixel Fusion: concat+1x1 conv (source={evaluator.fusion_source})\n")
         f.write(f"Dataset: {args.dataset}\n")
         f.write(f"Images: {len(psnr_list)}\n")
         f.write(f"Steps: {args.num_steps}, Guidance: {args.guidance}\n")
+        if evaluator.use_lora:
+            cfg = evaluator.lora_config_ckpt or {}
+            f.write(
+                f"LoRA: ACTIVE (tensors={evaluator.lora_state_tensors}, "
+                f"rank={cfg.get('rank', '?')}, alpha={cfg.get('alpha', '?')}, "
+                f"preset={cfg.get('target_preset', '?')})\n"
+            )
+        else:
+            f.write("LoRA: inactive\n")
         f.write("\n" + "=" * 60 + "\n")
         f.write("Summary:\n")
         if lpips_fn:
