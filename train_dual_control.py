@@ -1807,25 +1807,6 @@ def main():
                 print(f"  ... ({len(wrapped) - 200} more)")
         raise SystemExit(0)
 
-    if args.dry_run_lora:
-        if is_main:
-            wrapped = []
-            for n, m in system.transformer.named_modules():
-                if hasattr(m, 'lora_A'):
-                    try:
-                        if len(m.lora_A) > 0:
-                            wrapped.append(n)
-                    except TypeError:
-                        wrapped.append(n)
-            print("\n[dry_run_lora] LoRA regex diagnostic")
-            print(f"Target preset: {args.lora_target_preset}")
-            print(f"Wrapped modules: {len(wrapped)}")
-            for n in wrapped[:200]:
-                print(f"  {n}")
-            if len(wrapped) > 200:
-                print(f"  ... ({len(wrapped) - 200} more)")
-        raise SystemExit(0)
-
     lpips_model = None
     if args.lpips_weight > 0:
         if not LPIPS_AVAILABLE:
@@ -2282,13 +2263,13 @@ def main():
             if val_lpips is not None:
                 print(
                     f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, "
-                    f"val_lpips={val_lpips:.4f}, lr={lr_current:.2e}, gate={gate_value:.4f}"
+                    f"val_lpips={val_lpips:.4f}, lr={lr_current:.2e}, px_ratio={pixel_ratio:.4f}"
                     + (f", lora_lr={lr_scheduler.get_last_lr()[-1]:.2e}" if args.use_lora and len(lr_scheduler.get_last_lr()) >= 2 else "")
                 )
             else:
                 print(
                     f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, "
-                    f"lr={lr_current:.2e}, gate={gate_value:.4f}"
+                    f"lr={lr_current:.2e}, px_ratio={pixel_ratio:.4f}"
                     + (f", lora_lr={lr_scheduler.get_last_lr()[-1]:.2e}" if args.use_lora and len(lr_scheduler.get_last_lr()) >= 2 else "")
                 )
             

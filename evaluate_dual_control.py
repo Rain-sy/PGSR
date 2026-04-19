@@ -822,8 +822,10 @@ def main():
     parser.add_argument('--output_base', type=str, default='./outputs')
     parser.add_argument('--dataset', type=str, default=None)
     parser.add_argument('--exp_name', type=str, default=None)
-    parser.add_argument('--save_images', action='store_true', default=True)
-    parser.add_argument('--save_comparisons', action='store_true', default=True)
+    parser.add_argument('--save_images', dest='save_images', action='store_true', default=True)
+    parser.add_argument('--no_save_images', dest='save_images', action='store_false')
+    parser.add_argument('--save_comparisons', dest='save_comparisons', action='store_true', default=True)
+    parser.add_argument('--no_save_comparisons', dest='save_comparisons', action='store_false')
     parser.add_argument('--device', type=str, default='cuda')
     
     args = parser.parse_args()
@@ -870,6 +872,7 @@ def main():
         exp_name = args.exp_name
     else:
         fusion_tag = "concat"
+        fusion_source_tag = str(evaluator.fusion_source).replace("(", "").replace(")", "").replace(" ", "_")
         exp_name = (
             f"{ts}"
             f"_str{_fmt_tag(strength)}"
@@ -877,7 +880,7 @@ def main():
             f"_g{_fmt_tag(args.guidance)}"
             f"_pw{_fmt_tag(evaluator.pixel_weight)}"
             f"_{fusion_tag}"
-            f"_gate{_fmt_tag(gate_val)}"
+            f"_fus{fusion_source_tag}"
             f"_trlpw{_fmt_tag(evaluator.train_lpips_weight)}"
         )
         if evaluator.use_lora:

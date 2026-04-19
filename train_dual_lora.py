@@ -1644,7 +1644,7 @@ def main():
 
             print(
                 f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, "
-                f"lr={lr_current:.2e}, gate={gate_value:.4f}"
+                f"lr={lr_current:.2e}, px_ratio={pixel_ratio:.4f}"
                 + (f", lora_lr={lr_scheduler.get_last_lr()[-1]:.2e}" if args.use_lora else "")
             )
 
