@@ -29,6 +29,7 @@ import shutil
 import json
 import os
 import random
+import hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -37,6 +38,7 @@ from tqdm import tqdm
 
 
 VALID_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+BUILDER_VERSION = "build_dataset_repro_v2"
 
 DEFAULT_SOURCES = {
     "DIV2K": {"path": "./Data/DIV2K/DIV2K_train_HR", "count": 800},
@@ -95,6 +97,31 @@ PRESET_SOURCES = {
     "mix24k": MIX24K_SOURCES,
 }
 
+PRESET_TARGET_TOTAL = {
+    "mix24k": 24000,
+}
+
+# Deterministic top-up order for mix24k when base sources cannot reach 24k.
+# This is designed to reproduce the current local Mix24K composition:
+#   base + FFHQtopup(3000) + OSTmore(remaining).
+MIX24K_TOPUP_PLAN = [
+    {
+        "source": "FFHQ",
+        "prefix": "FFHQtopup",
+        "count": 3000,
+        "sample_mode": "random",
+        "min_short_side": None,
+    },
+    {
+        "source": "OST",
+        "prefix": "OSTmore",
+        "count": None,  # Fill whatever remains to target_total.
+        "sample_mode": "random",
+        "min_short_side": None,
+        "source_path_override": "./Data/OST/OutdoorSceneTrain_v2",
+    },
+]
+
 
 def collect_image_files(source_dir, recursive=True):
     source_path = Path(source_dir)
@@ -106,6 +133,75 @@ def collect_image_files(source_dir, recursive=True):
         p for p in candidates
         if p.is_file() and p.suffix.lower() in VALID_EXTS
     )
+
+
+def make_rng(base_seed, namespace):
+    text = f"{base_seed}:{namespace}".encode("utf-8")
+    digest = hashlib.sha256(text).digest()
+    seed_int = int.from_bytes(digest[:8], byteorder="big", signed=False)
+    return random.Random(seed_int)
+
+
+def hash_string_list(values):
+    h = hashlib.sha256()
+    for v in values:
+        h.update(str(v).encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def list_target_images(dir_path):
+    path = Path(dir_path)
+    if not path.exists():
+        return []
+    return sorted(
+        p for p in path.iterdir()
+        if p.is_file() and p.suffix.lower() in VALID_EXTS
+    )
+
+
+def ensure_clean_target_dirs(target_hr, target_lr, force_rebuild=False):
+    hr_existing = list_target_images(target_hr)
+    lr_existing = list_target_images(target_lr)
+    if not hr_existing and not lr_existing:
+        return {"removed_hr": 0, "removed_lr": 0}
+
+    if not force_rebuild:
+        raise RuntimeError(
+            "目标输出目录中已存在图片文件。为保证可复现，请先清空目录，"
+            "或使用 --force_rebuild 让脚本自动清空后重建。"
+        )
+
+    for p in hr_existing:
+        p.unlink()
+    for p in lr_existing:
+        p.unlink()
+    return {"removed_hr": len(hr_existing), "removed_lr": len(lr_existing)}
+
+
+def compute_output_signature(target_hr, target_lr):
+    hr_files = list_target_images(target_hr)
+    lr_files = list_target_images(target_lr)
+    hr_names = [p.name for p in hr_files]
+    lr_names = [p.name for p in lr_files]
+    hr_set = set(hr_names)
+    lr_set = set(lr_names)
+    common = sorted(hr_set & lr_set)
+
+    h = hashlib.sha256()
+    for name in common:
+        hr_size = (Path(target_hr) / name).stat().st_size
+        lr_size = (Path(target_lr) / name).stat().st_size
+        h.update(f"{name}|{hr_size}|{lr_size}\n".encode("utf-8"))
+
+    return {
+        "hr_count": len(hr_names),
+        "lr_count": len(lr_names),
+        "paired_count": len(common),
+        "hr_only_count": len(hr_set - lr_set),
+        "lr_only_count": len(lr_set - hr_set),
+        "paired_size_hash_sha256": h.hexdigest(),
+    }
 
 
 def load_sources(args):
@@ -213,8 +309,16 @@ def process_dataset(
     min_size=None,
     min_short_side=None,
     rng=None,
+    source_files=None,
+    exclude_files=None,
+    collect_selected_files=False,
+    start_index=0,
+    strict_scale_alignment=True,
 ):
-    all_files = collect_image_files(source_dir, recursive=recursive)
+    if source_files is None:
+        all_files = collect_image_files(source_dir, recursive=recursive)
+    else:
+        all_files = list(source_files)
 
     if not all_files:
         print(f"❌ [警告] 在 {source_dir} 中没有找到图片，请检查路径是否正确。")
@@ -232,12 +336,25 @@ def process_dataset(
 
     processed_count = 0
     skipped_small = 0
+    skipped_excluded = 0
     failed = 0
+    cropped_to_scale = 0
     min_size = min_size or scale
+    selected_files = []
+    exclude_set = {
+        str(Path(p).resolve()) if not isinstance(p, Path) else str(p.resolve())
+        for p in (exclude_files or [])
+    }
 
-    for img_path in tqdm(ordered_files, desc=f"处理 {prefix}"):
+    for raw_path in tqdm(ordered_files, desc=f"处理 {prefix}"):
+        img_path = raw_path if isinstance(raw_path, Path) else Path(raw_path)
+        img_key = str(img_path.resolve())
+        if img_key in exclude_set:
+            skipped_excluded += 1
+            continue
         try:
-            hr_img = Image.open(img_path).convert("RGB")
+            with Image.open(img_path) as _hr:
+                hr_img = _hr.convert("RGB")
             width, height = hr_img.size
 
             if min_short_side is not None and min(width, height) < min_short_side:
@@ -247,7 +364,21 @@ def process_dataset(
                 skipped_small += 1
                 continue
 
-            new_filename = f"{prefix}_{processed_count:05d}.png"
+            if strict_scale_alignment:
+                aligned_w = (width // scale) * scale
+                aligned_h = (height // scale) * scale
+                if aligned_w < scale or aligned_h < scale:
+                    skipped_small += 1
+                    continue
+                if aligned_w != width or aligned_h != height:
+                    # Deterministic center-crop so that HR exactly equals LR * scale.
+                    left = (width - aligned_w) // 2
+                    top = (height - aligned_h) // 2
+                    hr_img = hr_img.crop((left, top, left + aligned_w, top + aligned_h))
+                    width, height = hr_img.size
+                    cropped_to_scale += 1
+
+            new_filename = f"{prefix}_{start_index + processed_count:05d}.png"
             hr_save_path = os.path.join(target_hr_dir, new_filename)
             lr_save_path = os.path.join(target_lr_dir, new_filename)
 
@@ -258,6 +389,7 @@ def process_dataset(
             lr_img = hr_img.resize((lr_w, lr_h), Image.BICUBIC)
             lr_img.save(lr_save_path, format="PNG")
 
+            selected_files.append(img_key)
             processed_count += 1
             if target_count is not None and processed_count >= target_count:
                 break
@@ -271,13 +403,18 @@ def process_dataset(
             "可能是尺寸过滤(min_short_side/min_size)导致可用样本不足。"
         )
 
-    return {
+    summary = {
         "processed": processed_count,
         "requested": target_count,
         "available": len(all_files),
         "skipped_small": skipped_small,
+        "skipped_excluded": skipped_excluded,
         "failed": failed,
+        "cropped_to_scale": cropped_to_scale,
     }
+    if collect_selected_files:
+        summary["_selected_files"] = selected_files
+    return summary
 
 
 def resolve_source_path(info):
@@ -288,6 +425,120 @@ def resolve_source_path(info):
     if fallback and os.path.exists(fallback):
         return fallback, True
     return None, False
+
+
+def run_reproducible_topup(
+    args,
+    sources,
+    target_hr,
+    target_lr,
+    total_images,
+    used_files_by_source,
+):
+    target_total = args.ensure_target_total
+    if target_total <= 0:
+        return total_images, {}
+    if total_images >= target_total:
+        return total_images, {}
+
+    print("\n" + "-" * 70)
+    print(f"🔁 启动可复现补齐：当前 {total_images}，目标 {target_total}")
+    print("-" * 70)
+
+    topup_results = {}
+    for step in MIX24K_TOPUP_PLAN:
+        remaining = target_total - total_images
+        if remaining <= 0:
+            break
+
+        source_name = step["source"]
+        info = sources.get(source_name)
+        if info is None:
+            print(f"[TopUp:{source_name}] ❌ 源不存在于 sources，跳过。")
+            continue
+
+        source_path, used_fallback = resolve_source_path(info)
+        override = step.get("source_path_override")
+        if override:
+            if os.path.exists(override):
+                source_path = override
+                used_fallback = False
+            else:
+                print(f"[TopUp:{source_name}] ❌ source_path_override 不存在: {override}")
+                continue
+        if source_path is None:
+            print(f"[TopUp:{source_name}] ❌ 找不到路径，跳过。")
+            continue
+
+        step_count = step.get("count")
+        if step_count is None or step_count <= 0:
+            effective_count = remaining
+        else:
+            effective_count = min(int(step_count), remaining)
+        if effective_count <= 0:
+            continue
+
+        min_short_side = step.get("min_short_side")
+        sample_mode = step.get("sample_mode", info.get("sample_mode", "random"))
+        recursive = info.get("recursive", True)
+        # Reuse base-source namespace so random ordering is stable and reproducible.
+        rng = make_rng(args.seed, f"base::{source_name}")
+
+        used = used_files_by_source.setdefault(source_name, set())
+        print(
+            f"[TopUp:{source_name}] prefix={step['prefix']} 目标补 {effective_count} 张 "
+            f"(remaining={remaining}, 排除已用={len(used)})"
+        )
+
+        source_files = collect_image_files(source_path, recursive=recursive)
+        summary = process_dataset(
+            source_path,
+            str(target_hr),
+            str(target_lr),
+            step["prefix"],
+            sample_count=effective_count,
+            sample_mode=sample_mode,
+            recursive=recursive,
+            scale=args.scale,
+            min_size=args.min_size if args.min_size > 0 else None,
+            min_short_side=min_short_side,
+            rng=rng,
+            source_files=source_files,
+            exclude_files=used,
+            collect_selected_files=True,
+            strict_scale_alignment=args.strict_scale_alignment,
+        )
+        selected_list = summary.pop("_selected_files", [])
+        selected = set(selected_list)
+        used.update(selected)
+
+        summary["selected_count"] = len(selected_list)
+        summary["selected_hash"] = hash_string_list(selected_list)
+        summary["source"] = source_name
+        summary["used_path"] = source_path
+        summary["used_fallback_path"] = used_fallback
+        summary["effective_count"] = effective_count
+        summary["effective_min_short_side"] = min_short_side
+        summary["remaining_before"] = remaining
+        summary["excluded_used_paths"] = len(used) - len(selected)
+        topup_results[step["prefix"]] = summary
+
+        total_images += summary["processed"]
+        if summary["processed"] < effective_count:
+            print(
+                f"[TopUp:{source_name}] ⚠️ 仅补到 {summary['processed']}/{effective_count}，"
+                "可能是可用样本不足或过滤过严。"
+            )
+
+    if total_images < target_total:
+        print(
+            f"\n⚠️ 补齐后仍未达到目标总数: {total_images}/{target_total}。"
+            "请检查源数据是否不足，或放宽过滤条件。"
+        )
+    else:
+        print(f"\n✅ 可复现补齐完成：{total_images}/{target_total}")
+
+    return total_images, topup_results
 
 
 def copy_from_mix16k(
@@ -341,14 +592,27 @@ def copy_from_mix16k(
     }
 
 
-def build_manifest(target_name, target_hr, target_lr, scale, seed, sources, results):
-    return {
+def build_manifest(
+    target_name,
+    target_hr,
+    target_lr,
+    scale,
+    seed,
+    sources,
+    results,
+    target_total=None,
+    topup_results=None,
+    include_timestamp=False,
+    reproducibility=None,
+    output_signature=None,
+):
+    manifest = {
         "target_name": target_name,
         "target_hr": str(target_hr),
         "target_lr": str(target_lr),
         "scale": scale,
         "seed": seed,
-        "built_at": datetime.now().isoformat(timespec="seconds"),
+        "builder_version": BUILDER_VERSION,
         "sources": {
             name: {
                 "path": info["path"],
@@ -364,6 +628,18 @@ def build_manifest(target_name, target_hr, target_lr, scale, seed, sources, resu
             for name, info in sources.items()
         },
     }
+    if include_timestamp:
+        manifest["built_at"] = datetime.now().isoformat(timespec="seconds")
+    if target_total is not None and target_total > 0:
+        manifest["target_total"] = int(target_total)
+    if topup_results:
+        manifest["topup_results"] = topup_results
+        manifest["topup_plan"] = MIX24K_TOPUP_PLAN
+    if reproducibility is not None:
+        manifest["reproducibility"] = reproducibility
+    if output_signature is not None:
+        manifest["output_signature"] = output_signature
+    return manifest
 
 
 def parse_args():
@@ -382,6 +658,16 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="随机抽样 seed")
     parser.add_argument("--min_size", type=int, default=0,
                         help="跳过宽或高小于该值的图片；0 表示只要求不小于 scale")
+    parser.add_argument("--strict_scale_alignment", dest="strict_scale_alignment", action="store_true", default=True,
+                        help="默认开启：HR 会先中心裁到可被 scale 整除，再生成 LR，保证严格 x4 配对。")
+    parser.add_argument("--no_strict_scale_alignment", dest="strict_scale_alignment", action="store_false",
+                        help="关闭严格对齐（不推荐，会产生近似 x4 但非严格配对样本）。")
+    parser.add_argument("--force_rebuild", action="store_true", default=False,
+                        help="当目标目录非空时，先删除其中已有图片再重建（保证可复现）。")
+    parser.add_argument("--manifest_timestamp", action="store_true", default=False,
+                        help="在 manifest 中写入 built_at 时间戳。默认关闭以保持 manifest 可复现。")
+    parser.add_argument("--ensure_target_total", type=int, default=0,
+                        help="构建后自动补齐到该总数（0 表示不补齐）。mix24k 默认自动补到 24000。")
     parser.add_argument("--mix_hr_dir", type=str, default="./Data/Mix16K_HR",
                         help="DF2K 复制模式下的 Mix16K HR 目录")
     parser.add_argument("--mix_lr_dir", type=str, default="./Data/Mix16K_LR_bicubic_X4",
@@ -392,7 +678,12 @@ def parse_args():
 def main():
     args = parse_args()
     sources = load_sources(args)
-    rng = random.Random(args.seed)
+    if args.ensure_target_total <= 0 and args.preset in PRESET_TARGET_TOTAL:
+        args.ensure_target_total = PRESET_TARGET_TOTAL[args.preset]
+        print(
+            f"[{args.preset}] 自动启用可复现补齐: "
+            f"--ensure_target_total={args.ensure_target_total}"
+        )
     if args.target_name is None:
         preset_default_name = {
             "df2k": "DF2K",
@@ -405,15 +696,26 @@ def main():
     target_lr = Path(args.target_lr or f"./Data/{args.target_name}_LR_bicubic_X{args.scale}")
     target_hr.mkdir(parents=True, exist_ok=True)
     target_lr.mkdir(parents=True, exist_ok=True)
+    cleanup_info = ensure_clean_target_dirs(target_hr, target_lr, force_rebuild=args.force_rebuild)
 
     total_images = 0
     results = {}
+    topup_results = {}
+    used_files_by_source = {}
 
     print("=" * 70)
     print(f"🚀 开始构建 {args.target_name}")
     print(f"HR 输出: {target_hr}")
     print(f"LR 输出: {target_lr}")
     print(f"Scale: X{args.scale}")
+    print(f"Strict Scale Alignment: {args.strict_scale_alignment}")
+    print(f"Force Rebuild: {args.force_rebuild}")
+    print(f"Manifest Timestamp: {args.manifest_timestamp}")
+    if cleanup_info["removed_hr"] > 0 or cleanup_info["removed_lr"] > 0:
+        print(
+            f"已清空旧图片: HR={cleanup_info['removed_hr']} / "
+            f"LR={cleanup_info['removed_lr']}"
+        )
     print("=" * 70)
 
     if args.preset == "df2k":
@@ -428,11 +730,26 @@ def main():
             results["DF2K"] = copied_summary
             total_images = copied_summary["processed"]
             manifest = build_manifest(
-                args.target_name, target_hr, target_lr, args.scale, args.seed, sources, results
+                args.target_name,
+                target_hr,
+                target_lr,
+                args.scale,
+                args.seed,
+                sources,
+                results,
+                target_total=args.ensure_target_total,
+                topup_results=topup_results,
+                include_timestamp=args.manifest_timestamp,
+                reproducibility={
+                    "strict_scale_alignment": args.strict_scale_alignment,
+                    "force_rebuild": args.force_rebuild,
+                    "manifest_timestamp": args.manifest_timestamp,
+                },
+                output_signature=compute_output_signature(target_hr, target_lr),
             )
             manifest_path = target_hr.parent / f"{args.target_name}_manifest.json"
             with open(manifest_path, "w", encoding="utf-8") as f:
-                json.dump(manifest, f, ensure_ascii=False, indent=2)
+                json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
 
             print("\n" + "=" * 70)
             print("✅ DF2K 已从 Mix16K 直接复制完成")
@@ -475,8 +792,15 @@ def main():
             scale=args.scale,
             min_size=args.min_size if args.min_size > 0 else None,
             min_short_side=effective_min_short_side,
-            rng=rng,
+            rng=make_rng(args.seed, f"base::{prefix}"),
+            collect_selected_files=True,
+            strict_scale_alignment=args.strict_scale_alignment,
         )
+        selected_list = summary.pop("_selected_files", [])
+        selected = set(selected_list)
+        used_files_by_source[prefix] = selected
+        summary["selected_count"] = len(selected_list)
+        summary["selected_hash"] = hash_string_list(selected_list)
         summary["used_path"] = source_path
         summary["used_fallback_path"] = used_fallback
         summary["effective_count"] = effective_count
@@ -484,12 +808,40 @@ def main():
         results[prefix] = summary
         total_images += summary["processed"]
 
+    if args.ensure_target_total > 0:
+        if args.preset == "mix24k":
+            total_images, topup_results = run_reproducible_topup(
+                args=args,
+                sources=sources,
+                target_hr=target_hr,
+                target_lr=target_lr,
+                total_images=total_images,
+                used_files_by_source=used_files_by_source,
+            )
+        else:
+            print("⚠️ --ensure_target_total 当前仅内置支持 preset=mix24k，已跳过补齐。")
+
     manifest = build_manifest(
-        args.target_name, target_hr, target_lr, args.scale, args.seed, sources, results
+        args.target_name,
+        target_hr,
+        target_lr,
+        args.scale,
+        args.seed,
+        sources,
+        results,
+        target_total=args.ensure_target_total,
+        topup_results=topup_results,
+        include_timestamp=args.manifest_timestamp,
+        reproducibility={
+            "strict_scale_alignment": args.strict_scale_alignment,
+            "force_rebuild": args.force_rebuild,
+            "manifest_timestamp": args.manifest_timestamp,
+        },
+        output_signature=compute_output_signature(target_hr, target_lr),
     )
     manifest_path = target_hr.parent / f"{args.target_name}_manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
+        json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
 
     print("\n" + "=" * 70)
     print(f"✅ {args.target_name} 数据集构建完毕！共计成功处理图片: {total_images} 张")
