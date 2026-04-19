@@ -1906,7 +1906,8 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
                     lpips_weight=0.0, lpips_apply_prob=0.25,
                     val_lpips=None, best_metric='psnr', best_metric_value=None,
                     lora_config=None,
-                    optimizer=None, lr_scheduler=None, global_step=None):
+                    optimizer=None, lr_scheduler=None, global_step=None,
+                    training_data=None):
     """Save training checkpoint.
 
     Also persists optimizer / lr_scheduler state and global_step so resume
@@ -1976,6 +1977,8 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
             print(f"[Checkpoint][WARN] failed to serialize lr_scheduler state: {e}")
     if global_step is not None:
         payload['global_step'] = int(global_step)
+    if training_data is not None:
+        payload['train_data'] = training_data
     torch.save(payload, path)
 
 
@@ -2266,6 +2269,16 @@ def main():
             f"_tp{args.lora_target_preset}"
         )
     save_dir = os.path.join(args.save_dir, exp_name)
+    train_data_info = {
+        'train_hr_dir': args.hr_dir,
+        'train_lr_dir': args.lr_dir,
+        'val_hr_dir': args.val_hr_dir,
+        'val_lr_dir': args.val_lr_dir,
+        'degrade_mode': args.degrade_mode,
+        'scale': int(args.scale),
+        'resolution': int(args.resolution),
+        'num_crops': int(args.num_crops),
+    }
     
     if is_main:
         os.makedirs(save_dir, exist_ok=True)
@@ -2713,6 +2726,10 @@ def main():
         with open(log_path, 'w') as f:
             f.write("FLUX SR Training - Official Scheduler\n")
             f.write("=" * 60 + "\n")
+            f.write(f"Train HR Dir: {args.hr_dir}\n")
+            f.write(f"Train LR Dir: {args.lr_dir}\n")
+            f.write(f"Val HR Dir: {args.val_hr_dir}\n")
+            f.write(f"Val LR Dir: {args.val_lr_dir}\n")
             f.write(f"Degrade Mode: {args.degrade_mode}\n")
             f.write(f"Scale: x{args.scale}\n")
             f.write(f"Strength: {args.strength}\n")
@@ -2946,7 +2963,8 @@ def main():
                                lora_config=lora_cfg_for_ckpt,
                                optimizer=optimizer,
                                lr_scheduler=lr_scheduler,
-                               global_step=global_step)
+                               global_step=global_step,
+                               training_data=train_data_info)
                 if args.best_metric == 'lpips' and best_value is not None:
                     print(f"  -> New best LPIPS: {best_value:.4f}")
                 else:
@@ -2965,7 +2983,8 @@ def main():
                                lora_config=lora_cfg_for_ckpt,
                                optimizer=optimizer,
                                lr_scheduler=lr_scheduler,
-                               global_step=global_step)
+                               global_step=global_step,
+                               training_data=train_data_info)
             
         gc.collect()
         if device.type == 'cuda':
@@ -3001,7 +3020,8 @@ def main():
                        lora_config=lora_cfg_for_ckpt,
                        optimizer=optimizer,
                        lr_scheduler=lr_scheduler,
-                       global_step=global_step)
+                       global_step=global_step,
+                       training_data=train_data_info)
         
         print("\n" + "=" * 70)
         print("Training Complete!")

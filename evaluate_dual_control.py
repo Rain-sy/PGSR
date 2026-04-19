@@ -256,6 +256,7 @@ class DualStreamEvaluator(nn.Module):
         self.conditioning_scale = 1.0
         self.train_lpips_weight = 0.0
         self.train_lpips_apply_prob = 0.0
+        self.train_data = {}
         self.use_lora = False
         self.lora_config_ckpt = None
         self.lora_state_tensors = 0
@@ -334,11 +335,31 @@ class DualStreamEvaluator(nn.Module):
         self.control_guidance_end = ckpt.get('control_guidance_end', 1.0)
         self.train_lpips_weight = ckpt.get('lpips_weight', 0.0)
         self.train_lpips_apply_prob = ckpt.get('lpips_apply_prob', 0.0)
+        train_data = ckpt.get('train_data', {})
+        if not isinstance(train_data, dict):
+            train_data = {}
+        self.train_data = {
+            'train_hr_dir': train_data.get('train_hr_dir', ckpt.get('train_hr_dir')),
+            'train_lr_dir': train_data.get('train_lr_dir', ckpt.get('train_lr_dir')),
+            'val_hr_dir': train_data.get('val_hr_dir', ckpt.get('val_hr_dir')),
+            'val_lr_dir': train_data.get('val_lr_dir', ckpt.get('val_lr_dir')),
+            'degrade_mode': train_data.get('degrade_mode', ckpt.get('degrade_mode')),
+            'scale': train_data.get('scale', ckpt.get('scale')),
+            'resolution': train_data.get('resolution', ckpt.get('resolution')),
+            'num_crops': train_data.get('num_crops', ckpt.get('num_crops')),
+        }
 
         print(f"Checkpoint: epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', 0):.2f}")
         print(f"Pixel Weight: {self.pixel_weight}, Strength: {self.strength}")
         print(f"Pixel Fusion: concat+1x1 conv (source={self.fusion_source})")
         print(f"Train LPIPS: weight={self.train_lpips_weight}, prob={self.train_lpips_apply_prob}")
+        if self.train_data.get('train_hr_dir'):
+            print(
+                f"Train Data: hr={self.train_data.get('train_hr_dir')}, "
+                f"lr={self.train_data.get('train_lr_dir')}, "
+                f"degrade={self.train_data.get('degrade_mode')}, "
+                f"scale=x{self.train_data.get('scale')}"
+            )
         print(f"Conditioning Scale: {self.conditioning_scale}")
         print(f"Control Guidance Window: [{self.control_guidance_start}, {self.control_guidance_end}]")
         
@@ -1049,7 +1070,14 @@ def main():
                 f"_tp{cfg.get('target_preset', '?')}"
             )
     
-    method_tag = 'DualLoRA' if evaluator.use_lora else 'DualControl'
+    if evaluator.use_dfm and evaluator.use_lora:
+        method_tag = 'DualDFMLoRA'
+    elif evaluator.use_dfm:
+        method_tag = 'DualDFM'
+    elif evaluator.use_lora:
+        method_tag = 'DualLoRA'
+    else:
+        method_tag = 'DualControl'
     output_dir = os.path.join(args.output_base, args.dataset, method_tag, exp_name)
     os.makedirs(output_dir, exist_ok=True)
     if args.save_images:
@@ -1218,6 +1246,19 @@ def main():
         f.write(f"Train LPIPS Weight: {evaluator.train_lpips_weight}\n")
         f.write(f"Train LPIPS Apply Prob: {evaluator.train_lpips_apply_prob}\n")
         f.write(f"Pixel Fusion: concat+1x1 conv (source={evaluator.fusion_source})\n")
+        train_data = evaluator.train_data or {}
+        if any(v is not None for v in train_data.values()):
+            f.write("Train Data (from checkpoint):\n")
+            f.write(f"  HR Dir: {train_data.get('train_hr_dir')}\n")
+            f.write(f"  LR Dir: {train_data.get('train_lr_dir')}\n")
+            f.write(f"  Val HR Dir: {train_data.get('val_hr_dir')}\n")
+            f.write(f"  Val LR Dir: {train_data.get('val_lr_dir')}\n")
+            f.write(
+                f"  Degrade: {train_data.get('degrade_mode')}, "
+                f"Scale: x{train_data.get('scale')}, "
+                f"Resolution: {train_data.get('resolution')}, "
+                f"Num Crops: {train_data.get('num_crops')}\n"
+            )
         f.write(f"Dataset: {args.dataset}\n")
         f.write(f"Images: {len(psnr_list)}\n")
         f.write(f"Steps: {args.num_steps}, Guidance: {args.guidance}\n")
