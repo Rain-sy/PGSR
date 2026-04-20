@@ -4,12 +4,12 @@
 Dual-Stream FLUX SR Evaluation - aligned with official Diffusers pipeline
 ======================================================================
 
-Companion script for train_dual_control.py
+Companion script for train_dual_dfm.py
 Automatically detects and loads LoRA adapters when checkpoint contains
 `use_lora=True` and `lora_state_dict`.
 
 Usage:
-    python evaluate_dual_control.py \
+    python evaluate_dual_dfm.py \
         --checkpoint checkpoints/dual_control/xxx/best_model.pt \
         --hr_dir Data/DIV2K/DIV2K_valid_HR \
         --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
@@ -150,17 +150,18 @@ class PixelFeatureExtractor(nn.Module):
 
 
 class DFMAdapter(nn.Module):
-    """Inference-time DFM adapter (mirror of train_dual_control.DFMAdapter)."""
+    """Inference-time DFM adapter (mirror of train_dual_dfm.DFMAdapter).
+
+    Residual + zero-conv injection:
+        decoder_feat <- decoder_feat + zero_conv(silu(align(pixel_feat)))
+    """
 
     def __init__(self, feat_ch: int, decoder_ch: int):
         super().__init__()
         self.align = nn.Conv2d(feat_ch, decoder_ch, kernel_size=3, padding=1)
-        self.to_scale = nn.Conv2d(decoder_ch, decoder_ch, kernel_size=1)
-        self.to_shift = nn.Conv2d(decoder_ch, decoder_ch, kernel_size=1)
-        # Matches train-side init. If we load from checkpoint these values are
-        # overwritten immediately.
-        nn.init.zeros_(self.to_scale.weight); nn.init.zeros_(self.to_scale.bias)
-        nn.init.zeros_(self.to_shift.weight); nn.init.zeros_(self.to_shift.bias)
+        self.zero_conv = nn.Conv2d(decoder_ch, decoder_ch, kernel_size=1)
+        # Matches train-side init. Checkpoint values overwrite these immediately.
+        nn.init.zeros_(self.zero_conv.weight); nn.init.zeros_(self.zero_conv.bias)
         nn.init.kaiming_normal_(self.align.weight, nonlinearity='relu')
         nn.init.zeros_(self.align.bias)
 
@@ -172,8 +173,7 @@ class DFMAdapter(nn.Module):
             )
         if pixel_feat.dtype != decoder_feat.dtype:
             pixel_feat = pixel_feat.to(decoder_feat.dtype)
-        h = F.silu(self.align(pixel_feat))
-        return decoder_feat * (1.0 + self.to_scale(h)) + self.to_shift(h)
+        return decoder_feat + self.zero_conv(F.silu(self.align(pixel_feat)))
 
 
 # ============================================================================
@@ -320,6 +320,13 @@ class DualStreamEvaluator(nn.Module):
 
         if 'pixel_extractor' in ckpt:
             state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
+            if any(k.startswith("encoder.") for k in state.keys()):
+                raise RuntimeError(
+                    "[Eval] Incompatible checkpoint: pixel_extractor uses legacy "
+                    "'encoder.*' keys (train_dual_control style). "
+                    "Use evaluate_dual_control.py for that checkpoint, or evaluate a "
+                    "train_dual_dfm checkpoint with this script."
+                )
             self.pixel_extractor.load_state_dict(state)
 
         if 'controlnet' in ckpt:

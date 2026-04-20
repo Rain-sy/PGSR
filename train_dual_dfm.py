@@ -12,9 +12,9 @@ adapter wiring, loss, resume, eval) is intentionally kept identical so
 results comparing this file to train_dual_control.py isolate the pixel
 extractor refactor.
 
-Legacy train_dual_control checkpoints can be partially migrated on resume:
-matching flat ``encoder.*`` tensors are remapped to ``stage*`` keys when
-shapes align; unmatched layers keep current initialization.
+Checkpoints saved by this file use the ``stage*`` key namespace and are
+NOT compatible with train_dual_control.py (flat ``encoder.*`` keys). Resume
+from scratch or from a train_dual_dfm.py checkpoint only.
 
 This is the NEW training entry.
 - Supports `--degrade_mode {paired, bicubic, realesrgan}`
@@ -187,9 +187,9 @@ class PixelFeatureExtractor(nn.Module):
        (stage3_proj) still outputs ``latent_channels`` (16 by default) before
        the zero_conv, so the condition path is unchanged in width.
 
-    4. Legacy checkpoints from train_dual_control.py (flat ``encoder.N.*``
-       keys) are partially migrated on resume when shapes match. Unmatched
-       layers keep current initialization.
+    Note: state_dict keys use the ``stage*`` namespace above and are NOT
+    compatible with train_dual_control.py's flat ``encoder.N.*`` checkpoints.
+    Train from scratch when switching to this variant.
     """
 
     _TAP_CHANNELS = {'s1': 32, 's2': 64, 's3': 256}
@@ -234,7 +234,7 @@ class PixelFeatureExtractor(nn.Module):
         # Zero Conv for condition-side path. DFM taps (s1/s2/s3) bypass this
         # zero_conv entirely, so modulation starts non-zero from the first
         # step -- the DFM adapters themselves carry the zero-init guarantee
-        # via their own scale/shift convs.
+        # via their own residual zero_conv.
         self.zero_conv = nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
         nn.init.zeros_(self.zero_conv.weight)
         nn.init.zeros_(self.zero_conv.bias)
@@ -262,20 +262,23 @@ class PixelFeatureExtractor(nn.Module):
 
 
 class DFMAdapter(nn.Module):
-    """Decoder-side Feature Modulation (SPADE-style).
+    """Decoder-side Feature Modulation (residual + zero-conv).
 
-    Applies a conditional affine transform to a VAE-decoder activation using
-    a pixel-space feature tap from :class:`PixelFeatureExtractor`:
+    Adds a zero-init residual injection to a VAE-decoder activation using a
+    pixel-space feature tap from :class:`PixelFeatureExtractor`:
 
-        decoder_feat <- decoder_feat * (1 + scale(pixel_feat)) + shift(pixel_feat)
+        decoder_feat <- decoder_feat + zero_conv(silu(align(pixel_feat)))
 
-    ``to_scale`` and ``to_shift`` are zero-initialised, so at init the module
-    is an exact identity and DFM does not perturb the frozen VAE decoder.
-    This is the property we use for the bit-wise equivalence unit test.
+    ``zero_conv`` is zero-initialised, so at init the residual is exactly 0
+    and the frozen VAE decoder produces bit-wise identical output. Purely
+    additive injection leaves the decoder's pretrained activation scale
+    untouched (unlike SPADE affine, where a learned multiplicative ``scale``
+    can push activations off-distribution), and mirrors the way ControlNet
+    already injects into the FLUX transformer.
 
     Args:
         feat_ch:    channel count of the incoming pixel feature map
-                    (e.g. 128/64/32 for s3/s2/s1 taps).
+                    (e.g. 256/64/32 for s3/s2/s1 taps).
         decoder_ch: channel count of the VAE decoder activation at the
                     injection point. Read at runtime from
                     ``vae.decoder.up_blocks[i].resnets[0].conv1.in_channels``
@@ -285,16 +288,13 @@ class DFMAdapter(nn.Module):
     def __init__(self, feat_ch: int, decoder_ch: int):
         super().__init__()
         self.align = nn.Conv2d(feat_ch, decoder_ch, kernel_size=3, padding=1)
-        self.to_scale = nn.Conv2d(decoder_ch, decoder_ch, kernel_size=1)
-        self.to_shift = nn.Conv2d(decoder_ch, decoder_ch, kernel_size=1)
+        self.zero_conv = nn.Conv2d(decoder_ch, decoder_ch, kernel_size=1)
 
-        # Identity-at-init: zero out scale/shift heads.
-        nn.init.zeros_(self.to_scale.weight)
-        nn.init.zeros_(self.to_scale.bias)
-        nn.init.zeros_(self.to_shift.weight)
-        nn.init.zeros_(self.to_shift.bias)
-        # ``align`` is allowed to be non-zero since its output feeds both heads,
-        # which are themselves zero-init -> overall contribution is still zero.
+        # Identity-at-init: zero out the output conv so the residual is 0.
+        nn.init.zeros_(self.zero_conv.weight)
+        nn.init.zeros_(self.zero_conv.bias)
+        # ``align`` is allowed to be non-zero since its output feeds zero_conv
+        # (zero-init) -> overall residual contribution is still zero at init.
         nn.init.kaiming_normal_(self.align.weight, nonlinearity='relu')
         nn.init.zeros_(self.align.bias)
 
@@ -309,10 +309,8 @@ class DFMAdapter(nn.Module):
         # Cast pixel_feat to decoder_feat dtype (decoder may run in fp16/bf16).
         if pixel_feat.dtype != decoder_feat.dtype:
             pixel_feat = pixel_feat.to(decoder_feat.dtype)
-        h = F.silu(self.align(pixel_feat))
-        scale = self.to_scale(h)
-        shift = self.to_shift(h)
-        return decoder_feat * (1.0 + scale) + shift
+        residual = self.zero_conv(F.silu(self.align(pixel_feat)))
+        return decoder_feat + residual
 
 
 # ============================================================================
@@ -1573,7 +1571,7 @@ def compute_flow_matching_loss(
     # merge the two decode paths:
     #   - DFM OFF: keep baseline LPIPS path (uses unwrapped.decode -> vae.decoder).
     #   - DFM ON: decode through ``decode_with_dfm`` once. At init DFM is the
-    #     identity (zero-init scale/shift), so this is numerically identical
+    #     identity (zero-init residual branch), so this is numerically identical
     #     to ``decode`` and can carry BOTH the pixel-L1 supervision (for DFM
     #     adapters) and the optional LPIPS term. We therefore skip the extra
     #     baseline LPIPS decode.
@@ -1754,67 +1752,6 @@ def validate(system, accelerator, val_loader, device, num_samples=10,
 def _strip_module_prefix(state_dict):
     """Strip an optional DDP/DeepSpeed ``module.`` prefix from state_dict keys."""
     return {k[7:] if k.startswith("module.") else k: v for k, v in state_dict.items()}
-
-
-_LEGACY_PIXEL_LAYER_MAP = (
-    ("encoder.0", "stage1.0"),
-    ("encoder.1", "stage1.1"),
-    ("encoder.3", "stage1.3"),
-    ("encoder.4", "stage1.4"),
-    ("encoder.6", "stage2.0"),
-    ("encoder.7", "stage2.1"),
-    ("encoder.9", "stage2.3"),
-    ("encoder.10", "stage2.4"),
-    ("encoder.12", "stage3_body.0"),
-    ("encoder.13", "stage3_body.1"),
-    ("encoder.15", "stage3_proj.0"),
-    ("encoder.16", "stage3_proj.1"),
-)
-
-_LEGACY_PIXEL_KEY_MAP = {
-    f"{old}.{suffix}": f"{new}.{suffix}"
-    for old, new in _LEGACY_PIXEL_LAYER_MAP
-    for suffix in ("weight", "bias")
-}
-
-
-def _load_pixel_extractor_with_compat(pixel_extractor, state, is_main=False):
-    """Load pixel_extractor state with best-effort migration for flat legacy keys."""
-    has_legacy_encoder = any(k.startswith("encoder.") for k in state.keys())
-    if not has_legacy_encoder:
-        pixel_extractor.load_state_dict(state, strict=True)
-        return
-
-    target_state = pixel_extractor.state_dict()
-    migrated = {}
-    loaded_mapped = 0
-    skipped = []
-
-    for src_key, tensor in state.items():
-        dst_key = _LEGACY_PIXEL_KEY_MAP.get(src_key, src_key)
-        if dst_key not in target_state:
-            skipped.append((src_key, "missing_target"))
-            continue
-        if target_state[dst_key].shape != tensor.shape:
-            skipped.append((src_key, f"shape:{tuple(tensor.shape)}->{tuple(target_state[dst_key].shape)}"))
-            continue
-        migrated[dst_key] = tensor
-        if src_key != dst_key:
-            loaded_mapped += 1
-
-    missing, unexpected = pixel_extractor.load_state_dict(migrated, strict=False)
-
-    if is_main:
-        print(
-            "[Resume] Legacy pixel_extractor detected; applied partial migration "
-            f"(mapped={loaded_mapped}, skipped={len(skipped)}, "
-            f"missing_after_load={len(missing)}, unexpected_after_load={len(unexpected)})."
-        )
-        if skipped:
-            preview = ", ".join([f"{k}({r})" for k, r in skipped[:4]])
-            if len(skipped) > 4:
-                preview += ", ..."
-            print(f"[Resume] Legacy migration skipped keys: {preview}")
 
 
 def _load_pixel_fuse_proj_with_migration(unwrapped, ckpt, is_main=False):
@@ -2096,7 +2033,7 @@ def main():
                         help='Initialize model + LoRA, print matched modules and exit')
 
     # DFM (Decoder-side Feature Modulation; see Phase 1 of improvement plan).
-    # DFM injects a SPADE-style affine transform into the VAE decoder using
+    # DFM injects a residual zero-conv feature path into the VAE decoder using
     # multi-scale taps from the PixelFeatureExtractor. Gradient only flows into
     # the adapters via a pixel-space L1/LPIPS loss on z0_pred = noisy - sigma*v.
     parser.add_argument('--use_dfm', action='store_true', default=False,
@@ -2379,7 +2316,7 @@ def main():
         raise SystemExit(0)
 
     # --- Identity sanity test for freshly-initialized DFM adapters -----------
-    # With zero-init scale/shift convs, ``decode_with_dfm`` must numerically
+    # With zero-init residual convs, ``decode_with_dfm`` must numerically
     # equal ``decode``. We compare in fp32 (informational) and bf16 (matches
     # the training dtype) and fail hard if the bf16 diff is large.
     if args.test_dfm_identity:
@@ -2592,7 +2529,14 @@ def main():
         unwrapped = accelerator.unwrap_model(system)
         if 'pixel_extractor' in ckpt:
             state = _strip_module_prefix(ckpt['pixel_extractor'])
-            _load_pixel_extractor_with_compat(unwrapped.pixel_extractor, state, is_main=is_main)
+            if any(k.startswith("encoder.") for k in state.keys()):
+                raise RuntimeError(
+                    "[Resume] Incompatible pixel_extractor checkpoint format: found legacy "
+                    "'encoder.*' keys from train_dual_control.py, but train_dual_dfm.py "
+                    "expects 'stage*' keys. Please resume from a train_dual_dfm checkpoint "
+                    "or start a fresh run."
+                )
+            unwrapped.pixel_extractor.load_state_dict(state, strict=True)
         _load_pixel_fuse_proj_with_migration(unwrapped, ckpt, is_main=is_main)
         if args.reset_pixel_gate:
             with torch.no_grad():
