@@ -262,7 +262,7 @@ class PixelFeatureExtractor(nn.Module):
 
 
 class DFMAdapter(nn.Module):
-    """Decoder-side Feature Modulation (residual + zero-conv).
+    """Decoder-side Feature Modulation (residual + SiLU + zero-conv).
 
     Adds a zero-init residual injection to a VAE-decoder activation using a
     pixel-space feature tap from :class:`PixelFeatureExtractor`:
@@ -270,11 +270,11 @@ class DFMAdapter(nn.Module):
         decoder_feat <- decoder_feat + zero_conv(silu(align(pixel_feat)))
 
     ``zero_conv`` is zero-initialised, so at init the residual is exactly 0
-    and the frozen VAE decoder produces bit-wise identical output. Purely
-    additive injection leaves the decoder's pretrained activation scale
-    untouched (unlike SPADE affine, where a learned multiplicative ``scale``
-    can push activations off-distribution), and mirrors the way ControlNet
-    already injects into the FLUX transformer.
+    and the frozen VAE decoder produces bit-wise identical output. Additive
+    injection leaves the decoder's pretrained activation scale untouched
+    (unlike SPADE affine, where a learned multiplicative ``scale`` can push
+    activations off-distribution). The intermediate SiLU gives the adapter
+    one extra nonlinearity for local feature remapping.
 
     Args:
         feat_ch:    channel count of the incoming pixel feature map
@@ -2842,31 +2842,49 @@ def main():
             lr_norm = w[:, :in_half].norm().item()
             px_norm = w[:, in_half:].norm().item()
             pixel_ratio = px_norm / (lr_norm + 1e-8)
+
+            # DFM diagnostic: total Frobenius norm of the zero_conv output layers
+            # across all adapters. Starts at 0 (zero-init) and grows as the DFM
+            # branch learns to modulate the VAE decoder. Stays ~0 => either
+            # dfm_pixel_weight too small, sigma_gate too tight, or DFM is a no-op.
+            dfm_zc_norm = None
+            if getattr(unwrapped, 'use_dfm', False) and len(unwrapped.dfm_adapters) > 0:
+                dfm_zc_norm = sum(
+                    a.zero_conv.weight.detach().float().norm().item()
+                    for a in unwrapped.dfm_adapters.values()
+                )
+
+            extra_tag = f", PxRatio={pixel_ratio:.4f}"
+            if dfm_zc_norm is not None:
+                extra_tag += f", DFM_zc={dfm_zc_norm:.4f}"
             if val_lpips is not None:
                 log_line = (
                     f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, "
-                    f"LPIPS={val_lpips:.4f}, LR={lr_current:.2e}, PxRatio={pixel_ratio:.4f}\n"
+                    f"LPIPS={val_lpips:.4f}, LR={lr_current:.2e}{extra_tag}\n"
                 )
             else:
                 log_line = (
                     f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, "
-                    f"LR={lr_current:.2e}, PxRatio={pixel_ratio:.4f}\n"
+                    f"LR={lr_current:.2e}{extra_tag}\n"
                 )
             if args.use_lora and len(lr_scheduler.get_last_lr()) >= 2:
                 log_line = log_line.rstrip("\n") + f", LoRA_LR={lr_scheduler.get_last_lr()[-1]:.2e}\n"
             with open(log_path, 'a') as f:
                 f.write(log_line)
-            
+
+            dfm_print = f", dfm_zc={dfm_zc_norm:.4f}" if dfm_zc_norm is not None else ""
             if val_lpips is not None:
                 print(
                     f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, "
                     f"val_lpips={val_lpips:.4f}, lr={lr_current:.2e}, px_ratio={pixel_ratio:.4f}"
+                    + dfm_print
                     + (f", lora_lr={lr_scheduler.get_last_lr()[-1]:.2e}" if args.use_lora and len(lr_scheduler.get_last_lr()) >= 2 else "")
                 )
             else:
                 print(
                     f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, "
                     f"lr={lr_current:.2e}, px_ratio={pixel_ratio:.4f}"
+                    + dfm_print
                     + (f", lora_lr={lr_scheduler.get_last_lr()[-1]:.2e}" if args.use_lora and len(lr_scheduler.get_last_lr()) >= 2 else "")
                 )
             
