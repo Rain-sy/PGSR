@@ -1996,9 +1996,6 @@ def main():
     parser.add_argument('--guidance', type=float, default=3.5)
     parser.add_argument('--control_guidance_start', type=float, default=0.0)
     parser.add_argument('--control_guidance_end', type=float, default=1.0)
-    parser.add_argument('--pixel_gate_init', type=float, default=6.0,
-                        help='[DEPRECATED] Legacy gated-fusion initial logit. No-op now that '
-                             'fusion is concat+1x1. Kept for CLI backward compatibility.')
     parser.add_argument('--lpips_weight', type=float, default=0.0,
                         help='Optional LPIPS loss weight in training')
     parser.add_argument('--lpips_resize', type=int, default=256,

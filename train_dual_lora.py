@@ -149,7 +149,8 @@ LORA_TARGET_PRESETS = {
 class PixelFeatureExtractor(nn.Module):
     """
     从原始像素空间提取高频特征，映射到 Latent 空间维度
-    使用 Zero Conv 确保初始化时不破坏预训练 ControlNet
+    输出头命名保持 ``zero_conv`` 以兼容旧 checkpoint key；
+    但初始化改为非零，避免 concat 融合下出现双零梯度死锁。
     """
     def __init__(self, latent_channels=16):
         super().__init__()
@@ -180,9 +181,12 @@ class PixelFeatureExtractor(nn.Module):
             nn.SiLU(),
         )
 
-        # Zero Conv
+        # Keep the historical ``zero_conv`` name for checkpoint compatibility,
+        # but use non-zero init so concat fusion's pixel slice can receive
+        # gradient from step 1 (pixel_fuse_proj already guarantees fused_cond
+        # starts as lr_lat via identity init on the lr slice).
         self.zero_conv = nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
-        nn.init.zeros_(self.zero_conv.weight)
+        nn.init.kaiming_normal_(self.zero_conv.weight, nonlinearity='relu')
         nn.init.zeros_(self.zero_conv.bias)
 
     def forward(self, x):
@@ -394,8 +398,9 @@ class DualStreamFLUXSR(nn.Module):
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         # Concat-based fusion: [lr_lat || pixel_feat] (32ch) -> 16ch via 1x1 conv.
         # Identity-init on the first 16 input channels keeps lr_lat passthrough at start;
-        # the pixel_feat slice starts at 0 and the PixelFeatureExtractor's zero_conv is
-        # already zero, so the fused output equals lr_lat until training learns otherwise.
+        # the pixel_feat slice starts at 0, so fused output still equals lr_lat at init.
+        # PixelFeatureExtractor's zero_conv is intentionally non-zero to prevent
+        # concat fusion from falling into a dual-zero dead-gradient chain.
         self.pixel_fuse_proj = nn.Conv2d(32, 16, kernel_size=1).to(self.device).to(dtype)
         self._reset_pixel_fuse_proj_to_identity()
         self.pixel_extractor.train()
@@ -1222,9 +1227,6 @@ def main():
     parser.add_argument('--guidance', type=float, default=3.5)
     parser.add_argument('--control_guidance_start', type=float, default=0.0)
     parser.add_argument('--control_guidance_end', type=float, default=1.0)
-    parser.add_argument('--pixel_gate_init', type=float, default=6.0,
-                        help='[DEPRECATED] Legacy gated-fusion initial logit. No-op now that '
-                             'fusion is concat+1x1. Kept for CLI backward compatibility.')
     parser.add_argument('--lpips_weight', type=float, default=0.0,
                         help='Optional LPIPS loss weight in training')
     parser.add_argument('--lpips_resize', type=int, default=256,
