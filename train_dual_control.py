@@ -49,8 +49,6 @@ Typical commands (DF2K → Mix16K workflow):
         --strength 1 \
         --lpips_weight 0.05 --lpips_resize 256 --lpips_apply_prob 0.1 \
         --lpips_max_sigma 0.7 \
-        --realesrgan_paired_prob 0.15 --realesrgan_bicubic_prob 0.10 \
-        --usm_mode realesrgan --usm_weight 0.3 \
         --empty_cache_steps 50
 """
 
@@ -145,13 +143,52 @@ LORA_TARGET_PRESETS = {
 
 
 # ============================================================================
+# Fixed degradation / USM config (edit here; not exposed on CLI)
+# ============================================================================
+
+REALESRGAN_CFG = {
+    'blur_prob': 0.8,
+    'second_blur_prob': 0.8,
+    'gaussian_noise_prob1': 0.5,
+    'gaussian_noise_prob2': 0.5,
+    'gray_noise_prob1': 0.4,
+    'gray_noise_prob2': 0.4,
+    'final_sinc_prob': 0.8,
+    'blur_sigma': [0.2, 3.0],
+    'blur_sigma2': [0.2, 1.5],
+    'resize_prob1': [0.2, 0.7, 0.1],
+    'resize_prob2': [0.3, 0.4, 0.3],
+    'resize_range1': [0.15, 1.5],
+    'resize_range2': [0.3, 1.2],
+    'noise_sigma1': [1.0, 30.0],
+    'noise_sigma2': [1.0, 25.0],
+    'poisson_scale1': [0.05, 3.0],
+    'poisson_scale2': [0.05, 2.5],
+    'jpeg_range1': [30, 95],
+    'jpeg_range2': [30, 95],
+    'paired_prob': 0.0,
+    'bicubic_prob': 0.0,
+    'blur_sigma_scale': 0.0,
+}
+
+USM_CFG = {
+    'mode': 'off',
+    'weight': 0.0,
+    'radius': 1.0,
+    'threshold': 10.0,
+    'apply_prob': 1.0,
+}
+
+
+# ============================================================================
 # Pixel Feature Extractor
 # ============================================================================
 
 class PixelFeatureExtractor(nn.Module):
     """
     从原始像素空间提取高频特征，映射到 Latent 空间维度
-    使用 Zero Conv 确保初始化时不破坏预训练 ControlNet
+    输出头命名保持 ``zero_conv`` 以兼容旧 checkpoint key；
+    但初始化改为非零，避免 concat 融合下出现双零梯度死锁。
 
     Submodules are kept inside a flat ``self.encoder`` nn.Sequential so that
     checkpoints saved before the DFM refactor still load 1:1 with the same
@@ -198,9 +235,12 @@ class PixelFeatureExtractor(nn.Module):
             nn.SiLU(),                                                  # 17
         )
 
-        # Zero Conv
+        # Keep the historical ``zero_conv`` name for checkpoint compatibility,
+        # but use non-zero init so concat fusion's pixel slice can receive
+        # gradient from step 1 (pixel_fuse_proj already guarantees fused_cond
+        # starts as lr_lat via its identity init on the lr slice).
         self.zero_conv = nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
-        nn.init.zeros_(self.zero_conv.weight)
+        nn.init.kaiming_normal_(self.zero_conv.weight, nonlinearity='relu')
         nn.init.zeros_(self.zero_conv.bias)
 
     def forward(self, x, return_features=False):
@@ -1904,31 +1944,8 @@ def main():
     parser.add_argument('--degrade_mode', type=str, default='paired', choices=['paired', 'bicubic', 'realesrgan'],
                         help='Train-time degradation mode. Validation still uses paired LR when val_lr_dir is set.')
 
-    # Real-ESRGAN-style second-order degradation
-    parser.add_argument('--realesrgan_blur_prob', type=float, default=0.8)
-    parser.add_argument('--realesrgan_second_blur_prob', type=float, default=0.8)
-    parser.add_argument('--realesrgan_gaussian_noise_prob1', type=float, default=0.5)
-    parser.add_argument('--realesrgan_gaussian_noise_prob2', type=float, default=0.5)
-    parser.add_argument('--realesrgan_gray_noise_prob1', type=float, default=0.4)
-    parser.add_argument('--realesrgan_gray_noise_prob2', type=float, default=0.4)
-    parser.add_argument('--realesrgan_final_sinc_prob', type=float, default=0.8)
-    parser.add_argument('--realesrgan_blur_sigma1', type=float, nargs=2, default=[0.2, 3.0])
-    parser.add_argument('--realesrgan_blur_sigma2', type=float, nargs=2, default=[0.2, 1.5])
-    parser.add_argument('--realesrgan_resize_prob1', type=float, nargs=3, default=[0.2, 0.7, 0.1])
-    parser.add_argument('--realesrgan_resize_prob2', type=float, nargs=3, default=[0.3, 0.4, 0.3])
-    parser.add_argument('--realesrgan_resize_range1', type=float, nargs=2, default=[0.15, 1.5])
-    parser.add_argument('--realesrgan_resize_range2', type=float, nargs=2, default=[0.3, 1.2])
-    parser.add_argument('--realesrgan_noise_sigma1', type=float, nargs=2, default=[1.0, 30.0])
-    parser.add_argument('--realesrgan_noise_sigma2', type=float, nargs=2, default=[1.0, 25.0])
-    parser.add_argument('--realesrgan_poisson_scale1', type=float, nargs=2, default=[0.05, 3.0])
-    parser.add_argument('--realesrgan_poisson_scale2', type=float, nargs=2, default=[0.05, 2.5])
-    parser.add_argument('--realesrgan_jpeg_range1', type=int, nargs=2, default=[30, 95])
-    parser.add_argument('--realesrgan_jpeg_range2', type=int, nargs=2, default=[30, 95])
-    parser.add_argument('--realesrgan_paired_prob', type=float, default=0.0,
-                        help='In realesrgan mode, probability of using paired LR when available (quality-anchor mix)')
-    parser.add_argument('--realesrgan_bicubic_prob', type=float, default=0.0,
-                        help='In realesrgan mode, probability of using bicubic degradation (stability mix)')
-    
+    # RealESRGAN degradation params live in ``REALESRGAN_CFG`` module constant.
+
     # Model
     parser.add_argument('--model_name', type=str, default='black-forest-labs/FLUX.1-dev')
     parser.add_argument('--pretrained_controlnet', type=str, default=None)
@@ -1956,24 +1973,15 @@ def main():
                         help='Probability of applying LPIPS loss on each train step')
     parser.add_argument('--geom_aug', action='store_true',
                         help='Enable random flip/rotation augmentation during training')
-    parser.add_argument('--usm_mode', type=str, default='off', choices=['off', 'realesrgan', 'all'],
-                        help='USM sharpening scope for GT: off, only in realesrgan training, or all modes')
-    parser.add_argument('--usm_weight', type=float, default=0.0,
-                        help='USM sharpening weight (0 disables USM)')
-    parser.add_argument('--usm_radius', type=float, default=1.0,
-                        help='USM Gaussian blur radius (PIL radius)')
-    parser.add_argument('--usm_threshold', type=float, default=10.0,
-                        help='USM threshold in [0,255] space')
-    parser.add_argument('--usm_apply_prob', type=float, default=1.0,
-                        help='Probability to apply USM on each training sample')
+    # USM sharpening params live in ``USM_CFG`` module constant.
     parser.add_argument('--empty_cache_steps', type=int, default=0,
                         help='Call gc/empty_cache every N training steps (0 to disable)')
     
     # Validation/eval start point (img2img-style interpolation from LR + noise)
     parser.add_argument('--strength', type=float, default=1,
                         help='Validation/eval strength (1.0 = pure noise start, 0.8 = skip first 20%% steps)')
-    parser.add_argument('--val_num_steps', type=int, default=10)
-    parser.add_argument('--val_num_samples', type=int, default=5,
+    parser.add_argument('--val_num_steps', type=int, default=20)
+    parser.add_argument('--val_num_samples', type=int, default=10,
                         help='Number of validation samples per epoch (<=0 means full validation set)')
     parser.add_argument('--val_calc_lpips', action='store_true',
                         help='Also compute LPIPS on validation set')
@@ -2047,10 +2055,6 @@ def main():
     parser.add_argument('--controlnet_lr_scale', type=float, default=1.0,
                         help='Multiplier applied to --lr for the ControlNet param group (use <1 for Stage 2 fine-tuning, e.g. 0.1).')
 
-    # Degradation: resolution-aware scaling
-    parser.add_argument('--blur_sigma_scale', type=float, default=0.0,
-                        help='Multiplier applied to realesrgan_blur_sigma1/2. 0.0 = auto (resolution/256).')
-
     # LPIPS: only apply when denoising is mostly done (low sigma)
     parser.add_argument('--lpips_max_sigma', type=float, default=0.7,
                         help='Only compute LPIPS when sampled sigma < this threshold (decoded pred_hr is garbage at high sigma).')
@@ -2068,22 +2072,8 @@ def main():
         parser.error("--epochs must be >= 1")
     if args.resolution % args.scale != 0:
         parser.error("--resolution must be divisible by --scale")
-    if args.usm_weight < 0:
-        parser.error("--usm_weight must be >= 0")
-    if args.usm_radius < 0:
-        parser.error("--usm_radius must be >= 0")
-    if not (0.0 <= args.usm_apply_prob <= 1.0):
-        parser.error("--usm_apply_prob must be within [0, 1]")
-    if not (0.0 <= args.realesrgan_paired_prob <= 1.0):
-        parser.error("--realesrgan_paired_prob must be within [0, 1]")
-    if not (0.0 <= args.realesrgan_bicubic_prob <= 1.0):
-        parser.error("--realesrgan_bicubic_prob must be within [0, 1]")
-    if args.realesrgan_paired_prob + args.realesrgan_bicubic_prob > 1.0:
-        parser.error("--realesrgan_paired_prob + --realesrgan_bicubic_prob must be <= 1")
     if args.controlnet_lr_scale < 0:
         parser.error("--controlnet_lr_scale must be >= 0")
-    if args.blur_sigma_scale < 0:
-        parser.error("--blur_sigma_scale must be >= 0")
     if args.lpips_max_sigma < 0:
         parser.error("--lpips_max_sigma must be >= 0")
     if args.degrade_mode == 'paired' and not args.lr_dir:
@@ -2118,12 +2108,6 @@ def main():
         )
     if is_main and args.degrade_mode in ('paired', 'bicubic') and args.lpips_weight > 0:
         print("[Warning] LPIPS in Stage-1 style training can reduce PSNR. Consider --lpips_weight 0.")
-    if is_main and args.degrade_mode in ('paired', 'bicubic') and args.usm_mode != 'off' and args.usm_weight > 0:
-        print("[Warning] USM on paired/bicubic training can reduce PSNR. Consider --usm_mode off for Stage 1.")
-    if is_main and args.usm_mode == 'off' and args.usm_weight > 0:
-        print("[Warning] --usm_weight is set but --usm_mode=off, so USM is disabled.")
-    if is_main and args.usm_mode != 'off' and args.usm_weight <= 0:
-        print("[Warning] --usm_mode is enabled but --usm_weight <= 0, so USM has no effect.")
     triton_cache_dir = os.environ.get("TRITON_CACHE_DIR")
     if triton_cache_dir:
         try:
@@ -2148,8 +2132,6 @@ def main():
         f"_lpw{_fmt_tag(args.lpips_weight)}"
         f"_lpp{_fmt_tag(args.lpips_apply_prob)}"
         f"_aug{int(args.geom_aug)}"
-        f"_usm{_fmt_tag(args.usm_mode)}"
-        f"_usmw{_fmt_tag(args.usm_weight)}"
         f"_bm{_fmt_tag(args.best_metric)}"
         f"_crop{args.num_crops}"
     )
@@ -2191,10 +2173,6 @@ def main():
         print(f"Conditioning Scale: {args.conditioning_scale}")
         print(f"LPIPS Weight: {args.lpips_weight} (resize={args.lpips_resize}, prob={args.lpips_apply_prob})")
         print(f"Geometric Aug: {args.geom_aug}")
-        print(
-            f"USM: mode={args.usm_mode}, weight={args.usm_weight}, radius={args.usm_radius}, "
-            f"threshold={args.usm_threshold}, prob={args.usm_apply_prob}"
-        )
         print(f"Empty Cache Steps: {args.empty_cache_steps}")
         if triton_cache_dir:
             print(f"TRITON_CACHE_DIR: {triton_cache_dir}")
@@ -2219,16 +2197,6 @@ def main():
             )
         else:
             print("LoRA: disabled")
-        if args.degrade_mode == 'realesrgan':
-            print(
-                f"RealESRGAN Degrade: blur_p={args.realesrgan_blur_prob}, "
-                f"second_blur_p={args.realesrgan_second_blur_prob}, "
-                f"final_sinc_p={args.realesrgan_final_sinc_prob}"
-            )
-            print(
-                f"RealESRGAN Mix: paired_p={args.realesrgan_paired_prob}, "
-                f"bicubic_p={args.realesrgan_bicubic_prob}"
-            )
         print(f"Save Dir: {save_dir}")
         print("=" * 70 + "\n")
     
@@ -2385,50 +2353,21 @@ def main():
         )
     
     # Datasets
-    realesrgan_cfg = {
-        'blur_prob': args.realesrgan_blur_prob,
-        'second_blur_prob': args.realesrgan_second_blur_prob,
-        'gaussian_noise_prob1': args.realesrgan_gaussian_noise_prob1,
-        'gaussian_noise_prob2': args.realesrgan_gaussian_noise_prob2,
-        'gray_noise_prob1': args.realesrgan_gray_noise_prob1,
-        'gray_noise_prob2': args.realesrgan_gray_noise_prob2,
-        'final_sinc_prob': args.realesrgan_final_sinc_prob,
-        'blur_sigma': args.realesrgan_blur_sigma1,
-        'blur_sigma2': args.realesrgan_blur_sigma2,
-        'resize_prob1': args.realesrgan_resize_prob1,
-        'resize_prob2': args.realesrgan_resize_prob2,
-        'resize_range1': args.realesrgan_resize_range1,
-        'resize_range2': args.realesrgan_resize_range2,
-        'noise_sigma1': args.realesrgan_noise_sigma1,
-        'noise_sigma2': args.realesrgan_noise_sigma2,
-        'poisson_scale1': args.realesrgan_poisson_scale1,
-        'poisson_scale2': args.realesrgan_poisson_scale2,
-        'jpeg_range1': args.realesrgan_jpeg_range1,
-        'jpeg_range2': args.realesrgan_jpeg_range2,
-        'paired_prob': args.realesrgan_paired_prob,
-        'bicubic_prob': args.realesrgan_bicubic_prob,
-        'blur_sigma_scale': args.blur_sigma_scale,
-    }
-    # In realesrgan mode we still want lr_dir available for the paired-mix
-    # branch (paired_prob / bicubic_prob). Previously we silently set it to
-    # None, so --realesrgan_paired_prob had no effect.
-    if args.degrade_mode == 'paired':
-        train_lr_dir = args.lr_dir
-    elif args.degrade_mode == 'realesrgan':
-        train_lr_dir = args.lr_dir  # optional; _find_lr_file handles missing files
-    else:
+    if args.degrade_mode == 'bicubic':
         train_lr_dir = None
+    else:
+        train_lr_dir = args.lr_dir  # realesrgan also accepts optional paired mix
     train_dataset = SRDataset(
         args.hr_dir, train_lr_dir, args.resolution,
         num_crops=args.num_crops, is_val=False,
         degrade_mode=args.degrade_mode, scale=args.scale,
-        realesrgan_cfg=realesrgan_cfg,
+        realesrgan_cfg=REALESRGAN_CFG,
         geom_aug=args.geom_aug,
-        usm_mode=args.usm_mode,
-        usm_weight=args.usm_weight,
-        usm_radius=args.usm_radius,
-        usm_threshold=args.usm_threshold,
-        usm_apply_prob=args.usm_apply_prob,
+        usm_mode=USM_CFG['mode'],
+        usm_weight=USM_CFG['weight'],
+        usm_radius=USM_CFG['radius'],
+        usm_threshold=USM_CFG['threshold'],
+        usm_apply_prob=USM_CFG['apply_prob'],
     )
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
@@ -2626,10 +2565,7 @@ def main():
             f.write(f"Pixel Fusion: concat+1x1 conv (identity-init lr_lat passthrough)\n")
             f.write(f"LPIPS Weight: {args.lpips_weight} (resize={args.lpips_resize}, prob={args.lpips_apply_prob})\n\n")
             f.write(f"Geometric Aug: {args.geom_aug}\n")
-            f.write(
-                f"USM: mode={args.usm_mode}, weight={args.usm_weight}, radius={args.usm_radius}, "
-                f"threshold={args.usm_threshold}, prob={args.usm_apply_prob}\n\n"
-            )
+            f.write(f"USM: {USM_CFG}\n\n")
             f.write(
                 f"Validation: steps={args.val_num_steps}, samples={args.val_num_samples}, "
                 f"lpips={args.val_calc_lpips}\n"
@@ -2638,22 +2574,7 @@ def main():
                 f"Best Metric: {args.best_metric}, Reset Best On Resume: {args.reset_best_on_resume}\n\n"
             )
             if args.degrade_mode == 'realesrgan':
-                f.write(
-                    "RealESRGAN Degrade: "
-                    f"blur_p={args.realesrgan_blur_prob}, "
-                    f"second_blur_p={args.realesrgan_second_blur_prob}, "
-                    f"final_sinc_p={args.realesrgan_final_sinc_prob}\n"
-                )
-                f.write(
-                    "RealESRGAN Noise/JPEG: "
-                    f"n1={args.realesrgan_noise_sigma1}, n2={args.realesrgan_noise_sigma2}, "
-                    f"j1={args.realesrgan_jpeg_range1}, j2={args.realesrgan_jpeg_range2}\n\n"
-                )
-                f.write(
-                    "RealESRGAN Mix: "
-                    f"paired_p={args.realesrgan_paired_prob}, "
-                    f"bicubic_p={args.realesrgan_bicubic_prob}\n\n"
-                )
+                f.write(f"RealESRGAN Degrade: {REALESRGAN_CFG}\n\n")
             f.write(f"Empty Cache Steps: {args.empty_cache_steps}\n\n")
             f.write(f"Conditioning Scale: {args.conditioning_scale}\n")
             f.write(f"Control Guidance Window: [{args.control_guidance_start}, {args.control_guidance_end}]\n")
@@ -2921,6 +2842,26 @@ def main():
         print(f"Checkpoints: {save_dir}")
         print("=" * 70)
 
+    # Explicitly end the Accelerator training state so DDP/NCCL resources are
+    # cleaned up before process exit (PyTorch 2.4+ warns if not destroyed).
+    accelerator.wait_for_everyone()
+    try:
+        accelerator.end_training()
+    except Exception:
+        pass
+
+def _destroy_process_group_safely():
+    """Best-effort teardown for torch.distributed process groups."""
+    try:
+        dist = torch.distributed
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception:
+        pass
+
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    finally:
+        _destroy_process_group_safely()

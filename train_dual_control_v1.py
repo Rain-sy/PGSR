@@ -1,57 +1,37 @@
 #!/usr/bin/env python
 """
 ======================================================================
-Dual-Stream FLUX SR ControlNet Training (with Degradation Pipeline)
+Dual-Stream FLUX SR ControlNet Training — Legacy Entry (v1)
 ======================================================================
 
-This is the NEW training entry.
+Legacy training script, kept as a baseline reference. Fusion here is the
+original add / gate-fusion path (NOT the concat+1x1 identity-init used in
+train_dual_control.py / train_dual_dfm.py). Use this file only for A/B
+comparison against the newer concat-fusion / DFM entries.
+
 - Supports `--degrade_mode {paired, bicubic, realesrgan}`
 - `realesrgan` mode performs on-the-fly second-order degradation from HR patches
-- Keeps scheduler semantics aligned with official FlowMatch usage
-- FLUX LoRA training is enabled by default
+- Scheduler follows official FlowMatch usage
+- FLUX LoRA enabled by default
+- RealESRGAN / USM still exposed as CLI flags here (the newer files moved
+  them into module-level constants)
 
-Typical commands (DF2K → Mix16K workflow):
+NOTE on resume semantics:
+- default `--epochs_mode absolute`: --epochs is the target absolute epoch.
+- `--epochs_mode stage`: --epochs means "epochs to run in THIS stage".
+- lr_scheduler / optimizer restart fresh on resume by default
+  (see --resume_optimizer / --resume_lr_scheduler to override).
 
-    NOTE on resume semantics:
-    - default `--epochs_mode absolute` (backward compatible): --epochs is target absolute epoch.
-    - `--epochs_mode stage`: --epochs means "epochs to run in THIS stage".
-    lr_scheduler and optimizer restart fresh on resume by default (see
-    --resume_optimizer / --resume_lr_scheduler to override).
+Typical DIV2K bicubic baseline (no DFM, no LPIPS):
 
-1) Stage 1: paired bicubic pretraining on DF2K
-    accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
-        train_dual_control.py \
-        --hr_dir Data/DF2K_HR \
-        --lr_dir Data/DF2K_LR_bicubic_X4 \
+    accelerate launch --num_processes=8 --mixed_precision bf16 \
+        train_dual_control_v1.py \
+        --hr_dir Data/DIV2K/DIV2K_train_HR \
+        --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
+        --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
+        --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
         --degrade_mode paired --scale 4 \
-        --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
-        --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --batch_size 4 --epochs 40 --num_crops 2 --lr 1e-5 \
-        --warmup_epochs 5 \
-        --strength 1 \
-        --lpips_weight 0 \
-        --empty_cache_steps 50
-
-2) Stage 2: realesrgan degradation fine-tuning on Mix16K
-    accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
-        train_dual_control.py \
-        --hr_dir Data/Mix16K_HR \
-        --lr_dir Data/Mix16K_LR_bicubic_X4 \
-        --degrade_mode realesrgan --scale 4 \
-        --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
-        --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --resume checkpoints/dual_control/<stage1_exp>/best_model.pt \
-        --epochs_mode stage \
-        --reset_pixel_gate \
-        --controlnet_lr_scale 0.1 \
-        --batch_size 4 --epochs 20 --num_crops 2 --lr 5e-6 \
-        --warmup_epochs 2 \
-        --strength 1 \
-        --lpips_weight 0.05 --lpips_resize 256 --lpips_apply_prob 0.1 \
-        --lpips_max_sigma 0.7 \
-        --realesrgan_paired_prob 0.15 --realesrgan_bicubic_prob 0.10 \
-        --usm_mode realesrgan --usm_weight 0.3 \
-        --empty_cache_steps 50
+        --epochs 60 --val_calc_lpips
 """
 
 
@@ -701,6 +681,7 @@ class DualStreamFLUXSR(nn.Module):
         self.controlnet = None
         self.pixel_extractor = None
         self.pixel_fuse_proj = None
+        self.pixel_gate_logit = None
         self.scheduler = None
         self._cached_embeds = None
         
@@ -782,12 +763,10 @@ class DualStreamFLUXSR(nn.Module):
         # Pixel Feature Extractor
         print(f"[Rank {local_rank}] Initializing Pixel Feature Extractor...")
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
-        # Concat-based fusion: [lr_lat || pixel_feat] (32ch) -> 16ch via 1x1 conv.
-        # Identity-init on the first 16 input channels keeps lr_lat passthrough at start;
-        # the pixel_feat slice starts at 0 and the PixelFeatureExtractor's zero_conv is
-        # already zero, so the fused output equals lr_lat until training learns otherwise.
-        self.pixel_fuse_proj = nn.Conv2d(32, 16, kernel_size=1).to(self.device).to(dtype)
+        # Legacy gated fusion: lr_lat + pixel_weight * sigmoid(gate) * proj(pixel_feat).
+        self.pixel_fuse_proj = nn.Conv2d(16, 16, kernel_size=1).to(self.device).to(dtype)
         self._reset_pixel_fuse_proj_to_identity()
+        self.pixel_gate_logit = nn.Parameter(torch.tensor(-1.0, device=self.device))
         self.pixel_extractor.train()
         self.pixel_fuse_proj.train()
         
@@ -837,21 +816,14 @@ class DualStreamFLUXSR(nn.Module):
         gc.collect()
 
     def _reset_pixel_fuse_proj_to_identity(self):
-        """Identity-init the lr_lat passthrough and zero the pixel_feat branch.
-
-        The 1x1 conv has in_channels = lr_lat (16) + pixel_feat (16) = 32 and
-        out_channels = 16. We want the initial output to equal lr_lat, so we
-        set the first 16 input channels to identity and the last 16 to zero.
-        """
+        """Identity-init the 1x1 projection used on pixel features."""
         if self.pixel_fuse_proj is None:
             return
         with torch.no_grad():
             self.pixel_fuse_proj.weight.zero_()
             self.pixel_fuse_proj.bias.zero_()
-            out_ch = self.pixel_fuse_proj.out_channels
-            in_ch = self.pixel_fuse_proj.in_channels
-            passthrough = min(out_ch, in_ch // 2 if in_ch >= 2 * out_ch else in_ch)
-            idx = torch.arange(passthrough, device=self.pixel_fuse_proj.weight.device)
+            channels = min(self.pixel_fuse_proj.out_channels, self.pixel_fuse_proj.in_channels)
+            idx = torch.arange(channels, device=self.pixel_fuse_proj.weight.device)
             self.pixel_fuse_proj.weight[idx, idx, 0, 0] = 1.0
 
     def _apply_lora_to_transformer(self, local_rank=0):
@@ -938,6 +910,7 @@ class DualStreamFLUXSR(nn.Module):
     def get_pixel_branch_params(self):
         params = list(self.pixel_extractor.parameters())
         params += list(self.pixel_fuse_proj.parameters())
+        params.append(self.pixel_gate_logit)
         return params
 
     def get_lora_params(self):
@@ -1037,12 +1010,10 @@ class DualStreamFLUXSR(nn.Module):
                 pixel_feat, size=lr_lat.shape[-2:], mode='bilinear', align_corners=False
             )
 
-        # Concat fusion: [lr_lat || pixel_weight*pixel_feat] -> 1x1 conv -> 16ch.
-        # Identity init (see _reset_pixel_fuse_proj_to_identity) makes the initial
-        # output equal to lr_lat, after which the network learns the mixing itself.
-        fused_cond = self.pixel_fuse_proj(
-            torch.cat([lr_lat.to(dtype), (self.pixel_weight * pixel_feat).to(dtype)], dim=1)
-        ).to(dtype)
+        # Legacy gated fusion.
+        pixel_feat = self.pixel_fuse_proj(pixel_feat.to(dtype))
+        pixel_gate = torch.sigmoid(self.pixel_gate_logit).to(dtype)
+        fused_cond = (lr_lat.to(dtype) + self.pixel_weight * pixel_gate * pixel_feat).to(dtype)
         
         # Pack
         noisy_packed = self._pack(noisy.to(dtype))
@@ -1349,87 +1320,54 @@ def validate(system, accelerator, val_loader, device, num_samples=10,
         'lpips': float(np.mean(lpips_list)) if lpips_list else None,
     }
 def _load_pixel_fuse_proj_with_migration(unwrapped, ckpt, is_main=False):
-    """Load pixel_fuse_proj from a checkpoint, migrating legacy gated-fusion
-    checkpoints to the new concat-based layout.
-
-    Legacy layout:
-        pixel_fuse_proj: Conv2d(16, 16, 1) applied to pixel_feat
-        pixel_gate_logit: scalar; effective contribution = sigmoid(gate) * proj(pixel_feat)
-        fused = lr_lat + pixel_weight * sigmoid(gate) * conv_old(pixel_feat)
-
-    New layout:
-        pixel_fuse_proj: Conv2d(32, 16, 1) applied to cat([lr_lat, pixel_weight*pixel_feat])
-        fused = W_lr @ lr_lat + W_px @ (pixel_weight * pixel_feat) + b
-
-    Migration preserves the learned direction:
-        W_lr[i, j] = I (so lr_lat passthrough is preserved)
-        W_px = sigmoid(gate) * conv_old.weight / pixel_weight_effective
-        b    = sigmoid(gate) * conv_old.bias
-    Since the forward multiplies pixel_feat by self.pixel_weight before the conv,
-    and the legacy forward also applies self.pixel_weight, we can set W_px =
-    sigmoid(gate) * conv_old.weight directly (both paths carry the same
-    pixel_weight factor).
-    """
+    """Load gated-fusion params; best-effort migrate from concat checkpoints."""
     if 'pixel_fuse_proj' not in ckpt:
         if is_main:
             print("[Resume] pixel_fuse_proj missing; keeping fresh identity init.")
-        return
+    else:
+        state = {k.replace('module.', ''): v for k, v in ckpt['pixel_fuse_proj'].items()}
+        target = unwrapped.pixel_fuse_proj
+        target_w = target.weight
+        src_w = state.get('weight')
+        src_b = state.get('bias')
 
-    state = {k.replace('module.', ''): v for k, v in ckpt['pixel_fuse_proj'].items()}
-    target = unwrapped.pixel_fuse_proj
-    target_w = target.weight
-    src_w = state.get('weight')
-    src_b = state.get('bias')
-
-    is_legacy = (
-        src_w is not None
-        and src_w.shape == (16, 16, 1, 1)
-        and target_w.shape == (16, 32, 1, 1)
-    )
-
-    if not is_legacy and src_w is not None and src_w.shape == target_w.shape:
-        target.load_state_dict(state)
-        if is_main:
-            fusion_type = ckpt.get('fusion_type', 'concat')
-            print(f"[Resume] pixel_fuse_proj loaded (fusion_type={fusion_type}).")
-        return
-
-    if is_legacy:
-        gate_raw = ckpt.get('pixel_gate_logit', None)
-        if gate_raw is None:
-            gate_sig = 1.0
+        if src_w is not None and src_w.shape == target_w.shape:
+            target.load_state_dict(state)
+            if is_main:
+                fusion_type = ckpt.get('fusion_type', 'gated')
+                print(f"[Resume] pixel_fuse_proj loaded (fusion_type={fusion_type}).")
+        elif src_w is not None and src_w.shape == (16, 32, 1, 1) and target_w.shape == (16, 16, 1, 1):
+            # Approximate migration from concat -> gated: keep only the pixel slice.
+            with torch.no_grad():
+                target.weight.copy_(src_w[:, 16:32, :, :].to(device=target_w.device, dtype=target_w.dtype))
+                if src_b is not None:
+                    target.bias.copy_(src_b.to(device=target.bias.device, dtype=target.bias.dtype))
+                else:
+                    target.bias.zero_()
+            if is_main:
+                print("[Resume] Concat checkpoint migrated to gated layout (using pixel slice only).")
         else:
-            if isinstance(gate_raw, torch.Tensor):
-                gate_val = float(gate_raw.detach().float().item())
-            else:
-                gate_val = float(gate_raw)
-            gate_sig = 1.0 / (1.0 + math.exp(-gate_val))
+            if is_main:
+                print(
+                    f"[Resume][WARN] pixel_fuse_proj shape mismatch: "
+                    f"ckpt={tuple(src_w.shape) if src_w is not None else None}, "
+                    f"model={tuple(target_w.shape)}. Keeping fresh identity init."
+                )
 
+    gate_raw = ckpt.get('pixel_gate_logit', None)
+    if gate_raw is not None:
         with torch.no_grad():
-            target.weight.zero_()
-            target.bias.zero_()
-            # Identity on first 16 input channels (lr_lat passthrough).
-            idx = torch.arange(16, device=target_w.device)
-            target.weight[idx, idx, 0, 0] = 1.0
-            # Scaled legacy conv on the last 16 input channels (pixel branch).
-            legacy_w = src_w.to(device=target_w.device, dtype=target_w.dtype) * gate_sig
-            target.weight[:, 16:32, :, :].copy_(legacy_w)
-            if src_b is not None:
-                legacy_b = src_b.to(device=target.bias.device, dtype=target.bias.dtype) * gate_sig
-                target.bias.copy_(legacy_b)
+            if isinstance(gate_raw, torch.Tensor):
+                gate_raw = gate_raw.to(
+                    device=unwrapped.pixel_gate_logit.device,
+                    dtype=unwrapped.pixel_gate_logit.dtype,
+                )
+                unwrapped.pixel_gate_logit.copy_(gate_raw)
+            else:
+                unwrapped.pixel_gate_logit.fill_(float(gate_raw))
         if is_main:
-            print(
-                f"[Resume] Legacy gated-fusion checkpoint migrated to concat layout "
-                f"(sigmoid(gate)={gate_sig:.4f})."
-            )
-        return
-
-    if is_main:
-        print(
-            f"[Resume][WARN] pixel_fuse_proj shape mismatch: "
-            f"ckpt={tuple(src_w.shape) if src_w is not None else None}, "
-            f"model={tuple(target_w.shape)}. Keeping fresh identity init."
-        )
+            gate_sig = torch.sigmoid(unwrapped.pixel_gate_logit.detach().float()).item()
+            print(f"[Resume] pixel_gate_logit loaded (sigmoid={gate_sig:.4f}).")
 
 
 def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, strength,
@@ -1462,7 +1400,8 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
         'control_guidance_end': control_guidance_end,
         'pixel_extractor': unwrapped.pixel_extractor.state_dict(),
         'pixel_fuse_proj': unwrapped.pixel_fuse_proj.state_dict(),
-        'fusion_type': 'concat',
+        'pixel_gate_logit': unwrapped.pixel_gate_logit.detach().cpu(),
+        'fusion_type': 'gated',
         'controlnet': unwrapped.controlnet.state_dict(),
         'use_lora': unwrapped.use_lora,
     }
@@ -1557,8 +1496,7 @@ def main():
     parser.add_argument('--control_guidance_start', type=float, default=0.0)
     parser.add_argument('--control_guidance_end', type=float, default=1.0)
     parser.add_argument('--pixel_gate_init', type=float, default=6.0,
-                        help='[DEPRECATED] Legacy gated-fusion initial logit. No-op now that '
-                             'fusion is concat+1x1. Kept for CLI backward compatibility.')
+                        help='Initial logit for gated pixel fusion (sigmoid(logit) is gate value).')
     parser.add_argument('--lpips_weight', type=float, default=0.0,
                         help='Optional LPIPS loss weight in training')
     parser.add_argument('--lpips_resize', type=int, default=256,
@@ -1619,9 +1557,7 @@ def main():
     parser.add_argument('--resume_lr_scheduler', action='store_true', default=False,
                         help='When resuming, restore the LambdaLR step counter. Default OFF: the new stage gets a fresh warmup + cosine over --epochs.')
     parser.add_argument('--reset_pixel_gate', action='store_true', default=False,
-                        help='On resume, reset pixel_fuse_proj back to identity init '
-                             '(lr_lat passthrough, pixel branch zeroed). Useful when switching '
-                             'Stage 1 -> Stage 2 to re-learn the mixing from a clean starting point.')
+                        help='On resume, reset pixel_fuse_proj to identity and gate to --pixel_gate_init.')
     parser.add_argument('--controlnet_lr_scale', type=float, default=1.0,
                         help='Multiplier applied to --lr for the ControlNet param group (use <1 for Stage 2 fine-tuning, e.g. 0.1).')
 
@@ -1722,7 +1658,7 @@ def main():
         f"_x{args.scale}"
         f"_str{_fmt_tag(args.strength)}"
         f"_pw{_fmt_tag(args.pixel_weight)}"
-        f"_concat"
+        f"_gate{_fmt_tag(args.pixel_gate_init)}"
         f"_lpw{_fmt_tag(args.lpips_weight)}"
         f"_lpp{_fmt_tag(args.lpips_apply_prob)}"
         f"_aug{int(args.geom_aug)}"
@@ -1756,7 +1692,9 @@ def main():
         print(f"Num Crops: {args.num_crops}")
         print(f"Batch Size: {args.batch_size}")
         print(f"Pixel Weight: {args.pixel_weight}")
-        print(f"Pixel Fusion: concat+1x1 conv (identity-init lr_lat passthrough)")
+        print(f"Pixel Fusion: gated residual add")
+        print(f"Pixel Gate Init (logit): {args.pixel_gate_init}")
+        print(f"Pixel Gate Init (sigmoid): {1.0 / (1.0 + math.exp(-args.pixel_gate_init)):.4f}")
         print(f"Conditioning Scale: {args.conditioning_scale}")
         print(f"LPIPS Weight: {args.lpips_weight} (resize={args.lpips_resize}, prob={args.lpips_apply_prob})")
         print(f"Geometric Aug: {args.geom_aug}")
@@ -1807,6 +1745,8 @@ def main():
         lora_target_regex=lora_target_regex,
         lora_init_weights=lora_init_weights,
     )
+    with torch.no_grad():
+        system.pixel_gate_logit.fill_(args.pixel_gate_init)
     if args.dry_run_lora:
         if is_main:
             wrapped = []
@@ -2006,8 +1946,13 @@ def main():
         if args.reset_pixel_gate:
             with torch.no_grad():
                 unwrapped._reset_pixel_fuse_proj_to_identity()
+                unwrapped.pixel_gate_logit.fill_(args.pixel_gate_init)
             if is_main:
-                print("[Resume] --reset_pixel_gate: pixel_fuse_proj reset to identity (lr_lat passthrough).")
+                gate_sig = torch.sigmoid(unwrapped.pixel_gate_logit.detach().float()).item()
+                print(
+                    "[Resume] --reset_pixel_gate: pixel_fuse_proj reset to identity, "
+                    f"gate reset to sigmoid={gate_sig:.4f}."
+                )
         if args.train_controlnet and 'controlnet' in ckpt:
             state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
             unwrapped.controlnet.load_state_dict(state)
@@ -2108,7 +2053,9 @@ def main():
             f.write(f"Scale: x{args.scale}\n")
             f.write(f"Strength: {args.strength}\n")
             f.write(f"Pixel Weight: {args.pixel_weight}\n")
-            f.write(f"Pixel Fusion: concat+1x1 conv (identity-init lr_lat passthrough)\n")
+            f.write("Pixel Fusion: gated residual add\n")
+            f.write(f"Pixel Gate Init (logit): {args.pixel_gate_init}\n")
+            f.write(f"Pixel Gate Init (sigmoid): {1.0 / (1.0 + math.exp(-args.pixel_gate_init)):.6f}\n")
             f.write(f"LPIPS Weight: {args.lpips_weight} (resize={args.lpips_resize}, prob={args.lpips_apply_prob})\n\n")
             f.write(f"Geometric Aug: {args.geom_aug}\n")
             f.write(
@@ -2256,23 +2203,16 @@ def main():
         
         if is_main:
             lr_current = lr_scheduler.get_last_lr()[0]
-            # Diagnostic for concat fusion: frobenius norm of the pixel_feat input
-            # slice (last 16 input channels) relative to the lr_lat passthrough slice.
-            # Ratio >> 0 means the net has learned to use the pixel branch.
-            w = unwrapped.pixel_fuse_proj.weight.detach().float()
-            in_half = w.shape[1] // 2
-            lr_norm = w[:, :in_half].norm().item()
-            px_norm = w[:, in_half:].norm().item()
-            pixel_ratio = px_norm / (lr_norm + 1e-8)
+            gate_value = torch.sigmoid(unwrapped.pixel_gate_logit.detach().float()).item()
             if val_lpips is not None:
                 log_line = (
                     f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, "
-                    f"LPIPS={val_lpips:.4f}, LR={lr_current:.2e}, PxRatio={pixel_ratio:.4f}\n"
+                    f"LPIPS={val_lpips:.4f}, LR={lr_current:.2e}, Gate={gate_value:.4f}\n"
                 )
             else:
                 log_line = (
                     f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, "
-                    f"LR={lr_current:.2e}, PxRatio={pixel_ratio:.4f}\n"
+                    f"LR={lr_current:.2e}, Gate={gate_value:.4f}\n"
                 )
             if args.use_lora and len(lr_scheduler.get_last_lr()) >= 2:
                 log_line = log_line.rstrip("\n") + f", LoRA_LR={lr_scheduler.get_last_lr()[-1]:.2e}\n"
@@ -2282,13 +2222,13 @@ def main():
             if val_lpips is not None:
                 print(
                     f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, "
-                    f"val_lpips={val_lpips:.4f}, lr={lr_current:.2e}, px_ratio={pixel_ratio:.4f}"
+                    f"val_lpips={val_lpips:.4f}, lr={lr_current:.2e}, gate={gate_value:.4f}"
                     + (f", lora_lr={lr_scheduler.get_last_lr()[-1]:.2e}" if args.use_lora and len(lr_scheduler.get_last_lr()) >= 2 else "")
                 )
             else:
                 print(
                     f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, "
-                    f"lr={lr_current:.2e}, px_ratio={pixel_ratio:.4f}"
+                    f"lr={lr_current:.2e}, gate={gate_value:.4f}"
                     + (f", lora_lr={lr_scheduler.get_last_lr()[-1]:.2e}" if args.use_lora and len(lr_scheduler.get_last_lr()) >= 2 else "")
                 )
             
@@ -2398,6 +2338,26 @@ def main():
         print(f"Checkpoints: {save_dir}")
         print("=" * 70)
 
+    # Explicitly end the Accelerator training state so DDP/NCCL resources are
+    # cleaned up before process exit (PyTorch 2.4+ warns if not destroyed).
+    accelerator.wait_for_everyone()
+    try:
+        accelerator.end_training()
+    except Exception:
+        pass
+
+def _destroy_process_group_safely():
+    """Best-effort teardown for torch.distributed process groups."""
+    try:
+        dist = torch.distributed
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception:
+        pass
+
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    finally:
+        _destroy_process_group_safely()

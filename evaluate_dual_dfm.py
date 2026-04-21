@@ -135,8 +135,11 @@ class PixelFeatureExtractor(nn.Module):
             nn.SiLU(),
         )
 
+        # Name kept as ``zero_conv`` for checkpoint-key compatibility, but
+        # weights are kaiming-init -- see train_dual_dfm.py for the
+        # dead-gradient explanation.
         self.zero_conv = nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
-        nn.init.zeros_(self.zero_conv.weight)
+        nn.init.kaiming_normal_(self.zero_conv.weight, nonlinearity='relu')
         nn.init.zeros_(self.zero_conv.bias)
 
     def forward(self, x, return_features=False):
