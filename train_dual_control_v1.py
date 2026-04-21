@@ -1495,7 +1495,7 @@ def main():
     parser.add_argument('--guidance', type=float, default=3.5)
     parser.add_argument('--control_guidance_start', type=float, default=0.0)
     parser.add_argument('--control_guidance_end', type=float, default=1.0)
-    parser.add_argument('--pixel_gate_init', type=float, default=6.0,
+    parser.add_argument('--pixel_gate_init', type=float, default=4.0,
                         help='Initial logit for gated pixel fusion (sigmoid(logit) is gate value).')
     parser.add_argument('--lpips_weight', type=float, default=0.0,
                         help='Optional LPIPS loss weight in training')
@@ -1521,7 +1521,7 @@ def main():
     # Validation/eval start point (img2img-style interpolation from LR + noise)
     parser.add_argument('--strength', type=float, default=1,
                         help='Validation/eval strength (1.0 = pure noise start, 0.8 = skip first 20%% steps)')
-    parser.add_argument('--val_num_steps', type=int, default=10)
+    parser.add_argument('--val_num_steps', type=int, default=20)
     parser.add_argument('--val_num_samples', type=int, default=5,
                         help='Number of validation samples per epoch (<=0 means full validation set)')
     parser.add_argument('--val_calc_lpips', action='store_true',
@@ -1548,7 +1548,7 @@ def main():
                         help='Initialize model + LoRA, print matched modules and exit')
     
     # Checkpointing
-    parser.add_argument('--save_dir', type=str, default='./checkpoints/dual_control')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints/dual_controlv1')
     parser.add_argument('--save_interval', type=int, default=10)
     parser.add_argument('--val_interval', type=int, default=1)
     parser.add_argument('--resume', type=str, default=None)

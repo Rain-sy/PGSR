@@ -883,7 +883,7 @@ def main():
     # Validation/eval start point (img2img-style interpolation from LR + noise)
     parser.add_argument('--strength', type=float, default=1,
                         help='Validation/eval strength (1.0 = pure noise start, 0.8 = skip first 20% steps)')
-    parser.add_argument('--val_num_steps', type=int, default=5)
+    parser.add_argument('--val_num_steps', type=int, default=20)
     
     # Checkpointing
     parser.add_argument('--save_dir', type=str, default='./checkpoints/dual_control')
