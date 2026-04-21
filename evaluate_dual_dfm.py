@@ -89,6 +89,28 @@ LORA_TARGET_PRESETS = {
 }
 
 
+def infer_dataset_name(*candidates):
+    """Infer a canonical dataset name from free-form path/name candidates."""
+    mapping = (
+        ('mix24k', 'MIX24K'),
+        ('mix16k', 'MIX16K'),
+        ('df2k', 'DF2K'),
+        ('div2k', 'DIV2K'),
+        ('urban100', 'Urban100'),
+        ('urban', 'Urban100'),
+        ('drealsr', 'DRealSR'),
+        ('realsr', 'RealSR'),
+    )
+    for value in candidates:
+        if not value:
+            continue
+        low = str(value).lower()
+        for key, dataset_name in mapping:
+            if key in low:
+                return dataset_name
+    return 'Unknown'
+
+
 # ============================================================================
 # Pixel Feature Extractor
 # ============================================================================
@@ -1012,19 +1034,10 @@ def main():
     
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     
-    # Auto-detect dataset
+    # Auto-detect dataset tag when not provided, then normalize to canonical name.
     if args.dataset is None:
-        hr_lower = args.hr_dir.lower()
-        if 'urban' in hr_lower:
-            args.dataset = 'Urban100'
-        elif 'div2k' in hr_lower:
-            args.dataset = 'DIV2K'
-        elif 'drealsr' in hr_lower:
-            args.dataset = 'DRealSR'
-        elif 'realsr' in hr_lower:
-            args.dataset = 'RealSR'
-        else:
-            args.dataset = 'Unknown'
+        args.dataset = infer_dataset_name(args.hr_dir, args.lr_dir)
+    dataset_name = infer_dataset_name(args.dataset, args.hr_dir, args.lr_dir)
     
     # Load model
     initial_pixel_weight = args.pixel_weight if args.pixel_weight is not None else 1.0
@@ -1100,7 +1113,7 @@ def main():
     print("Dual-Stream FLUX SR Evaluation - Official Scheduler")
     print("=" * 70)
     print(f"Checkpoint: {args.checkpoint}")
-    print(f"Dataset: {args.dataset}")
+    print(f"Dataset: {args.dataset} (canonical: {dataset_name})")
     print(f"Strength: {strength}")
     print(f"Control Guidance Window: [{control_guidance_start}, {control_guidance_end}]")
     print(f"Pixel Weight: {evaluator.pixel_weight}")
@@ -1270,9 +1283,15 @@ def main():
                 f"Resolution: {train_data.get('resolution')}, "
                 f"Num Crops: {train_data.get('num_crops')}\n"
             )
-        f.write(f"Dataset: {args.dataset}\n")
+        f.write(f"Dataset Name: {dataset_name}\n")
+        f.write(f"Dataset Tag: {args.dataset}\n")
+        f.write(f"Eval HR Dir: {args.hr_dir}\n")
+        f.write(f"Eval LR Dir: {args.lr_dir}\n")
         f.write(f"Images: {len(psnr_list)}\n")
         f.write(f"Steps: {args.num_steps}, Guidance: {args.guidance}\n")
+        f.write(f"Tile: size={args.tile_size}, min={args.min_tile_size}, overlap={args.overlap}\n")
+        f.write(f"Save Images: {args.save_images}, Save Comparisons: {args.save_comparisons}\n")
+        f.write(f"Device: {device}\n")
         if evaluator.use_lora:
             cfg = evaluator.lora_config_ckpt or {}
             f.write(

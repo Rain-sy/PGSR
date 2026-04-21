@@ -142,6 +142,28 @@ LORA_TARGET_PRESETS = {
 }
 
 
+def infer_dataset_name(*candidates):
+    """Infer a canonical dataset name from free-form path/name candidates."""
+    mapping = (
+        ('mix24k', 'MIX24K'),
+        ('mix16k', 'MIX16K'),
+        ('df2k', 'DF2K'),
+        ('div2k', 'DIV2K'),
+        ('urban100', 'Urban100'),
+        ('urban', 'Urban100'),
+        ('drealsr', 'DRealSR'),
+        ('realsr', 'RealSR'),
+    )
+    for value in candidates:
+        if not value:
+            continue
+        low = str(value).lower()
+        for key, dataset_name in mapping:
+            if key in low:
+                return dataset_name
+    return 'Unknown'
+
+
 # ============================================================================
 # Pixel Feature Extractor
 # ============================================================================
@@ -1474,6 +1496,7 @@ def main():
     )
 
     val_loader = None
+    val_dataset = None
     if args.val_hr_dir and args.val_lr_dir:
         val_dataset = SRDataset(
             args.val_hr_dir, args.val_lr_dir, args.resolution,
@@ -1486,8 +1509,17 @@ def main():
     # Optimizer and LR scheduler
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01)
 
-    num_training_steps = args.epochs * len(train_loader)
-    num_warmup_steps = args.warmup_epochs * len(train_loader)
+    steps_per_epoch = len(train_loader)
+    num_training_steps = args.epochs * steps_per_epoch
+    num_warmup_steps = args.warmup_epochs * steps_per_epoch
+    val_samples = len(val_dataset) if val_dataset is not None else 0
+    train_dataset_name = infer_dataset_name(args.hr_dir, args.lr_dir)
+    val_dataset_name = infer_dataset_name(args.val_hr_dir, args.val_lr_dir)
+    world_size = int(getattr(accelerator, 'num_processes', 1))
+    grad_accum_steps = int(getattr(accelerator, 'gradient_accumulation_steps', 1))
+    global_batch = int(args.batch_size) * world_size
+    effective_batch = global_batch * grad_accum_steps
+    controlnet_init = args.pretrained_controlnet or "jasperai/Flux.1-dev-Controlnet-Upscaler"
 
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
@@ -1532,6 +1564,24 @@ def main():
         with open(log_path, 'w') as f:
             f.write("FLUX SR Training + LoRA\n")
             f.write("=" * 60 + "\n")
+            f.write(f"Train Dataset: {train_dataset_name}\n")
+            f.write(f"Val Dataset: {val_dataset_name}\n")
+            f.write(f"Train HR Dir: {args.hr_dir}\n")
+            f.write(f"Train LR Dir: {args.lr_dir}\n")
+            f.write(f"Val HR Dir: {args.val_hr_dir}\n")
+            f.write(f"Val LR Dir: {args.val_lr_dir}\n")
+            f.write(
+                f"Samples: train={len(train_dataset)}, val={val_samples} | "
+                f"Steps/Epoch: {steps_per_epoch}, Total Steps: {num_training_steps}\n"
+            )
+            f.write(
+                f"Batch: per_device={args.batch_size}, world_size={world_size}, "
+                f"global={global_batch}, grad_accum={grad_accum_steps}, effective={effective_batch}\n"
+            )
+            f.write(f"Seed: {args.seed}\n")
+            f.write(f"Model: {args.model_name}\n")
+            f.write(f"ControlNet Init: {controlnet_init}\n")
+            f.write(f"Resume From: {args.resume}\n\n")
             f.write(f"Strength: {args.strength}\n")
             f.write(f"Pixel Weight: {args.pixel_weight}\n")
             f.write(f"Pixel Fusion: concat+1x1 conv (identity-init lr_lat passthrough)\n")
