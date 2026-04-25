@@ -2118,7 +2118,7 @@ def main():
                              'use when you want to tune DFM without perturbing the diffusion '
                              'backbone (e.g. frozen Stage-2).')
     # Checkpointing
-    parser.add_argument('--save_dir', type=str, default='./checkpoints/dual_dfm')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints/dual_dfmv2')
     parser.add_argument('--save_interval', type=int, default=10)
     parser.add_argument('--val_interval', type=int, default=1)
     parser.add_argument('--resume', type=str, default=None)

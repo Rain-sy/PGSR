@@ -245,6 +245,17 @@ def calculate_ssim(img1, img2):
             return _global_ssim()
     return _global_ssim()
 
+
+def pad_tensor_to_multiple(x, multiple=8, mode='replicate'):
+    """Pad BCHW tensor so H/W are divisible by ``multiple``."""
+    _, _, h, w = x.shape
+    pad_h = (-h) % int(multiple)
+    pad_w = (-w) % int(multiple)
+    if pad_h == 0 and pad_w == 0:
+        return x, 0, 0
+    return F.pad(x, (0, pad_w, 0, pad_h), mode=mode), pad_h, pad_w
+
+
 def clear_memory(device):
     """Aggressively clear Python/CUDA memory."""
     gc.collect()
@@ -1145,9 +1156,13 @@ def main():
         
         lr_t = torch.from_numpy(lr_bicubic_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
         lr_t = lr_t.to(device).to(torch.bfloat16)
-        
+        # The FLUX VAE downsamples by 8x; odd/non-divisible image sizes like
+        # Urban100's 322x512 otherwise decode back to 320x512. Pad before
+        # encode/inference and crop back after decode so metrics stay aligned.
+        lr_t_infer, _, _ = pad_tensor_to_multiple(lr_t, multiple=8, mode='replicate')
+
         sr_t = run_sr_tiled_with_oom_retry(
-            evaluator, lr_t, device,
+            evaluator, lr_t_infer, device,
             num_steps=args.num_steps,
             guidance=args.guidance,
             tile_size=args.tile_size,
@@ -1155,7 +1170,7 @@ def main():
             overlap=args.overlap,
             strength=strength
         )
-        
+        sr_t = sr_t[:, :, :H, :W]
         sr_np = ((sr_t[0].float().cpu().clamp(-1, 1) + 1) * 127.5).permute(1, 2, 0).numpy().astype(np.uint8)
         
         psnr_val = calculate_psnr(sr_np, hr_np)

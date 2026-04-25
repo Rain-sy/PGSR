@@ -9,7 +9,7 @@ Automatically detects and loads LoRA adapters when checkpoint contains
 `use_lora=True` and `lora_state_dict`.
 
 Usage:
-    python evaluate_dual_control.py \
+    python evaluate_dual_control_v1.py \
         --checkpoint checkpoints/dual_control/xxx/best_model.pt \
         --hr_dir Data/DIV2K/DIV2K_valid_HR \
         --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \

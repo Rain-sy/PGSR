@@ -2710,10 +2710,8 @@ def main():
                 
                 accelerator.backward(loss)
                 optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            
-            if (use_accumulate and accelerator.sync_gradients) or (not use_accumulate):
                 lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
             
             loss_item = loss.item()
             epoch_losses.append(loss_item)
