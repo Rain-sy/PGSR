@@ -103,7 +103,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed, DistributedType
 from tqdm import tqdm
 
@@ -214,14 +214,20 @@ REALESRGAN_CFG = {
     'poisson_scale2': [0.05, 2.5],
     'jpeg_range1': [30, 95],
     'jpeg_range2': [30, 95],
-    'paired_prob': 0.0,
-    'bicubic_prob': 0.0,
+    # Stage-2 mix probabilities: 15% paired (use real LR if available),
+    # 10% plain bicubic; remaining 75% goes through full Real-ESRGAN
+    # second-order degradation. Set both to 0.0 for pure Real-ESRGAN.
+    'paired_prob': 0.15,
+    'bicubic_prob': 0.10,
     'blur_sigma_scale': 0.0,
 }
 
+# Stage-2 USM: sharpen GT slightly before encoding so the model targets
+# a slightly sharpened HR (Real-ESRGAN paper's ``gt_usm`` trick). Set
+# mode='off' for Stage 1.
 USM_CFG = {
-    'mode': 'off',
-    'weight': 0.0,
+    'mode': 'realesrgan',
+    'weight': 0.5,
     'radius': 1.0,
     'threshold': 10.0,
     'apply_prob': 1.0,
@@ -2175,7 +2181,17 @@ def main():
             "PEFT is required for LoRA training. Install with: pip install peft>=0.10"
         )
     
-    accelerator = Accelerator(mixed_precision='bf16')
+    # DFM adapters and the DFM pixel loss are sigma-gated: on steps where the
+    # DFM path is skipped, DFM adapter params (and their zero_conv) get no
+    # gradient. We also use reentrant gradient checkpointing on the FLUX
+    # transformer, which can mark a param ready multiple times during the
+    # backward pass. ``static_graph=True`` is the PyTorch-recommended switch
+    # that handles BOTH cases (covers find_unused_parameters semantics and
+    # tolerates reentrant-checkpoint multi-ready hooks).
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=True, static_graph=True
+    )
+    accelerator = Accelerator(mixed_precision='bf16', kwargs_handlers=[ddp_kwargs])
     device = accelerator.device
     is_main = accelerator.is_main_process
     set_seed(args.seed)

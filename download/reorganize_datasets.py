@@ -205,19 +205,48 @@ def reorganize_urban100(src_base, dst_base, scale=4, copy=True):
     src_base = Path(src_base)
     dst_base = Path(dst_base)
     
-    # 查找 HR 和 LR 目录
-    hr_src = None
-    lr_src = None
-    
-    for d in src_base.rglob('*'):
-        if d.is_dir():
-            if 'HIGH' in d.name.upper():
-                hr_src = d
-            elif 'LOW' in d.name.upper():
-                lr_src = d
-    
+    # 1) 优先使用已经整理好的标准目录，避免误选 X2 数据。
+    hr_src = src_base / 'HR'
+    lr_src = src_base / f'LR_X{scale}'
+    if not (hr_src.is_dir() and lr_src.is_dir()):
+        # 2) 回退到原始 Urban100 目录结构，按 scale 精确匹配。
+        hr_src = None
+        lr_src = None
+        high_candidates = []
+        low_candidates = []
+        scale_token = f"X{scale}"
+
+        for d in src_base.rglob('*'):
+            if not d.is_dir():
+                continue
+            name_upper = d.name.upper()
+            path_upper = str(d).upper()
+            if 'HIGH' in name_upper:
+                high_candidates.append(d)
+            elif 'LOW' in name_upper:
+                low_candidates.append(d)
+
+        def _pick_scale_dir(candidates, kind):
+            # Strong match: both path and folder name include target scale token.
+            strong = [c for c in candidates if scale_token in str(c).upper() and scale_token in c.name.upper()]
+            if strong:
+                return sorted(strong)[0]
+            # Medium match: path includes target scale token.
+            medium = [c for c in candidates if scale_token in str(c).upper()]
+            if medium:
+                return sorted(medium)[0]
+            # Fallback: deterministic first candidate (for backward compatibility).
+            if candidates:
+                picked = sorted(candidates)[0]
+                print(f"  警告: 未找到包含 {scale_token} 的 {kind} 目录，回退到 {picked}")
+                return picked
+            return None
+
+        hr_src = _pick_scale_dir(high_candidates, "HIGH")
+        lr_src = _pick_scale_dir(low_candidates, "LOW")
+
     if hr_src is None or lr_src is None:
-        raise FileNotFoundError(f"找不到 HIGH/LOW 目录 in {src_base}")
+        raise FileNotFoundError(f"找不到 Urban100 对应的 HR/LR 源目录 in {src_base} (scale={scale})")
     
     print(f"[Urban100] HR 源目录: {hr_src}")
     print(f"[Urban100] LR 源目录: {lr_src}")

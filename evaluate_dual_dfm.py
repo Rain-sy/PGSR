@@ -46,6 +46,17 @@ except ImportError:
     SKIMAGE_AVAILABLE = False
     print("Note: scikit-image not installed; falling back to global SSIM. Run: pip install scikit-image")
 
+# pyiqa supplies MUSIQ / MANIQA / CLIP-IQA / NIQE / DISTS / FID. Optional —
+# evaluation falls back to PSNR/SSIM/LPIPS only when not installed.
+try:
+    import pyiqa
+    PYIQA_AVAILABLE = True
+except ImportError:
+    pyiqa = None
+    PYIQA_AVAILABLE = False
+    print("Note: pyiqa not installed. NR-IQA (MUSIQ/MANIQA/CLIP-IQA/NIQE/DISTS/FID) "
+          "disabled. Install: pip install pyiqa")
+
 # PEFT is optional; only required when checkpoint contains a LoRA adapter.
 try:
     from peft import LoraConfig, get_peft_model
@@ -258,6 +269,117 @@ def pad_tensor_to_multiple(x, multiple=8, mode='replicate'):
     if pad_h == 0 and pad_w == 0:
         return x, 0, 0
     return F.pad(x, (0, pad_w, 0, pad_h), mode=mode), pad_h, pad_w
+
+
+# ============================================================================
+# IQA metric registry (pyiqa-backed: MUSIQ / MANIQA / CLIP-IQA / NIQE / DISTS)
+# FID is computed separately from saved PNG directories at the end.
+# ============================================================================
+
+# Per-metric config: backend name in pyiqa, type (NR/FR), and convention.
+IQA_REGISTRY = {
+    'musiq':   {'pyiqa': 'musiq',         'type': 'NR', 'higher_better': True},
+    'maniqa':  {'pyiqa': 'maniqa',        'type': 'NR', 'higher_better': True},
+    'clipiqa': {'pyiqa': 'clipiqa',       'type': 'NR', 'higher_better': True},
+    'niqe':    {'pyiqa': 'niqe',          'type': 'NR', 'higher_better': False},
+    'dists':   {'pyiqa': 'dists',         'type': 'FR', 'higher_better': False},
+}
+
+
+class IQAMetricsRunner:
+    """Manage pyiqa metrics: lazy init, per-image update, finalize.
+
+    All inputs to ``update`` are uint8 numpy HWC; conversion to BCHW [0,1] on
+    ``self.device`` happens internally. Failed metrics push NaN so downstream
+    means are robust.
+    """
+
+    def __init__(self, device, requested):
+        self.device = device
+        self.metrics = {}        # name -> pyiqa Metric module
+        self.values_sr = {}      # name -> list of floats (SR vs HR)
+        self.values_bic = {}     # name -> list of floats (bicubic vs HR)
+        if not PYIQA_AVAILABLE:
+            return
+        for name in requested:
+            if name not in IQA_REGISTRY:
+                print(f"[IQA] unknown metric '{name}', skipped.")
+                continue
+            cfg = IQA_REGISTRY[name]
+            try:
+                m = pyiqa.create_metric(cfg['pyiqa'], device=device, as_loss=False)
+                m.eval()
+                self.metrics[name] = m
+                self.values_sr[name] = []
+                self.values_bic[name] = []
+                print(f"[IQA] loaded {name} ({cfg['type']}, "
+                      f"{'higher' if cfg['higher_better'] else 'lower'} better)")
+            except Exception as e:
+                print(f"[IQA] failed to init {name}: {e}")
+
+    @staticmethod
+    def _to_tensor01(img_uint8_hwc, device):
+        t = torch.from_numpy(img_uint8_hwc).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+        return t.clamp(0, 1).to(device)
+
+    @torch.no_grad()
+    def update(self, sr_np, hr_np, bic_np):
+        if not self.metrics:
+            return
+        sr_t = self._to_tensor01(sr_np, self.device)
+        bic_t = self._to_tensor01(bic_np, self.device)
+        hr_t = None  # lazy: only init for FR metrics
+        for name, m in self.metrics.items():
+            cfg = IQA_REGISTRY[name]
+            try:
+                if cfg['type'] == 'FR':
+                    if hr_t is None:
+                        hr_t = self._to_tensor01(hr_np, self.device)
+                    sr_score = float(m(sr_t, hr_t).item())
+                    bic_score = float(m(bic_t, hr_t).item())
+                else:
+                    sr_score = float(m(sr_t).item())
+                    bic_score = float(m(bic_t).item())
+            except Exception as e:
+                print(f"[IQA] {name} failed on this image: {e}")
+                sr_score = float('nan')
+                bic_score = float('nan')
+            self.values_sr[name].append(sr_score)
+            self.values_bic[name].append(bic_score)
+        del sr_t, bic_t
+        if hr_t is not None:
+            del hr_t
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+    def averages(self):
+        out = {}
+        for name in self.metrics:
+            sr_vals = [v for v in self.values_sr[name] if not math.isnan(v)]
+            bic_vals = [v for v in self.values_bic[name] if not math.isnan(v)]
+            out[name] = {
+                'sr': float(np.mean(sr_vals)) if sr_vals else None,
+                'bic': float(np.mean(bic_vals)) if bic_vals else None,
+                'higher_better': IQA_REGISTRY[name]['higher_better'],
+                'type': IQA_REGISTRY[name]['type'],
+            }
+        return out
+
+
+def compute_fid(sr_dir, hr_dir, device):
+    """Compute FID(sr, hr) using pyiqa. Returns float or None on failure."""
+    if not PYIQA_AVAILABLE:
+        return None
+    try:
+        fid_metric = pyiqa.create_metric('fid', device=device)
+        score = float(fid_metric(sr_dir, hr_dir))
+        del fid_metric
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        return score
+    except Exception as e:
+        print(f"[FID] failed: {e}")
+        return None
 
 
 def clear_memory(device):
@@ -1021,6 +1143,24 @@ def main():
                         help='Disable LPIPS calculation')
     parser.add_argument('--lpips_device', type=str, default='cpu', choices=['cpu', 'cuda'])
     parser.set_defaults(calc_lpips=True)
+    # Extra IQA metrics (pyiqa-backed): MUSIQ / MANIQA / CLIP-IQA / NIQE / DISTS.
+    # FID is a directory-level metric computed at the end.
+    parser.add_argument(
+        '--iqa_metrics',
+        type=str,
+        default='musiq,maniqa,clipiqa,niqe,dists',
+        help='Comma-separated IQA metrics to compute. Empty string disables all. '
+             'Available: musiq, maniqa, clipiqa, niqe, dists',
+    )
+    parser.add_argument('--iqa_device', type=str, default='cpu', choices=['cpu', 'cuda'],
+                        help='Device for pyiqa metrics. cpu is slower but safe; '
+                             'cuda is fast but uses extra GPU memory on top of FLUX.')
+    parser.add_argument('--calc_fid', dest='calc_fid', action='store_true',
+                        help='Compute FID(SR, HR) over the full eval set at the end. '
+                             'Requires save_images so the SR PNG dir is available.')
+    parser.add_argument('--no_calc_fid', dest='calc_fid', action='store_false')
+    parser.set_defaults(calc_fid=True)
+    parser.add_argument('--fid_device', type=str, default='cuda', choices=['cpu', 'cuda'])
     
     parser.add_argument('--output_base', type=str, default='./outputs')
     parser.add_argument('--dataset', type=str, default=None)
@@ -1155,12 +1295,28 @@ def main():
                 lpips_device = torch.device('cpu')
             lpips_fn = lpips.LPIPS(net='alex').to(lpips_device)
             lpips_fn.eval()
-    
+
+    iqa_device = torch.device(args.iqa_device if (args.iqa_device == 'cpu' or torch.cuda.is_available()) else 'cpu')
+    requested_iqa = [m.strip().lower() for m in args.iqa_metrics.split(',') if m.strip()]
+    iqa_runner = IQAMetricsRunner(iqa_device, requested_iqa)
+
+    # Always save SR + HR + bicubic PNGs to dirs that FID can consume.
+    # If --save_images already on, predictions/ dir is reused; otherwise a
+    # temp dir under output_dir keeps things contained.
+    fid_sr_dir = os.path.join(output_dir, 'predictions')
+    fid_hr_dir = os.path.join(output_dir, '_fid_hr')
+    fid_bic_dir = os.path.join(output_dir, '_fid_bicubic')
+    will_compute_fid = bool(args.calc_fid and PYIQA_AVAILABLE)
+    if will_compute_fid:
+        os.makedirs(fid_sr_dir, exist_ok=True)
+        os.makedirs(fid_hr_dir, exist_ok=True)
+        os.makedirs(fid_bic_dir, exist_ok=True)
+
     hr_files = sorted([f for f in os.listdir(args.hr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
     lr_files = sorted([f for f in os.listdir(args.lr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-    
+
     print(f"\nEvaluating {len(hr_files)} images...\n")
-    
+
     psnr_list, ssim_list, lpips_list = [], [], []
     psnr_bic_list, ssim_bic_list, lpips_bic_list = [], [], []
     filenames = []
@@ -1225,17 +1381,27 @@ def main():
         if lpips_fn:
             hr_t = torch.from_numpy(hr_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
             lr_t_lpips = torch.from_numpy(lr_bicubic_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
-            
+
             hr_t = hr_t.to(lpips_device)
             lr_t_lpips = lr_t_lpips.to(lpips_device)
             lpips_val = lpips_fn(sr_t.float().clamp(-1, 1).to(lpips_device), hr_t).item()
             lpips_bic = lpips_fn(lr_t_lpips, hr_t).item()
             lpips_list.append(lpips_val)
             lpips_bic_list.append(lpips_bic)
-        
+
+        # Extra IQA metrics (MUSIQ / MANIQA / CLIP-IQA / NIQE / DISTS).
+        iqa_runner.update(sr_np, hr_np, lr_bicubic_np)
+
         if args.save_images:
             Image.fromarray(sr_np).save(os.path.join(output_dir, 'predictions', f'{base_name}.png'))
-        
+
+        # Mirror SR / HR / bicubic to FID dirs (only needed if FID will run).
+        if will_compute_fid:
+            if not args.save_images:
+                Image.fromarray(sr_np).save(os.path.join(fid_sr_dir, f'{base_name}.png'))
+            Image.fromarray(hr_np).save(os.path.join(fid_hr_dir, f'{base_name}.png'))
+            Image.fromarray(lr_bicubic_np).save(os.path.join(fid_bic_dir, f'{base_name}.png'))
+
         if args.save_comparisons:
             comp = Image.new('RGB', (W * 4, H))
             lr_display = lr_img.resize((W, H), Image.NEAREST)
@@ -1244,7 +1410,7 @@ def main():
             comp.paste(Image.fromarray(sr_np), (W * 2, 0))
             comp.paste(hr_img, (W * 3, 0))
             comp.save(os.path.join(output_dir, 'comparisons', f'{base_name}_compare.png'))
-        
+
         del lr_t, sr_t
         if lpips_fn:
             del hr_t, lr_t_lpips
@@ -1257,24 +1423,59 @@ def main():
     avg_ssim_bic = np.mean(ssim_bic_list)
     avg_lpips = np.mean(lpips_list) if lpips_list else 0
     avg_lpips_bic = np.mean(lpips_bic_list) if lpips_bic_list else 0
-    
+
+    iqa_avg = iqa_runner.averages()  # name -> {'sr', 'bic', 'higher_better', 'type'}
+
+    fid_sr = None
+    fid_bic = None
+    if will_compute_fid and len(psnr_list) > 0:
+        fid_device = torch.device(args.fid_device if torch.cuda.is_available() else 'cpu')
+        print("\n[FID] computing FID(SR, HR) ...")
+        fid_sr = compute_fid(fid_sr_dir, fid_hr_dir, fid_device)
+        print(f"[FID] SR vs HR  = {fid_sr:.4f}" if fid_sr is not None else "[FID] failed")
+        print("[FID] computing FID(Bicubic, HR) ...")
+        fid_bic = compute_fid(fid_bic_dir, fid_hr_dir, fid_device)
+        print(f"[FID] BIC vs HR = {fid_bic:.4f}" if fid_bic is not None else "[FID] failed")
+
+    def _fmt(v, prec=4):
+        return 'n/a' if v is None or (isinstance(v, float) and math.isnan(v)) else f'{v:.{prec}f}'
+
     print("\n" + "=" * 70)
     print("Results")
     print("=" * 70)
     print(f"Strength: {strength}")
     print(f"Pixel Weight: {evaluator.pixel_weight}")
     print(f"Pixel Fusion: concat+1x1 conv (source={evaluator.fusion_source})")
+    print("---------- Full-reference (HR available) ----------")
     if lpips_fn:
         print(f"Bicubic:  PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}")
         print(f"SR:       PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
-        print(f"Delta:    {avg_psnr - avg_psnr_bic:+.4f} dB, {avg_ssim - avg_ssim_bic:+.4f}, {avg_lpips_bic - avg_lpips:+.4f}")
+        print(f"Delta:    {avg_psnr - avg_psnr_bic:+.4f} dB, {avg_ssim - avg_ssim_bic:+.4f}, "
+              f"{avg_lpips_bic - avg_lpips:+.4f}")
     else:
         print(f"Bicubic:  PSNR={avg_psnr_bic:.4f} dB, SSIM={avg_ssim_bic:.4f}")
         print(f"SR:       PSNR={avg_psnr:.4f} dB, SSIM={avg_ssim:.4f}")
+    if any(v['type'] == 'FR' for v in iqa_avg.values()):
+        print("---------- Full-reference (pyiqa) ----------")
+        for name, v in iqa_avg.items():
+            if v['type'] != 'FR':
+                continue
+            arrow = '↓' if not v['higher_better'] else '↑'
+            print(f"  {name.upper():<8} ({arrow}): SR={_fmt(v['sr'])}, BIC={_fmt(v['bic'])}")
+    if any(v['type'] == 'NR' for v in iqa_avg.values()):
+        print("---------- No-reference (pyiqa) ----------")
+        for name, v in iqa_avg.items():
+            if v['type'] != 'NR':
+                continue
+            arrow = '↑' if v['higher_better'] else '↓'
+            print(f"  {name.upper():<8} ({arrow}): SR={_fmt(v['sr'])}, BIC={_fmt(v['bic'])}")
+    if fid_sr is not None or fid_bic is not None:
+        print("---------- Distribution-level ----------")
+        print(f"  FID (↓):   SR={_fmt(fid_sr)},  BIC={_fmt(fid_bic)}")
     print("=" * 70)
     
     results_path = os.path.join(output_dir, 'results.txt')
-    with open(results_path, 'w') as f:
+    with open(results_path, 'w', encoding='utf-8') as f:
         f.write("Dual-Stream FLUX SR - Official Scheduler\n")
         f.write("=" * 60 + "\n")
         f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -1317,23 +1518,85 @@ def main():
         else:
             f.write("LoRA: inactive\n")
         f.write("\n" + "=" * 60 + "\n")
-        f.write("Summary:\n")
+        f.write("Summary (averages):\n")
+        f.write("[Full-reference, classical]\n")
         if lpips_fn:
-            f.write(f"Bicubic:  PSNR={avg_psnr_bic:.4f}, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}\n")
-            f.write(f"SR:       PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}\n")
+            f.write(f"  Bicubic: PSNR={avg_psnr_bic:.4f}, SSIM={avg_ssim_bic:.4f}, LPIPS={avg_lpips_bic:.4f}\n")
+            f.write(f"  SR:      PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}\n")
         else:
-            f.write(f"Bicubic:  PSNR={avg_psnr_bic:.4f}, SSIM={avg_ssim_bic:.4f}\n")
-            f.write(f"SR:       PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}\n")
+            f.write(f"  Bicubic: PSNR={avg_psnr_bic:.4f}, SSIM={avg_ssim_bic:.4f}\n")
+            f.write(f"  SR:      PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}\n")
+        if any(v['type'] == 'FR' for v in iqa_avg.values()):
+            f.write("[Full-reference, pyiqa]\n")
+            for name, v in iqa_avg.items():
+                if v['type'] != 'FR':
+                    continue
+                arrow = '↓' if not v['higher_better'] else '↑'
+                f.write(f"  {name.upper()} ({arrow}): SR={_fmt(v['sr'])}, BIC={_fmt(v['bic'])}\n")
+        if any(v['type'] == 'NR' for v in iqa_avg.values()):
+            f.write("[No-reference, pyiqa]\n")
+            for name, v in iqa_avg.items():
+                if v['type'] != 'NR':
+                    continue
+                arrow = '↑' if v['higher_better'] else '↓'
+                f.write(f"  {name.upper()} ({arrow}): SR={_fmt(v['sr'])}, BIC={_fmt(v['bic'])}\n")
+        if fid_sr is not None or fid_bic is not None:
+            f.write("[Distribution-level]\n")
+            f.write(f"  FID (↓): SR={_fmt(fid_sr)}, BIC={_fmt(fid_bic)}\n")
         f.write("\n" + "=" * 60 + "\n")
-        f.write("Per-image:\n")
+
+        # Per-image header: PSNR, SSIM, LPIPS, then any pyiqa metrics in order.
+        iqa_names = list(iqa_avg.keys())
+        header_parts = ['filename', 'PSNR', 'dPSNR', 'SSIM', 'dSSIM']
+        if lpips_fn:
+            header_parts += ['LPIPS', 'dLPIPS']
+        for n in iqa_names:
+            header_parts.append(n.upper())
+            header_parts.append(f'{n.upper()}_bic')
+        f.write("Per-image (TSV):\n")
+        f.write("\t".join(header_parts) + "\n")
         for i, fname in enumerate(filenames):
-            delta = psnr_list[i] - psnr_bic_list[i]
+            row = [fname,
+                   f'{psnr_list[i]:.4f}', f'{psnr_list[i] - psnr_bic_list[i]:+.4f}',
+                   f'{ssim_list[i]:.4f}', f'{ssim_list[i] - ssim_bic_list[i]:+.4f}']
             if lpips_fn:
-                f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (delta {delta:+.2f}), LPIPS={lpips_list[i]:.4f}\n")
-            else:
-                f.write(f"{fname}: PSNR={psnr_list[i]:.2f} (delta {delta:+.2f})\n")
-    
+                row.append(f'{lpips_list[i]:.4f}')
+                row.append(f'{lpips_list[i] - lpips_bic_list[i]:+.4f}')
+            for n in iqa_names:
+                sr_v = iqa_runner.values_sr[n][i] if i < len(iqa_runner.values_sr[n]) else float('nan')
+                bic_v = iqa_runner.values_bic[n][i] if i < len(iqa_runner.values_bic[n]) else float('nan')
+                row.append(_fmt(sr_v))
+                row.append(_fmt(bic_v))
+            f.write("\t".join(row) + "\n")
+
+    # Write a parallel JSON for downstream programmatic comparison.
+    import json as _json
+    summary_json = {
+        'checkpoint': args.checkpoint,
+        'dataset_name': dataset_name,
+        'dataset_tag': args.dataset,
+        'images': len(psnr_list),
+        'classical': {
+            'sr': {'psnr': avg_psnr, 'ssim': avg_ssim,
+                   'lpips': (avg_lpips if lpips_fn else None)},
+            'bic': {'psnr': avg_psnr_bic, 'ssim': avg_ssim_bic,
+                    'lpips': (avg_lpips_bic if lpips_fn else None)},
+        },
+        'iqa': {
+            n: {
+                'sr': v['sr'], 'bic': v['bic'],
+                'type': v['type'], 'higher_better': v['higher_better'],
+            }
+            for n, v in iqa_avg.items()
+        },
+        'fid': {'sr': fid_sr, 'bic': fid_bic},
+    }
+    with open(os.path.join(output_dir, 'metrics.json'), 'w', encoding='utf-8') as f:
+        _json.dump(summary_json, f, indent=2, default=lambda o: None)
+
     print(f"\nResults saved: {output_dir}")
+    print(f"  results.txt : {results_path}")
+    print(f"  metrics.json: {os.path.join(output_dir, 'metrics.json')}")
 
 
 if __name__ == '__main__':
