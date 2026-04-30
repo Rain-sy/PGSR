@@ -382,6 +382,57 @@ def compute_fid(sr_dir, hr_dir, device):
         return None
 
 
+def _crop_or_pad_patch(img_np, y, x, patch_size):
+    """Return a fixed-size HWC patch, edge-padding small images if needed."""
+    h, w = img_np.shape[:2]
+    y = max(0, min(int(y), max(0, h - patch_size)))
+    x = max(0, min(int(x), max(0, w - patch_size)))
+    patch = img_np[y:min(y + patch_size, h), x:min(x + patch_size, w), :]
+    pad_h = patch_size - patch.shape[0]
+    pad_w = patch_size - patch.shape[1]
+    if pad_h > 0 or pad_w > 0:
+        patch = np.pad(
+            patch,
+            ((0, max(0, pad_h)), (0, max(0, pad_w)), (0, 0)),
+            mode='edge',
+        )
+    return patch
+
+
+def _sample_patch_coords(h, w, patch_size, n_per_image, rng):
+    """Sample paired crop coordinates for patch-based distribution metrics."""
+    n = max(1, int(n_per_image))
+    max_y = max(0, h - patch_size)
+    max_x = max(0, w - patch_size)
+    if max_y == 0 and max_x == 0:
+        return [(0, 0)] * n
+    ys = rng.integers(0, max_y + 1, size=n) if max_y > 0 else np.zeros(n, dtype=np.int64)
+    xs = rng.integers(0, max_x + 1, size=n) if max_x > 0 else np.zeros(n, dtype=np.int64)
+    return list(zip(ys.tolist(), xs.tolist()))
+
+
+def save_fid_patches(sr_np, hr_np, bic_np, base_name, patch_dirs,
+                     patch_size=512, n_per_image=25, rng=None):
+    """Write aligned SR/HR/bicubic patches for patch-based FID."""
+    if rng is None:
+        rng = np.random.default_rng(42)
+    coords = _sample_patch_coords(
+        hr_np.shape[0], hr_np.shape[1], patch_size, n_per_image, rng
+    )
+    for idx, (y, x) in enumerate(coords):
+        patch_name = f'{base_name}_p{idx:03d}.png'
+        Image.fromarray(_crop_or_pad_patch(sr_np, y, x, patch_size)).save(
+            os.path.join(patch_dirs['sr'], patch_name)
+        )
+        Image.fromarray(_crop_or_pad_patch(hr_np, y, x, patch_size)).save(
+            os.path.join(patch_dirs['hr'], patch_name)
+        )
+        Image.fromarray(_crop_or_pad_patch(bic_np, y, x, patch_size)).save(
+            os.path.join(patch_dirs['bic'], patch_name)
+        )
+    return len(coords)
+
+
 def clear_memory(device):
     """Aggressively clear Python/CUDA memory."""
     gc.collect()
@@ -1156,11 +1207,18 @@ def main():
                         help='Device for pyiqa metrics. cpu is slower but safe; '
                              'cuda is fast but uses extra GPU memory on top of FLUX.')
     parser.add_argument('--calc_fid', dest='calc_fid', action='store_true',
-                        help='Compute FID(SR, HR) over the full eval set at the end. '
-                             'Requires save_images so the SR PNG dir is available.')
+                        help='Compute FID(SR, HR) at the end using --fid_mode.')
     parser.add_argument('--no_calc_fid', dest='calc_fid', action='store_false')
     parser.set_defaults(calc_fid=True)
     parser.add_argument('--fid_device', type=str, default='cuda', choices=['cpu', 'cuda'])
+    parser.add_argument('--fid_mode', type=str, default='patch',
+                        choices=['patch', 'full', 'both'],
+                        help='FID protocol. patch crops many fixed-size patches per image; '
+                             'full preserves the previous full-image pyiqa FID path.')
+    parser.add_argument('--fid_patch_size', type=int, default=512)
+    parser.add_argument('--fid_patches_per_image', type=int, default=25,
+                        help='Number of aligned patches sampled per evaluated image for patch FID.')
+    parser.add_argument('--fid_patch_seed', type=int, default=42)
     
     parser.add_argument('--output_base', type=str, default='./outputs')
     parser.add_argument('--dataset', type=str, default=None)
@@ -1182,6 +1240,10 @@ def main():
         and args.control_guidance_start > args.control_guidance_end
     ):
         parser.error("--control_guidance_start must be <= --control_guidance_end")
+    if args.fid_patch_size < 1:
+        parser.error("--fid_patch_size must be >= 1")
+    if args.fid_patches_per_image < 1:
+        parser.error("--fid_patches_per_image must be >= 1")
     
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     
@@ -1270,6 +1332,11 @@ def main():
     print(f"Pixel Weight: {evaluator.pixel_weight}")
     print(f"Train LPIPS: weight={evaluator.train_lpips_weight}, prob={evaluator.train_lpips_apply_prob}")
     print(f"Steps: {args.num_steps}, Guidance: {args.guidance}")
+    if args.calc_fid and PYIQA_AVAILABLE:
+        print(
+            f"FID: mode={args.fid_mode}, patch_size={args.fid_patch_size}, "
+            f"patches_per_image={args.fid_patches_per_image}"
+        )
     print(f"DFM: {'ACTIVE' if evaluator.use_dfm else 'inactive'}")
     if evaluator.use_lora:
         cfg = evaluator.lora_config_ckpt or {}
@@ -1300,17 +1367,29 @@ def main():
     requested_iqa = [m.strip().lower() for m in args.iqa_metrics.split(',') if m.strip()]
     iqa_runner = IQAMetricsRunner(iqa_device, requested_iqa)
 
-    # Always save SR + HR + bicubic PNGs to dirs that FID can consume.
-    # If --save_images already on, predictions/ dir is reused; otherwise a
-    # temp dir under output_dir keeps things contained.
+    # Save images/patches to dirs that FID can consume. Patch FID is the
+    # default because 100 full-resolution DIV2K images produce unrealistically
+    # tiny FID values after Inception's 299px resize.
     fid_sr_dir = os.path.join(output_dir, 'predictions')
     fid_hr_dir = os.path.join(output_dir, '_fid_hr')
     fid_bic_dir = os.path.join(output_dir, '_fid_bicubic')
     will_compute_fid = bool(args.calc_fid and PYIQA_AVAILABLE)
-    if will_compute_fid:
+    compute_full_fid = bool(will_compute_fid and args.fid_mode in ('full', 'both'))
+    compute_patch_fid = bool(will_compute_fid and args.fid_mode in ('patch', 'both'))
+    fid_patch_dirs = {
+        'sr': os.path.join(output_dir, '_fid_patches_sr'),
+        'hr': os.path.join(output_dir, '_fid_patches_hr'),
+        'bic': os.path.join(output_dir, '_fid_patches_bicubic'),
+    }
+    fid_patch_rng = np.random.default_rng(args.fid_patch_seed)
+    fid_patch_count = 0
+    if compute_full_fid:
         os.makedirs(fid_sr_dir, exist_ok=True)
         os.makedirs(fid_hr_dir, exist_ok=True)
         os.makedirs(fid_bic_dir, exist_ok=True)
+    if compute_patch_fid:
+        for d in fid_patch_dirs.values():
+            os.makedirs(d, exist_ok=True)
 
     hr_files = sorted([f for f in os.listdir(args.hr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
     lr_files = sorted([f for f in os.listdir(args.lr_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
@@ -1395,12 +1474,19 @@ def main():
         if args.save_images:
             Image.fromarray(sr_np).save(os.path.join(output_dir, 'predictions', f'{base_name}.png'))
 
-        # Mirror SR / HR / bicubic to FID dirs (only needed if FID will run).
-        if will_compute_fid:
+        # Mirror SR / HR / bicubic to FID dirs (only needed for full-image FID).
+        if compute_full_fid:
             if not args.save_images:
                 Image.fromarray(sr_np).save(os.path.join(fid_sr_dir, f'{base_name}.png'))
             Image.fromarray(hr_np).save(os.path.join(fid_hr_dir, f'{base_name}.png'))
             Image.fromarray(lr_bicubic_np).save(os.path.join(fid_bic_dir, f'{base_name}.png'))
+        if compute_patch_fid:
+            fid_patch_count += save_fid_patches(
+                sr_np, hr_np, lr_bicubic_np, base_name, fid_patch_dirs,
+                patch_size=args.fid_patch_size,
+                n_per_image=args.fid_patches_per_image,
+                rng=fid_patch_rng,
+            )
 
         if args.save_comparisons:
             comp = Image.new('RGB', (W * 4, H))
@@ -1426,16 +1512,33 @@ def main():
 
     iqa_avg = iqa_runner.averages()  # name -> {'sr', 'bic', 'higher_better', 'type'}
 
+    fid_results = {}
     fid_sr = None
     fid_bic = None
     if will_compute_fid and len(psnr_list) > 0:
         fid_device = torch.device(args.fid_device if torch.cuda.is_available() else 'cpu')
-        print("\n[FID] computing FID(SR, HR) ...")
-        fid_sr = compute_fid(fid_sr_dir, fid_hr_dir, fid_device)
-        print(f"[FID] SR vs HR  = {fid_sr:.4f}" if fid_sr is not None else "[FID] failed")
-        print("[FID] computing FID(Bicubic, HR) ...")
-        fid_bic = compute_fid(fid_bic_dir, fid_hr_dir, fid_device)
-        print(f"[FID] BIC vs HR = {fid_bic:.4f}" if fid_bic is not None else "[FID] failed")
+        if compute_patch_fid:
+            print(
+                f"\n[FID][patch] computing on {fid_patch_count} patches "
+                f"(size={args.fid_patch_size}, per_image={args.fid_patches_per_image}) ..."
+            )
+            patch_sr = compute_fid(fid_patch_dirs['sr'], fid_patch_dirs['hr'], fid_device)
+            print(f"[FID][patch] SR vs HR  = {patch_sr:.4f}" if patch_sr is not None else "[FID][patch] failed")
+            patch_bic = compute_fid(fid_patch_dirs['bic'], fid_patch_dirs['hr'], fid_device)
+            print(f"[FID][patch] BIC vs HR = {patch_bic:.4f}" if patch_bic is not None else "[FID][patch] failed")
+            fid_results['patch'] = {'sr': patch_sr, 'bic': patch_bic}
+        if compute_full_fid:
+            print("\n[FID][full] computing FID(SR, HR) ...")
+            full_sr = compute_fid(fid_sr_dir, fid_hr_dir, fid_device)
+            print(f"[FID][full] SR vs HR  = {full_sr:.4f}" if full_sr is not None else "[FID][full] failed")
+            print("[FID][full] computing FID(Bicubic, HR) ...")
+            full_bic = compute_fid(fid_bic_dir, fid_hr_dir, fid_device)
+            print(f"[FID][full] BIC vs HR = {full_bic:.4f}" if full_bic is not None else "[FID][full] failed")
+            fid_results['full'] = {'sr': full_sr, 'bic': full_bic}
+
+        primary_fid = fid_results.get('patch') or fid_results.get('full') or {}
+        fid_sr = primary_fid.get('sr')
+        fid_bic = primary_fid.get('bic')
 
     def _fmt(v, prec=4):
         return 'n/a' if v is None or (isinstance(v, float) and math.isnan(v)) else f'{v:.{prec}f}'
@@ -1469,9 +1572,14 @@ def main():
                 continue
             arrow = '↑' if v['higher_better'] else '↓'
             print(f"  {name.upper():<8} ({arrow}): SR={_fmt(v['sr'])}, BIC={_fmt(v['bic'])}")
-    if fid_sr is not None or fid_bic is not None:
+    if fid_results:
         print("---------- Distribution-level ----------")
-        print(f"  FID (↓):   SR={_fmt(fid_sr)},  BIC={_fmt(fid_bic)}")
+        if 'patch' in fid_results:
+            v = fid_results['patch']
+            print(f"  FID-patch (↓): SR={_fmt(v['sr'])},  BIC={_fmt(v['bic'])}")
+        if 'full' in fid_results:
+            v = fid_results['full']
+            print(f"  FID-full  (↓): SR={_fmt(v['sr'])},  BIC={_fmt(v['bic'])}")
     print("=" * 70)
     
     results_path = os.path.join(output_dir, 'results.txt')
@@ -1506,6 +1614,12 @@ def main():
         f.write(f"Images: {len(psnr_list)}\n")
         f.write(f"Steps: {args.num_steps}, Guidance: {args.guidance}\n")
         f.write(f"Tile: size={args.tile_size}, min={args.min_tile_size}, overlap={args.overlap}\n")
+        if will_compute_fid:
+            f.write(
+                f"FID: mode={args.fid_mode}, patch_size={args.fid_patch_size}, "
+                f"patches_per_image={args.fid_patches_per_image}, "
+                f"patch_count={fid_patch_count}\n"
+            )
         f.write(f"Save Images: {args.save_images}, Save Comparisons: {args.save_comparisons}\n")
         f.write(f"Device: {device}\n")
         if evaluator.use_lora:
@@ -1540,9 +1654,14 @@ def main():
                     continue
                 arrow = '↑' if v['higher_better'] else '↓'
                 f.write(f"  {name.upper()} ({arrow}): SR={_fmt(v['sr'])}, BIC={_fmt(v['bic'])}\n")
-        if fid_sr is not None or fid_bic is not None:
+        if fid_results:
             f.write("[Distribution-level]\n")
-            f.write(f"  FID (↓): SR={_fmt(fid_sr)}, BIC={_fmt(fid_bic)}\n")
+            if 'patch' in fid_results:
+                v = fid_results['patch']
+                f.write(f"  FID-patch (↓): SR={_fmt(v['sr'])}, BIC={_fmt(v['bic'])}\n")
+            if 'full' in fid_results:
+                v = fid_results['full']
+                f.write(f"  FID-full (↓): SR={_fmt(v['sr'])}, BIC={_fmt(v['bic'])}\n")
         f.write("\n" + "=" * 60 + "\n")
 
         # Per-image header: PSNR, SSIM, LPIPS, then any pyiqa metrics in order.
@@ -1589,7 +1708,16 @@ def main():
             }
             for n, v in iqa_avg.items()
         },
-        'fid': {'sr': fid_sr, 'bic': fid_bic},
+        'fid': {
+            'primary_mode': 'patch' if 'patch' in fid_results else ('full' if 'full' in fid_results else None),
+            'sr': fid_sr,
+            'bic': fid_bic,
+            'patch': fid_results.get('patch'),
+            'full': fid_results.get('full'),
+            'patch_size': args.fid_patch_size if compute_patch_fid else None,
+            'patches_per_image': args.fid_patches_per_image if compute_patch_fid else None,
+            'patch_count': fid_patch_count if compute_patch_fid else None,
+        },
     }
     with open(os.path.join(output_dir, 'metrics.json'), 'w', encoding='utf-8') as f:
         _json.dump(summary_json, f, indent=2, default=lambda o: None)
