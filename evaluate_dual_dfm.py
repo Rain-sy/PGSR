@@ -475,11 +475,17 @@ class DualStreamEvaluator(nn.Module):
         self.use_dfm = False
         self.dfm_adapters = nn.ModuleDict()
         self._dfm_up_to_tap = {0: 's3', 1: 's2', 2: 's1'}
-    
+
+        # Learnable meta text embedding state (filled in by .load() when the
+        # checkpoint sets use_learnable_text_embed=True; e.g. ckpts produced
+        # by train_text.py). Auto-detected from the ckpt; no CLI flag needed.
+        self.use_learnable_text_embed = False
+        self.learnable_text_embed = None
+
     def load(self):
         from diffusers import FluxTransformer2DModel, AutoencoderKL, FluxControlNetModel
         from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
-        
+
         dtype = torch.bfloat16
         
         # Load Scheduler
@@ -496,6 +502,23 @@ class DualStreamEvaluator(nn.Module):
         self.vae.eval()
         self.vae.enable_tiling()
         
+        # Peek at the checkpoint metadata BEFORE caching text embeddings, so
+        # _cache_text_embeddings knows whether to register a learnable
+        # nn.Parameter (warm-started from cached empty-string T5). Loaded on
+        # CPU to avoid GPU memory pressure; the full ckpt is re-loaded below.
+        try:
+            _ckpt_peek = torch.load(
+                self.checkpoint_path, map_location='cpu', weights_only=False
+            )
+            self.use_learnable_text_embed = bool(
+                _ckpt_peek.get('use_learnable_text_embed', False)
+            )
+            del _ckpt_peek
+        except Exception as _peek_err:
+            print(f"[Eval][WARN] Could not peek at checkpoint for "
+                  f"use_learnable_text_embed flag: {_peek_err}; assuming False.")
+            self.use_learnable_text_embed = False
+
         # Cache text embeddings
         print("Caching text embeddings...")
         self._cache_text_embeddings()
@@ -658,6 +681,39 @@ class DualStreamEvaluator(nn.Module):
         else:
             print("[DFM] inactive (checkpoint has no adapters)")
 
+        # --- Learnable meta text embedding load (eval side) ---
+        # The Parameter was created in `_cache_text_embeddings` if the ckpt
+        # peek set `self.use_learnable_text_embed=True` (e.g. ckpts from
+        # train_text.py). Here we copy the actual learned weights into it.
+        if self.use_learnable_text_embed and self.learnable_text_embed is not None:
+            text_embed_raw = ckpt.get('learnable_text_embed', None)
+            if text_embed_raw is not None:
+                with torch.no_grad():
+                    text_embed_raw = text_embed_raw.to(
+                        device=self.learnable_text_embed.device,
+                        dtype=self.learnable_text_embed.dtype,
+                    )
+                    if text_embed_raw.shape == self.learnable_text_embed.shape:
+                        self.learnable_text_embed.data.copy_(text_embed_raw)
+                        print(
+                            f"[TextEmbed] ACTIVE: loaded learnable_text_embed "
+                            f"shape={tuple(text_embed_raw.shape)} "
+                            f"(freeze={bool(ckpt.get('text_embed_freeze', False))})"
+                        )
+                    else:
+                        print(
+                            f"[TextEmbed][WARN] shape mismatch: "
+                            f"ckpt {tuple(text_embed_raw.shape)} vs "
+                            f"model {tuple(self.learnable_text_embed.shape)}; "
+                            f"falling back to warm-start init."
+                        )
+            else:
+                print("[TextEmbed][WARN] use_learnable_text_embed=True in "
+                      "checkpoint but no `learnable_text_embed` tensor found; "
+                      "using warm-start init from cached empty-string T5.")
+        else:
+            print("[TextEmbed] inactive (checkpoint trained with cached empty T5)")
+
     def _reset_pixel_fuse_proj_to_identity(self):
         """Identity-init lr_lat passthrough (first 16 in-channels); zero pixel branch."""
         if self.pixel_fuse_proj is None:
@@ -751,7 +807,22 @@ class DualStreamEvaluator(nn.Module):
                 'prompt': t5_out[0].to(dtype),
                 'text_ids': torch.zeros(t5_out[0].shape[1], 3, device=self.device, dtype=dtype),
             }
-        
+
+        # If the checkpoint was trained with a learnable meta text embedding
+        # (e.g. by train_text.py), register a Parameter with shape
+        # (1, 512, 4096) and warm-start from the cached empty-string T5
+        # output. The actual learned weights are copied in below from
+        # `ckpt['learnable_text_embed']`. We keep the warm-start fallback so
+        # eval still runs even if the key is missing.
+        if self.use_learnable_text_embed:
+            self.learnable_text_embed = nn.Parameter(
+                t5_out[0].detach().to(torch.float32),
+                requires_grad=False,
+            )
+            self.learnable_text_embed.data = (
+                self.learnable_text_embed.data.to(self.device)
+            )
+
         del text_enc, text_enc_2, tok, tok_2, clip_out, t5_out
         clear_memory(self.device)
     
@@ -894,7 +965,14 @@ class DualStreamEvaluator(nn.Module):
         img_ids = self._img_ids(H_pack, W_pack, device, dtype)
         
         pooled = self._cached_embeds['pooled'].expand(B, -1)
-        prompt = self._cached_embeds['prompt'].expand(B, -1, -1)
+        # T5 prompt (= encoder_hidden_states): learnable meta embedding when
+        # the checkpoint enabled it (train_text.py ckpts), else the cached
+        # empty-string T5 output. CLIP `pooled` (temb path) and zero
+        # `text_ids` (pos embed path) are unchanged regardless.
+        if self.use_learnable_text_embed and self.learnable_text_embed is not None:
+            prompt = self.learnable_text_embed.to(dtype).expand(B, -1, -1)
+        else:
+            prompt = self._cached_embeds['prompt'].expand(B, -1, -1)
         text_ids = self._cached_embeds['text_ids']
         
         if isinstance(timestep, torch.Tensor):
