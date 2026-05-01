@@ -884,7 +884,8 @@ class DualStreamFLUXSR(nn.Module):
                  use_dfm=False, dfm_pixel_weight=0.05, dfm_lpips_weight=0.0,
                  dfm_sigma_min=0.05, dfm_sigma_gate=0.7,
                  dfm_detach_v=False,
-                 pixel_gate_init=4.0):
+                 pixel_gate_init=4.0,
+                 use_learnable_text_embed=False, text_embed_freeze=False):
         super().__init__()
         self.model_name = model_name
         self.device = device
@@ -921,12 +922,23 @@ class DualStreamFLUXSR(nn.Module):
         # grounding also refines the FM head.
         self.dfm_detach_v = bool(dfm_detach_v)
 
+        # Learnable meta text embedding (replaces the cached empty-string T5
+        # prompt fed into FLUX `encoder_hidden_states`). When enabled, an
+        # nn.Parameter of shape (1, 512, 4096) is registered in
+        # `_cache_text_embeddings` and warm-started from the cached
+        # empty-string T5 output. CLIP `pooled_projections` (which feeds the
+        # `temb` guiding embedding inside FLUX) and the zero `text_ids` are
+        # NOT modified -- only the `encoder_hidden_states` path changes.
+        self.use_learnable_text_embed = bool(use_learnable_text_embed)
+        self.text_embed_freeze = bool(text_embed_freeze)
+
         self.vae = None
         self.transformer = None
         self.controlnet = None
         self.pixel_extractor = None
         self.pixel_fuse_proj = None
         self.pixel_gate_logit = None
+        self.learnable_text_embed = None  # populated in _cache_text_embeddings
         self.scheduler = None
         self._cached_embeds = None
         # DFM adapter dict: key is 'up0'/'up1'/'up2', value is DFMAdapter.
@@ -1073,7 +1085,21 @@ class DualStreamFLUXSR(nn.Module):
                 'prompt': t5_out[0].to(dtype),
                 'text_ids': torch.zeros(t5_out[0].shape[1], 3, device=self.device, dtype=dtype),
             }
-        
+
+        # Warm-start the learnable meta text embedding from the cached
+        # empty-string T5 output. Stored in fp32 (mirrors `pixel_gate_logit`
+        # precedent) and cast to bf16 at use-site in `forward()`. The CLIP
+        # `pooled` and zero `text_ids` are unchanged -- only the FLUX
+        # `encoder_hidden_states` input becomes learnable.
+        if self.use_learnable_text_embed:
+            self.learnable_text_embed = nn.Parameter(
+                t5_out[0].detach().to(torch.float32),
+                requires_grad=not self.text_embed_freeze,
+            )
+            self.learnable_text_embed.data = (
+                self.learnable_text_embed.data.to(self.device)
+            )
+
         del text_enc, text_enc_2
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
@@ -1101,6 +1127,24 @@ class DualStreamFLUXSR(nn.Module):
             return
         with torch.no_grad():
             self.pixel_gate_logit.fill_(self.pixel_gate_init)
+
+    def _reset_learnable_text_embed(self):
+        """Reset the learnable meta text embedding to its warm-start value.
+
+        Copies the cached empty-string T5 output back into the parameter (in
+        fp32 to match its storage dtype). No-op when the feature is disabled
+        or the cached embedding is missing. Intended for Stage 1 -> Stage 2
+        transitions, paired with --reset_pixel_gate.
+        """
+        if (not self.use_learnable_text_embed
+                or self.learnable_text_embed is None
+                or self._cached_embeds is None
+                or self._cached_embeds.get('prompt', None) is None):
+            return
+        with torch.no_grad():
+            warm = self._cached_embeds['prompt'].to(torch.float32)
+            warm = warm.to(self.learnable_text_embed.device)
+            self.learnable_text_embed.data.copy_(warm)
 
     def _apply_lora_to_transformer(self, local_rank=0):
         """Wrap Transformer with a PEFT LoRA adapter."""
@@ -1193,6 +1237,19 @@ class DualStreamFLUXSR(nn.Module):
         if self.use_dfm and len(self.dfm_adapters) > 0:
             params += list(self.dfm_adapters.parameters())
         return params
+
+    def get_text_embed_params(self):
+        """Return the learnable meta text embedding parameter list.
+
+        Kept separate from get_pixel_branch_params / get_lora_params so that
+        per-group LR schedules and parameter counting remain auditable.
+        Returns an empty list when the feature is disabled or frozen.
+        """
+        if (self.use_learnable_text_embed
+                and self.learnable_text_embed is not None
+                and not self.text_embed_freeze):
+            return [self.learnable_text_embed]
+        return []
 
     def get_dfm_params(self):
         """Return DFM adapter params only (empty list if DFM disabled).
@@ -1458,8 +1515,16 @@ class DualStreamFLUXSR(nn.Module):
         img_ids = self._img_ids(H, W, device, dtype)
         
         # Text embeddings
+        # Per FLUX MMDiT pre-process: `pooled` feeds into the guiding-embed
+        # (temb) path together with timestep/guidance, and `text_ids` feeds
+        # the positional embedder. Only `prompt` (= encoder_hidden_states,
+        # shape (B, 512, 4096)) is replaced by a learnable meta embedding
+        # when --use_learnable_text_embed is set.
         pooled = self._cached_embeds['pooled'].expand(B, -1)
-        prompt = self._cached_embeds['prompt'].expand(B, -1, -1)
+        if self.use_learnable_text_embed and self.learnable_text_embed is not None:
+            prompt = self.learnable_text_embed.to(dtype).expand(B, -1, -1)
+        else:
+            prompt = self._cached_embeds['prompt'].expand(B, -1, -1)
         text_ids = self._cached_embeds['text_ids']
         
         # 🌟 timestep 已经是 / 1000 后的值，直接使用
@@ -1590,6 +1655,7 @@ class DualStreamFLUXSR(nn.Module):
             params += list(self.controlnet.parameters())
         if self.use_lora:
             params += self.get_lora_params()
+        params += self.get_text_embed_params()
         return params
 
 
@@ -1971,6 +2037,16 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
         'pixel_gate_logit': unwrapped.pixel_gate_logit.detach().cpu()
             if unwrapped.pixel_gate_logit is not None else None,
         'fusion_type': 'gated',
+        'use_learnable_text_embed': bool(
+            getattr(unwrapped, 'use_learnable_text_embed', False)
+        ),
+        'learnable_text_embed': (
+            unwrapped.learnable_text_embed.detach().cpu()
+            if (getattr(unwrapped, 'use_learnable_text_embed', False)
+                and getattr(unwrapped, 'learnable_text_embed', None) is not None)
+            else None
+        ),
+        'text_embed_freeze': bool(getattr(unwrapped, 'text_embed_freeze', False)),
         'controlnet': unwrapped.controlnet.state_dict(),
         'use_lora': unwrapped.use_lora,
         'use_dfm': bool(getattr(unwrapped, 'use_dfm', False)),
@@ -2136,6 +2212,22 @@ def main():
                         help='On resume, reset pixel_fuse_proj to identity and '
                              'pixel_gate_logit back to --pixel_gate_init. Useful when '
                              'switching Stage 1 -> Stage 2 to re-learn the mixing.')
+    # Learnable Meta Text Embedding (replaces cached empty-string T5 prompt
+    # at FLUX `encoder_hidden_states`; CLIP pooled and zero text_ids unchanged)
+    parser.add_argument('--use_learnable_text_embed', action='store_true', default=False,
+                        help='Replace cached empty-string T5 prompt with a learnable '
+                             'nn.Parameter of shape (1, 512, 4096), warm-started from '
+                             'the cached empty-string T5 output. Only the FLUX '
+                             'encoder_hidden_states input is replaced; CLIP pooled '
+                             '(temb path) and zero text_ids (pos embed path) stay '
+                             'as cached tensors.')
+    parser.add_argument('--freeze_text_embed', action='store_true', default=False,
+                        help='If set, the learnable text embedding is registered but '
+                             'not optimized (frozen at warm-start). Useful for ablation.')
+    parser.add_argument('--reset_text_embed', action='store_true', default=False,
+                        help='On resume, reset learnable_text_embed back to cached '
+                             'empty-string T5 warm-start. Pairs with --reset_pixel_gate '
+                             'for Stage 1 -> Stage 2 transitions.')
     parser.add_argument('--controlnet_lr_scale', type=float, default=1.0,
                         help='Multiplier applied to --lr for the ControlNet param group (use <1 for Stage 2 fine-tuning, e.g. 0.1).')
 
@@ -2273,6 +2365,14 @@ def main():
         gate_sig_print = 1.0 / (1.0 + math.exp(-args.pixel_gate_init))
         print(f"Pixel Fusion: gated residual add (identity-init conv, "
               f"logit={args.pixel_gate_init}, sigmoid={gate_sig_print:.4f})")
+        if args.use_learnable_text_embed:
+            print(
+                f"[TextEmbed] Learnable T5 prompt ENABLED "
+                f"(shape=(1,512,4096), warm-start from empty string, "
+                f"freeze={args.freeze_text_embed}, params=2,097,152)"
+            )
+        else:
+            print("[TextEmbed] inactive (cached empty-string T5)")
         print(f"Conditioning Scale: {args.conditioning_scale}")
         print(f"LPIPS Weight: {args.lpips_weight} (resize={args.lpips_resize}, prob={args.lpips_apply_prob})")
         print(f"Geometric Aug: {args.geom_aug}")
@@ -2317,6 +2417,8 @@ def main():
         dfm_sigma_gate=args.dfm_sigma_gate,
         dfm_detach_v=args.dfm_detach_v,
         pixel_gate_init=args.pixel_gate_init,
+        use_learnable_text_embed=args.use_learnable_text_embed,
+        text_embed_freeze=args.freeze_text_embed,
     )
     if args.dry_run_lora:
         if is_main:
@@ -2376,6 +2478,7 @@ def main():
     # Optimizer groups (pixel branch 10x LR; controlnet optionally scaled down for Stage 2)
     pixel_branch_params = system.get_pixel_branch_params()
     lora_params = system.get_lora_params()
+    text_embed_params = system.get_text_embed_params()
     controlnet_lr = args.lr * float(args.controlnet_lr_scale)
     optimizer_grouped_parameters = []
     if args.train_controlnet:
@@ -2394,21 +2497,31 @@ def main():
         optimizer_grouped_parameters.append(
             {"params": lora_params, "lr": args.lora_lr}
         )
+    # Learnable meta text embedding -- shares the base lr (same magnitude as
+    # LoRA / pixel branch). Empty when --use_learnable_text_embed is off or
+    # --freeze_text_embed is on.
+    if len(text_embed_params) > 0:
+        optimizer_grouped_parameters.append(
+            {"params": text_embed_params, "lr": args.lr}
+        )
     if is_main:
+        text_lr_str = f", text_embed={args.lr:.2e}" if len(text_embed_params) > 0 else ""
         print(
             f"[Training] LR groups: controlnet={controlnet_lr:.2e} "
             f"(scale={args.controlnet_lr_scale}), pixel={args.lr * 10.0:.2e}, "
-            f"lora={args.lora_lr:.2e}"
+            f"lora={args.lora_lr:.2e}{text_lr_str}"
         )
-    
+
     if is_main:
         total_params = sum(p.numel() for p in system.get_trainable_params())
         n_pixel = sum(p.numel() for p in pixel_branch_params)
         n_cn = sum(p.numel() for p in system.controlnet.parameters()) if args.train_controlnet else 0
         n_lora = sum(p.numel() for p in lora_params)
+        n_text = sum(p.numel() for p in text_embed_params)
+        text_extra = f", text_embed={n_text:,}" if n_text > 0 else ""
         print(
             f"[Training] Trainable params: total={total_params:,} "
-            f"(controlnet={n_cn:,}, pixel={n_pixel:,}, lora={n_lora:,})"
+            f"(controlnet={n_cn:,}, pixel={n_pixel:,}, lora={n_lora:,}{text_extra})"
         )
     
     # Datasets
@@ -2514,6 +2627,46 @@ def main():
                     "[Resume] --reset_pixel_gate: pixel_fuse_proj reset to identity, "
                     f"pixel_gate_logit reset (sigmoid={gate_sig:.4f})."
                 )
+
+        # Learnable meta text embedding: graceful resume.
+        # - ckpt has it & current run uses it -> copy in (shape-checked).
+        # - ckpt missing & current run uses it -> warm-start init from cached
+        #   empty-string T5 (already done in _cache_text_embeddings); log note.
+        # - ckpt has it & current run does NOT use it -> silently ignored.
+        text_embed_raw = ckpt.get('learnable_text_embed', None)
+        if (text_embed_raw is not None
+                and getattr(unwrapped, 'use_learnable_text_embed', False)
+                and getattr(unwrapped, 'learnable_text_embed', None) is not None):
+            with torch.no_grad():
+                text_embed_raw = text_embed_raw.to(
+                    device=unwrapped.learnable_text_embed.device,
+                    dtype=unwrapped.learnable_text_embed.dtype,
+                )
+                if text_embed_raw.shape == unwrapped.learnable_text_embed.shape:
+                    unwrapped.learnable_text_embed.data.copy_(text_embed_raw)
+                    if is_main:
+                        print("[Resume] Loaded learnable_text_embed from checkpoint "
+                              f"(shape={tuple(text_embed_raw.shape)}).")
+                else:
+                    if is_main:
+                        print(
+                            f"[Resume][WARN] learnable_text_embed shape mismatch: "
+                            f"ckpt {tuple(text_embed_raw.shape)} vs "
+                            f"model {tuple(unwrapped.learnable_text_embed.shape)}; "
+                            f"keeping warm-start init."
+                        )
+        elif (getattr(unwrapped, 'use_learnable_text_embed', False)
+                and text_embed_raw is None
+                and is_main):
+            print("[Resume] Checkpoint has no learnable_text_embed; "
+                  "using warm-start init from cached empty-string T5.")
+
+        if getattr(args, 'reset_text_embed', False):
+            unwrapped._reset_learnable_text_embed()
+            if is_main:
+                print("[Resume] --reset_text_embed: learnable_text_embed "
+                      "reset to cached empty-string T5 warm-start.")
+
         if args.train_controlnet and 'controlnet' in ckpt:
             state = _strip_module_prefix(ckpt['controlnet'])
             unwrapped.controlnet.load_state_dict(state)
