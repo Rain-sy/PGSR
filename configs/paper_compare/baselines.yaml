@@ -142,6 +142,58 @@ methods:
     env_name: fluxsr
     notes: "Official repo is public. Fill exact inference command after local setup and weight download."
 
+  PASD:
+    status: public_needs_command
+    repo_url: https://github.com/yangxy/PASD.git
+    repo_dir: PASD
+    commit: main
+    env_name: pasd
+    entrypoint: test_pasd.py
+    input_arg: --input_image
+    output_arg: --output_dir
+    extra_args:
+      - --pasd_model_path
+      - runs/pasd/checkpoint-100000
+      - --pretrained_model_path
+      - ../weights/hf/stable-diffusion-v1-5-official
+      - --upscale
+      - "4"
+      - --seed
+      - "123"
+    notes: "Public repo and pretrained models are available. Verify exact checkpoint path after downloading PASD weights."
+    expected_output_patterns:
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.jpeg"
+
+  OSEDiff:
+    status: public_needs_command
+    repo_url: https://github.com/cswry/OSEDiff.git
+    repo_dir: OSEDiff
+    commit: main
+    env_name: osediff
+    entrypoint: test_osediff.py
+    input_arg: -i
+    output_arg: -o
+    extra_args:
+      - --osediff_path
+      - preset/models/osediff.pkl
+      - --pretrained_model_name_or_path
+      - preset/models/stable-diffusion-2-1-base
+      - --ram_ft_path
+      - preset/models/DAPE.pth
+      - --ram_path
+      - preset/models/ram_swin_large_14m.pth
+      - --process_size
+      - "512"
+      - --upscale
+      - "4"
+    notes: "Public repo, model links, and benchmark outputs are available. Fill model files under preset/models."
+    expected_output_patterns:
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.jpeg"
+
   FlowSR:
     status: pending_public_code
     repo_url: null
