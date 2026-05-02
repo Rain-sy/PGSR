@@ -9,11 +9,12 @@ Automatically detects and loads LoRA adapters when checkpoint contains
 `use_lora=True` and `lora_state_dict`.
 
 Usage:
-    python evaluate_dual_dfm.py \
+    CUDA_VISIBLE_DEVICES=0 python evaluate_dual_dfm.py \
         --checkpoint checkpoints/dual_control/xxx/best_model.pt \
         --hr_dir Data/DIV2K/DIV2K_valid_HR \
         --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --strength 0.7 --num_steps 20
+        --iqa_device cuda \
+        --lpips_device cuda 
 """
 
 import os
@@ -294,8 +295,13 @@ class IQAMetricsRunner:
     means are robust.
     """
 
-    def __init__(self, device, requested):
+    def __init__(self, device, requested, fr_max_long_edge=1024):
         self.device = device
+        # FR metrics like DISTS use VGG features; full-res 2K-4K inputs are
+        # both very slow and memory-heavy. Resize so the long edge is at most
+        # this value before computing FR metrics. NR metrics already do their
+        # own internal resize so this only affects FR.
+        self.fr_max_long_edge = int(fr_max_long_edge) if fr_max_long_edge else 0
         self.metrics = {}        # name -> pyiqa Metric module
         self.values_sr = {}      # name -> list of floats (SR vs HR)
         self.values_bic = {}     # name -> list of floats (bicubic vs HR)
@@ -322,6 +328,20 @@ class IQAMetricsRunner:
         t = torch.from_numpy(img_uint8_hwc).float().permute(2, 0, 1).unsqueeze(0) / 255.0
         return t.clamp(0, 1).to(device)
 
+    def _maybe_resize_for_fr(self, t):
+        """Cap long edge for FR metrics so DISTS / VGG-based metrics stay fast.
+        Returns either the original tensor or a bilinear-resized copy."""
+        if self.fr_max_long_edge <= 0:
+            return t
+        _, _, h, w = t.shape
+        long_edge = max(h, w)
+        if long_edge <= self.fr_max_long_edge:
+            return t
+        scale = self.fr_max_long_edge / long_edge
+        new_h = int(round(h * scale))
+        new_w = int(round(w * scale))
+        return F.interpolate(t, size=(new_h, new_w), mode='bilinear', align_corners=False)
+
     @torch.no_grad()
     def update(self, sr_np, hr_np, bic_np):
         if not self.metrics:
@@ -329,14 +349,19 @@ class IQAMetricsRunner:
         sr_t = self._to_tensor01(sr_np, self.device)
         bic_t = self._to_tensor01(bic_np, self.device)
         hr_t = None  # lazy: only init for FR metrics
+        sr_t_fr = bic_t_fr = hr_t_fr = None  # lazy resize
         for name, m in self.metrics.items():
             cfg = IQA_REGISTRY[name]
             try:
                 if cfg['type'] == 'FR':
                     if hr_t is None:
                         hr_t = self._to_tensor01(hr_np, self.device)
-                    sr_score = float(m(sr_t, hr_t).item())
-                    bic_score = float(m(bic_t, hr_t).item())
+                    if sr_t_fr is None:
+                        sr_t_fr = self._maybe_resize_for_fr(sr_t)
+                        bic_t_fr = self._maybe_resize_for_fr(bic_t)
+                        hr_t_fr = self._maybe_resize_for_fr(hr_t)
+                    sr_score = float(m(sr_t_fr, hr_t_fr).item())
+                    bic_score = float(m(bic_t_fr, hr_t_fr).item())
                 else:
                     sr_score = float(m(sr_t).item())
                     bic_score = float(m(bic_t).item())
@@ -349,6 +374,8 @@ class IQAMetricsRunner:
         del sr_t, bic_t
         if hr_t is not None:
             del hr_t
+        if sr_t_fr is not None:
+            del sr_t_fr, bic_t_fr, hr_t_fr
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
 
@@ -480,6 +507,9 @@ class DualStreamEvaluator(nn.Module):
         # checkpoint sets use_learnable_text_embed=True; e.g. ckpts produced
         # by train_text.py). Auto-detected from the ckpt; no CLI flag needed.
         self.use_learnable_text_embed = False
+        self.text_embed_format = None
+        self.text_embed_tokens = 0
+        self.text_embed_scale = 0.1
         self.learnable_text_embed = None
 
     def load(self):
@@ -512,7 +542,11 @@ class DualStreamEvaluator(nn.Module):
             )
             self.use_learnable_text_embed = bool(
                 _ckpt_peek.get('use_learnable_text_embed', False)
+                or _ckpt_peek.get('text_embed_format', None) == 'residual_delta_v1'
             )
+            self.text_embed_format = _ckpt_peek.get('text_embed_format', None)
+            self.text_embed_tokens = int(_ckpt_peek.get('text_embed_tokens', 0) or 0)
+            self.text_embed_scale = float(_ckpt_peek.get('text_embed_scale', 0.1))
             del _ckpt_peek
         except Exception as _peek_err:
             print(f"[Eval][WARN] Could not peek at checkpoint for "
@@ -681,13 +715,48 @@ class DualStreamEvaluator(nn.Module):
         else:
             print("[DFM] inactive (checkpoint has no adapters)")
 
-        # --- Learnable meta text embedding load (eval side) ---
-        # The Parameter was created in `_cache_text_embeddings` if the ckpt
-        # peek set `self.use_learnable_text_embed=True` (e.g. ckpts from
-        # train_text.py). Here we copy the actual learned weights into it.
+        # --- Learnable / residual text embedding load (eval side) ---
+        # `_cache_text_embeddings` creates a full prompt Parameter warm-started
+        # from empty T5. New train_text.py checkpoints store a small residual
+        # delta; old checkpoints store a full learned prompt.
         if self.use_learnable_text_embed and self.learnable_text_embed is not None:
+            text_format = ckpt.get('text_embed_format', self.text_embed_format)
+            text_delta_raw = ckpt.get('learnable_text_delta', None)
             text_embed_raw = ckpt.get('learnable_text_embed', None)
-            if text_embed_raw is not None:
+            if text_format == 'residual_delta_v1' and text_delta_raw is not None:
+                with torch.no_grad():
+                    text_delta_raw = text_delta_raw.to(
+                        device=self.learnable_text_embed.device,
+                        dtype=torch.float32,
+                    )
+                    n = min(
+                        int(text_delta_raw.shape[1]),
+                        int(self.learnable_text_embed.shape[1]),
+                    )
+                    if text_delta_raw.shape[-1] == self.learnable_text_embed.shape[-1]:
+                        self.learnable_text_embed.data.copy_(
+                            self._cached_embeds['prompt'].to(
+                                device=self.learnable_text_embed.device,
+                                dtype=self.learnable_text_embed.dtype,
+                            )
+                        )
+                        self.learnable_text_embed.data[:, :n, :] += (
+                            float(ckpt.get('text_embed_scale', self.text_embed_scale))
+                            * text_delta_raw[:, :n, :].to(self.learnable_text_embed.dtype)
+                        )
+                        print(
+                            f"[TextEmbed] residual_delta_v1 ACTIVE: "
+                            f"tokens={n}, scale={float(ckpt.get('text_embed_scale', self.text_embed_scale)):g}, "
+                            f"delta_shape={tuple(text_delta_raw.shape)}"
+                        )
+                    else:
+                        print(
+                            f"[TextEmbed][WARN] residual delta hidden dim mismatch: "
+                            f"ckpt {tuple(text_delta_raw.shape)} vs "
+                            f"model {tuple(self.learnable_text_embed.shape)}; "
+                            f"falling back to warm-start init."
+                        )
+            elif text_embed_raw is not None:
                 with torch.no_grad():
                     text_embed_raw = text_embed_raw.to(
                         device=self.learnable_text_embed.device,
@@ -709,7 +778,7 @@ class DualStreamEvaluator(nn.Module):
                         )
             else:
                 print("[TextEmbed][WARN] use_learnable_text_embed=True in "
-                      "checkpoint but no `learnable_text_embed` tensor found; "
+                      "checkpoint but no text prior tensor found; "
                       "using warm-start init from cached empty-string T5.")
         else:
             print("[TextEmbed] inactive (checkpoint trained with cached empty T5)")
@@ -1284,6 +1353,9 @@ def main():
     parser.add_argument('--iqa_device', type=str, default='cpu', choices=['cpu', 'cuda'],
                         help='Device for pyiqa metrics. cpu is slower but safe; '
                              'cuda is fast but uses extra GPU memory on top of FLUX.')
+    parser.add_argument('--iqa_fr_max_long_edge', type=int, default=1024,
+                        help='Cap long edge for FR metrics (e.g. DISTS) to avoid '
+                             'multi-minute VGG forward on 2K-4K images. Set 0 to disable.')
     parser.add_argument('--calc_fid', dest='calc_fid', action='store_true',
                         help='Compute FID(SR, HR) at the end using --fid_mode.')
     parser.add_argument('--no_calc_fid', dest='calc_fid', action='store_false')
@@ -1303,8 +1375,6 @@ def main():
     parser.add_argument('--exp_name', type=str, default=None)
     parser.add_argument('--save_images', dest='save_images', action='store_true', default=True)
     parser.add_argument('--no_save_images', dest='save_images', action='store_false')
-    parser.add_argument('--save_comparisons', dest='save_comparisons', action='store_true', default=True)
-    parser.add_argument('--no_save_comparisons', dest='save_comparisons', action='store_false')
     parser.add_argument('--device', type=str, default='cuda')
     
     args = parser.parse_args()
@@ -1397,8 +1467,6 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     if args.save_images:
         os.makedirs(os.path.join(output_dir, 'predictions'), exist_ok=True)
-    if args.save_comparisons:
-        os.makedirs(os.path.join(output_dir, 'comparisons'), exist_ok=True)
     
     print("=" * 70)
     print("Dual-Stream FLUX SR Evaluation - Official Scheduler")
@@ -1443,7 +1511,8 @@ def main():
 
     iqa_device = torch.device(args.iqa_device if (args.iqa_device == 'cpu' or torch.cuda.is_available()) else 'cpu')
     requested_iqa = [m.strip().lower() for m in args.iqa_metrics.split(',') if m.strip()]
-    iqa_runner = IQAMetricsRunner(iqa_device, requested_iqa)
+    iqa_runner = IQAMetricsRunner(iqa_device, requested_iqa,
+                                  fr_max_long_edge=args.iqa_fr_max_long_edge)
 
     # Save images/patches to dirs that FID can consume. Patch FID is the
     # default because 100 full-resolution DIV2K images produce unrealistically
@@ -1566,15 +1635,6 @@ def main():
                 rng=fid_patch_rng,
             )
 
-        if args.save_comparisons:
-            comp = Image.new('RGB', (W * 4, H))
-            lr_display = lr_img.resize((W, H), Image.NEAREST)
-            comp.paste(lr_display, (0, 0))
-            comp.paste(lr_bicubic, (W, 0))
-            comp.paste(Image.fromarray(sr_np), (W * 2, 0))
-            comp.paste(hr_img, (W * 3, 0))
-            comp.save(os.path.join(output_dir, 'comparisons', f'{base_name}_compare.png'))
-
         del lr_t, sr_t
         if lpips_fn:
             del hr_t, lr_t_lpips
@@ -1617,6 +1677,17 @@ def main():
         primary_fid = fid_results.get('patch') or fid_results.get('full') or {}
         fid_sr = primary_fid.get('sr')
         fid_bic = primary_fid.get('bic')
+
+        # Always clean up FID staging dirs once FID is computed -- they're
+        # large (esp. patches) and not needed for anything downstream.
+        # predictions/ is left alone since it's the user-facing SR output.
+        import shutil as _shutil
+        cleanup_dirs = [fid_hr_dir, fid_bic_dir]
+        if compute_patch_fid:
+            cleanup_dirs.extend(fid_patch_dirs.values())
+        for d in cleanup_dirs:
+            if os.path.isdir(d):
+                _shutil.rmtree(d, ignore_errors=True)
 
     def _fmt(v, prec=4):
         return 'n/a' if v is None or (isinstance(v, float) and math.isnan(v)) else f'{v:.{prec}f}'
@@ -1698,7 +1769,7 @@ def main():
                 f"patches_per_image={args.fid_patches_per_image}, "
                 f"patch_count={fid_patch_count}\n"
             )
-        f.write(f"Save Images: {args.save_images}, Save Comparisons: {args.save_comparisons}\n")
+        f.write(f"Save Images: {args.save_images}\n")
         f.write(f"Device: {device}\n")
         if evaluator.use_lora:
             cfg = evaluator.lora_config_ckpt or {}

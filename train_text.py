@@ -8,14 +8,15 @@ A/B variant of ``train_dual_dfm_v2.py``. Inherits the v2 architecture
 (stage-grouped PixelFeatureExtractor, gated residual Level-1 fusion,
 DFM adapters at decoder up_blocks) and adds **one new component**:
 
-    encoder_hidden_states <- learnable nn.Parameter (1, 512, 4096)
+    encoder_hidden_states <- empty T5 + scale * learnable residual delta
+    learnable_text_delta  <- nn.Parameter (1, N, 4096), zero-init
 
 i.e., the cached empty-string T5 prompt fed into FLUX
-``encoder_hidden_states`` is replaced by a learnable "meta prompt"
-(soft prompt). The prompt is warm-started from the cached empty-string
-T5 output so step-0 forward is bit-identical to the v2 baseline; from
-step 1 onwards the network can learn a task-specific context that
-biases FLUX restoration without any natural-language input.
+``encoder_hidden_states`` is preserved, but the first N T5 tokens receive a
+small learned residual. The residual is zero-initialized so step-0 forward is
+bit-identical to the v2 baseline; from step 1 onwards the network can learn a
+task-specific SR prior without a natural-language prompt and without fully
+rewriting the text branch.
 
 Other text-branch inputs are NOT changed (per the FLUX MMDiT
 pre-process figure):
@@ -24,13 +25,13 @@ pre-process figure):
 - `text_ids` -> still all-zero (1, 512, 3) (feeds the positional
   embedder together with `img_ids`)
 
-Param cost: 1*512*4096 = 2,097,152 fp32 trainables (~8 MB) -- negligible
-next to ControlNet (1.8B) and LoRA. CLIP/T5 encoders are still loaded
-once at startup to seed the warm-start and pooled, then dropped --
+Default param cost: 1*32*4096 = 131,072 fp32 trainables (~0.5 MB) -- small
+next to ControlNet (1.8B) and LoRA. CLIP/T5 encoders are still loaded once at
+startup to seed the cached empty-string prompt and pooled, then dropped --
 identical VRAM profile to v2.
 
 Difference from train_dual_dfm_v2.py:
-    forward(): prompt = self.learnable_text_embed.to(bf16).expand(B,-1,-1)
+    forward(): prompt = empty_t5_prompt + text_embed_scale * learnable_text_delta
               (instead of self._cached_embeds['prompt'].expand(B,-1,-1))
 Everything else (dataset, scheduler, LoRA, gated fusion, DFM adapters,
 loss, resume, eval) is kept identical so A/B vs train_dual_dfm_v2.py
@@ -38,19 +39,22 @@ isolates the learnable text embedding contribution.
 
 Checkpoints saved by this file additionally store:
     use_learnable_text_embed = True
-    learnable_text_embed     = (1, 512, 4096) fp32 tensor
+    text_embed_format        = residual_delta_v1
+    learnable_text_delta     = (1, N, 4096) fp32 tensor
+    learnable_text_embed     = effective full prompt for eval compatibility
     text_embed_freeze        = bool (mirrors --freeze_text_embed)
 
-Resume from a v2 checkpoint (no learnable_text_embed key): warm-starts
-from cached empty-string T5 -> equivalent to v2 at step 0, then learns.
+Resume from a v2 checkpoint (no text prior key): keeps zero delta -> equivalent
+to v2 at step 0, then learns. Resume from older full-prompt train_text
+checkpoints converts the first N tokens to residual delta.
 
 This is the NEW training entry for the text-embed variant.
 - Supports `--degrade_mode {paired, bicubic, realesrgan}`
 - `realesrgan` mode performs on-the-fly second-order degradation from HR patches
 - Keeps scheduler semantics aligned with official FlowMatch usage
 - FLUX LoRA training is enabled by default
-- Learnable meta text embedding is ALWAYS ON in this script (the whole
-  point of the variant). Use --freeze_text_embed for ablation.
+- Residual learnable text prior is ALWAYS ON in this script (the whole point
+  of the variant). Use --freeze_text_embed for ablation.
 
 Typical commands (DF2K -> Mix16K workflow):
 
@@ -902,7 +906,11 @@ class DualStreamFLUXSR(nn.Module):
                  dfm_sigma_min=0.05, dfm_sigma_gate=0.7,
                  dfm_detach_v=False,
                  pixel_gate_init=4.0,
-                 text_embed_freeze=False):
+                 text_embed_freeze=False,
+                 text_embed_tokens=32,
+                 text_embed_scale=0.1,
+                 text_embed_l2=1e-4,
+                 text_embed_lr=1e-6):
         super().__init__()
         self.model_name = model_name
         self.device = device
@@ -939,14 +947,17 @@ class DualStreamFLUXSR(nn.Module):
         # grounding also refines the FM head.
         self.dfm_detach_v = bool(dfm_detach_v)
 
-        # Learnable meta text embedding. Always ON in this script (the whole
-        # point of train_text.py vs train_dual_dfm_v2.py). The Parameter is
-        # registered in `_cache_text_embeddings` with shape (1, 512, 4096),
-        # warm-started from cached empty-string T5. Only the FLUX
-        # `encoder_hidden_states` input changes; CLIP `pooled_projections`
-        # (temb path) and `text_ids` (pos embed path) are unchanged.
+        # Weak residual text prior. Always ON in this script, but initialized
+        # to zero so step-0 is identical to train_dual_dfm_v2's cached empty
+        # T5 prompt. Only the first N T5 tokens receive a small residual delta;
+        # CLIP pooled_projections and text_ids stay unchanged.
         self.use_learnable_text_embed = True
+        self.text_embed_format = 'residual_delta_v1'
         self.text_embed_freeze = bool(text_embed_freeze)
+        self.text_embed_tokens = int(text_embed_tokens)
+        self.text_embed_scale = float(text_embed_scale)
+        self.text_embed_l2 = float(text_embed_l2)
+        self.text_embed_lr = float(text_embed_lr)
 
         self.vae = None
         self.transformer = None
@@ -954,7 +965,7 @@ class DualStreamFLUXSR(nn.Module):
         self.pixel_extractor = None
         self.pixel_fuse_proj = None
         self.pixel_gate_logit = None
-        self.learnable_text_embed = None  # populated in _cache_text_embeddings
+        self.learnable_text_delta = None  # populated in _cache_text_embeddings
         self.scheduler = None
         self._cached_embeds = None
         # DFM adapter dict: key is 'up0'/'up1'/'up2', value is DFMAdapter.
@@ -1102,22 +1113,48 @@ class DualStreamFLUXSR(nn.Module):
                 'text_ids': torch.zeros(t5_out[0].shape[1], 3, device=self.device, dtype=dtype),
             }
 
-        # Register the learnable meta text embedding (always ON in train_text).
-        # Warm-start from cached empty-string T5 -> step-0 forward is
-        # bit-identical to the v2 baseline. Stored fp32, cast bf16 at use-site.
-        # CLIP `pooled` and zero `text_ids` are unchanged.
-        self.learnable_text_embed = nn.Parameter(
-            t5_out[0].detach().to(torch.float32),
+        # Register a small residual text prior. Zero init keeps step-0
+        # bit-identical to the v2 baseline while still giving the model a
+        # learned task-level T5 context once training starts.
+        seq_len = int(t5_out[0].shape[1])
+        hidden = int(t5_out[0].shape[2])
+        tokens = max(1, min(int(self.text_embed_tokens), seq_len))
+        self.text_embed_tokens = tokens
+        self.learnable_text_delta = nn.Parameter(
+            torch.zeros(1, tokens, hidden, device=self.device, dtype=torch.float32),
             requires_grad=not self.text_embed_freeze,
-        )
-        self.learnable_text_embed.data = (
-            self.learnable_text_embed.data.to(self.device)
         )
 
         del text_enc, text_enc_2
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
         gc.collect()
+
+    def get_effective_text_embed(self, dtype=torch.float32):
+        """Return full T5 encoder_hidden_states with the residual prior applied."""
+        if self._cached_embeds is None or self._cached_embeds.get('prompt', None) is None:
+            raise RuntimeError("Text embeddings have not been cached yet.")
+        prompt = self._cached_embeds['prompt'].to(dtype).clone()
+        if self.learnable_text_delta is not None:
+            n = min(int(self.learnable_text_delta.shape[1]), int(prompt.shape[1]))
+            delta = self.learnable_text_delta[:, :n, :].to(dtype)
+            prompt[:, :n, :] = prompt[:, :n, :] + float(self.text_embed_scale) * delta
+        return prompt
+
+    def text_delta_regularization_loss(self):
+        if (
+            self.learnable_text_delta is None
+            or self.text_embed_freeze
+            or float(self.text_embed_l2) <= 0.0
+        ):
+            return None
+        return float(self.text_embed_l2) * self.learnable_text_delta.float().pow(2).mean()
+
+    def get_text_delta_stats(self):
+        if self.learnable_text_delta is None:
+            return 0.0, 0.0
+        delta = self.learnable_text_delta.detach().float()
+        return delta.pow(2).mean().sqrt().item(), delta.norm().item()
 
     def _reset_pixel_fuse_proj_to_identity(self):
         """Identity-init the 16->16 projection applied to pixel_feat.
@@ -1143,21 +1180,11 @@ class DualStreamFLUXSR(nn.Module):
             self.pixel_gate_logit.fill_(self.pixel_gate_init)
 
     def _reset_learnable_text_embed(self):
-        """Reset the learnable meta text embedding to its warm-start value.
-
-        Copies the cached empty-string T5 output back into the parameter (in
-        fp32 to match its storage dtype). No-op when the cached embedding is
-        missing. Intended for Stage 1 -> Stage 2 transitions, paired with
-        --reset_pixel_gate.
-        """
-        if (self.learnable_text_embed is None
-                or self._cached_embeds is None
-                or self._cached_embeds.get('prompt', None) is None):
+        """Reset the residual text prior to zero (empty T5 baseline)."""
+        if self.learnable_text_delta is None:
             return
         with torch.no_grad():
-            warm = self._cached_embeds['prompt'].to(torch.float32)
-            warm = warm.to(self.learnable_text_embed.device)
-            self.learnable_text_embed.data.copy_(warm)
+            self.learnable_text_delta.zero_()
 
     def _apply_lora_to_transformer(self, local_rank=0):
         """Wrap Transformer with a PEFT LoRA adapter."""
@@ -1252,13 +1279,13 @@ class DualStreamFLUXSR(nn.Module):
         return params
 
     def get_text_embed_params(self):
-        """Return the learnable meta text embedding parameter list.
+        """Return the residual text-prior parameter list.
 
         Kept as a separate group so per-group LR schedules and parameter
         counting remain auditable. Returns an empty list when frozen.
         """
-        if self.learnable_text_embed is not None and not self.text_embed_freeze:
-            return [self.learnable_text_embed]
+        if self.learnable_text_delta is not None and not self.text_embed_freeze:
+            return [self.learnable_text_delta]
         return []
 
     def get_dfm_params(self):
@@ -1527,11 +1554,11 @@ class DualStreamFLUXSR(nn.Module):
         # Text embeddings (per FLUX MMDiT pre-process):
         # - `pooled`   -> guiding-embed (temb) path with timestep+guidance
         #                 (kept as cached empty-string CLIP pooled).
-        # - `prompt`   -> encoder_hidden_states; REPLACED by the learnable
-        #                 meta embedding registered in _cache_text_embeddings.
+        # - `prompt`   -> encoder_hidden_states; empty T5 plus a small learned
+        #                 residual on the first N tokens.
         # - `text_ids` -> positional embedder with img_ids (zeros, unchanged).
         pooled = self._cached_embeds['pooled'].expand(B, -1)
-        prompt = self.learnable_text_embed.to(dtype).expand(B, -1, -1)
+        prompt = self.get_effective_text_embed(dtype=dtype).expand(B, -1, -1)
         text_ids = self._cached_embeds['text_ids']
         
         # 🌟 timestep 已经是 / 1000 后的值，直接使用
@@ -2044,13 +2071,19 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
         'pixel_gate_logit': unwrapped.pixel_gate_logit.detach().cpu()
             if unwrapped.pixel_gate_logit is not None else None,
         'fusion_type': 'gated',
-        # Learnable meta text embedding (always saved by train_text.py).
+        # Residual text prior plus a full effective prompt for old eval scripts.
         'use_learnable_text_embed': True,
-        'learnable_text_embed': (
-            unwrapped.learnable_text_embed.detach().cpu()
-            if getattr(unwrapped, 'learnable_text_embed', None) is not None
+        'text_embed_format': getattr(unwrapped, 'text_embed_format', 'residual_delta_v1'),
+        'learnable_text_delta': (
+            unwrapped.learnable_text_delta.detach().cpu()
+            if getattr(unwrapped, 'learnable_text_delta', None) is not None
             else None
         ),
+        'learnable_text_embed': unwrapped.get_effective_text_embed(dtype=torch.float32).detach().cpu(),
+        'text_embed_tokens': int(getattr(unwrapped, 'text_embed_tokens', 0)),
+        'text_embed_scale': float(getattr(unwrapped, 'text_embed_scale', 0.1)),
+        'text_embed_l2': float(getattr(unwrapped, 'text_embed_l2', 0.0)),
+        'text_embed_lr': float(getattr(unwrapped, 'text_embed_lr', 0.0)),
         'text_embed_freeze': bool(getattr(unwrapped, 'text_embed_freeze', False)),
         'controlnet': unwrapped.controlnet.state_dict(),
         'use_lora': unwrapped.use_lora,
@@ -2219,13 +2252,20 @@ def main():
                              'switching Stage 1 -> Stage 2 to re-learn the mixing.')
     # Learnable Meta Text Embedding (always ON in train_text.py).
     parser.add_argument('--freeze_text_embed', action='store_true', default=False,
-                        help='If set, the learnable text embedding is registered but '
-                             'not optimized (frozen at warm-start). Useful for ablation '
-                             'experiments comparing learned vs. cached empty-string T5.')
+                        help='If set, the residual text prior is registered but '
+                             'not optimized (frozen at zero, equal to cached empty-string T5).')
     parser.add_argument('--reset_text_embed', action='store_true', default=False,
-                        help='On resume, reset learnable_text_embed back to cached '
-                             'empty-string T5 warm-start. Pairs with --reset_pixel_gate '
+                        help='On resume, reset learnable_text_delta back to zero. '
+                             'Pairs with --reset_pixel_gate '
                              'for Stage 1 -> Stage 2 transitions.')
+    parser.add_argument('--text_embed_tokens', type=int, default=32,
+                        help='Number of leading T5 tokens that receive a learned residual delta.')
+    parser.add_argument('--text_embed_scale', type=float, default=0.1,
+                        help='Scale applied to the learned T5 residual delta before adding to empty T5.')
+    parser.add_argument('--text_embed_lr', type=float, default=1e-6,
+                        help='Learning rate for the residual text prior parameter group.')
+    parser.add_argument('--text_embed_l2', type=float, default=1e-4,
+                        help='L2 penalty on learnable_text_delta.float().pow(2).mean().')
     parser.add_argument('--controlnet_lr_scale', type=float, default=1.0,
                         help='Multiplier applied to --lr for the ControlNet param group (use <1 for Stage 2 fine-tuning, e.g. 0.1).')
 
@@ -2239,6 +2279,14 @@ def main():
     parser.add_argument('--freeze_controlnet', action='store_true', default=False)
     
     args = parser.parse_args()
+    if args.text_embed_tokens < 1:
+        parser.error("--text_embed_tokens must be >= 1")
+    if args.text_embed_scale <= 0:
+        parser.error("--text_embed_scale must be > 0")
+    if args.text_embed_lr <= 0:
+        parser.error("--text_embed_lr must be > 0")
+    if args.text_embed_l2 < 0:
+        parser.error("--text_embed_l2 must be >= 0")
 
     if args.scale < 1:
         parser.error("--scale must be >= 1")
@@ -2364,9 +2412,10 @@ def main():
         print(f"Pixel Fusion: gated residual add (identity-init conv, "
               f"logit={args.pixel_gate_init}, sigmoid={gate_sig_print:.4f})")
         print(
-            f"[TextEmbed] Learnable T5 prompt ALWAYS ON in train_text "
-            f"(shape=(1,512,4096), warm-start from empty string, "
-            f"freeze={args.freeze_text_embed}, params=2,097,152)"
+            f"[TextEmbed] Residual T5 prior ON "
+            f"(format=residual_delta_v1, tokens={args.text_embed_tokens}, "
+            f"scale={args.text_embed_scale:g}, lr={args.text_embed_lr:.2e}, "
+            f"l2={args.text_embed_l2:.2e}, freeze={args.freeze_text_embed})"
         )
         print(f"Conditioning Scale: {args.conditioning_scale}")
         print(f"LPIPS Weight: {args.lpips_weight} (resize={args.lpips_resize}, prob={args.lpips_apply_prob})")
@@ -2413,6 +2462,10 @@ def main():
         dfm_detach_v=args.dfm_detach_v,
         pixel_gate_init=args.pixel_gate_init,
         text_embed_freeze=args.freeze_text_embed,
+        text_embed_tokens=args.text_embed_tokens,
+        text_embed_scale=args.text_embed_scale,
+        text_embed_l2=args.text_embed_l2,
+        text_embed_lr=args.text_embed_lr,
     )
     if args.dry_run_lora:
         if is_main:
@@ -2491,14 +2544,14 @@ def main():
         optimizer_grouped_parameters.append(
             {"params": lora_params, "lr": args.lora_lr}
         )
-    # Learnable meta text embedding -- shares the base lr (same magnitude as
-    # LoRA / pixel branch). Empty when --freeze_text_embed is on.
+    # Residual text prior -- separate conservative LR and no AdamW decay; the
+    # explicit --text_embed_l2 term controls how far the delta can drift.
     if len(text_embed_params) > 0:
         optimizer_grouped_parameters.append(
-            {"params": text_embed_params, "lr": args.lr}
+            {"params": text_embed_params, "lr": args.text_embed_lr, "weight_decay": 0.0}
         )
     if is_main:
-        text_lr_str = f", text_embed={args.lr:.2e}" if len(text_embed_params) > 0 else " (frozen)"
+        text_lr_str = f", text_delta={args.text_embed_lr:.2e}" if len(text_embed_params) > 0 else " (text frozen)"
         print(
             f"[Training] LR groups: controlnet={controlnet_lr:.2e} "
             f"(scale={args.controlnet_lr_scale}), pixel={args.lr * 10.0:.2e}, "
@@ -2511,7 +2564,7 @@ def main():
         n_cn = sum(p.numel() for p in system.controlnet.parameters()) if args.train_controlnet else 0
         n_lora = sum(p.numel() for p in lora_params)
         n_text = sum(p.numel() for p in text_embed_params)
-        text_extra = f", text_embed={n_text:,}" if n_text > 0 else ", text_embed=0(frozen)"
+        text_extra = f", text_delta={n_text:,}" if n_text > 0 else ", text_delta=0(frozen)"
         print(
             f"[Training] Trainable params: total={total_params:,} "
             f"(controlnet={n_cn:,}, pixel={n_pixel:,}, lora={n_lora:,}{text_extra})"
@@ -2621,41 +2674,59 @@ def main():
                     f"pixel_gate_logit reset (sigmoid={gate_sig:.4f})."
                 )
 
-        # Learnable meta text embedding: graceful resume.
-        # - ckpt has it -> shape-checked copy.
-        # - ckpt missing (e.g. resuming from a v2 baseline) -> warm-start
-        #   init from cached empty-string T5 already done in
-        #   _cache_text_embeddings; log a one-line note.
+        # Residual text prior: graceful resume.
+        # - new ckpt has learnable_text_delta -> shape-checked copy.
+        # - old train_text ckpt has full learnable_text_embed -> convert the
+        #   first N tokens to a residual delta.
+        # - v2 baseline ckpt has neither -> keep zero delta, equal to empty T5.
+        text_delta_raw = ckpt.get('learnable_text_delta', None)
         text_embed_raw = ckpt.get('learnable_text_embed', None)
-        if (text_embed_raw is not None
-                and getattr(unwrapped, 'learnable_text_embed', None) is not None):
+        target_delta = getattr(unwrapped, 'learnable_text_delta', None)
+        if target_delta is not None:
             with torch.no_grad():
-                text_embed_raw = text_embed_raw.to(
-                    device=unwrapped.learnable_text_embed.device,
-                    dtype=unwrapped.learnable_text_embed.dtype,
-                )
-                if text_embed_raw.shape == unwrapped.learnable_text_embed.shape:
-                    unwrapped.learnable_text_embed.data.copy_(text_embed_raw)
-                    if is_main:
-                        print("[Resume] Loaded learnable_text_embed from checkpoint "
-                              f"(shape={tuple(text_embed_raw.shape)}).")
-                else:
-                    if is_main:
+                if text_delta_raw is not None:
+                    text_delta_raw = text_delta_raw.to(
+                        device=target_delta.device,
+                        dtype=target_delta.dtype,
+                    )
+                    if text_delta_raw.shape == target_delta.shape:
+                        target_delta.data.copy_(text_delta_raw)
+                        if is_main:
+                            print("[Resume] Loaded learnable_text_delta from checkpoint "
+                                  f"(shape={tuple(text_delta_raw.shape)}).")
+                    elif is_main:
                         print(
-                            f"[Resume][WARN] learnable_text_embed shape mismatch: "
-                            f"ckpt {tuple(text_embed_raw.shape)} vs "
-                            f"model {tuple(unwrapped.learnable_text_embed.shape)}; "
-                            f"keeping warm-start init."
+                            f"[Resume][WARN] learnable_text_delta shape mismatch: "
+                            f"ckpt {tuple(text_delta_raw.shape)} vs "
+                            f"model {tuple(target_delta.shape)}; keeping zero init."
                         )
-        elif text_embed_raw is None and is_main:
-            print("[Resume] Checkpoint has no learnable_text_embed (likely a v2 "
-                  "baseline ckpt); using warm-start init from cached empty-string T5.")
+                elif text_embed_raw is not None:
+                    full = text_embed_raw.to(device=target_delta.device, dtype=torch.float32)
+                    empty = unwrapped._cached_embeds['prompt'].to(
+                        device=target_delta.device,
+                        dtype=torch.float32,
+                    )
+                    n = min(target_delta.shape[1], full.shape[1], empty.shape[1])
+                    if full.shape[-1] == target_delta.shape[-1] == empty.shape[-1]:
+                        converted = (full[:, :n, :] - empty[:, :n, :]) / float(unwrapped.text_embed_scale)
+                        target_delta[:, :n, :].copy_(converted.to(dtype=target_delta.dtype))
+                        if is_main:
+                            print("[Resume][WARN] Converted legacy full learnable_text_embed "
+                                  f"to residual delta for first {n} tokens.")
+                    elif is_main:
+                        print(
+                            f"[Resume][WARN] legacy learnable_text_embed hidden dim mismatch: "
+                            f"ckpt {tuple(full.shape)} vs delta {tuple(target_delta.shape)}; "
+                            "keeping zero init."
+                        )
+                elif is_main:
+                    print("[Resume] Checkpoint has no text prior (likely train_dual_dfm_v2); "
+                          "using zero residual delta over cached empty-string T5.")
 
         if getattr(args, 'reset_text_embed', False):
             unwrapped._reset_learnable_text_embed()
             if is_main:
-                print("[Resume] --reset_text_embed: learnable_text_embed "
-                      "reset to cached empty-string T5 warm-start.")
+                print("[Resume] --reset_text_embed: learnable_text_delta reset to zero.")
 
         if args.train_controlnet and 'controlnet' in ckpt:
             state = _strip_module_prefix(ckpt['controlnet'])
@@ -2899,6 +2970,9 @@ def main():
                     lpips_apply_prob=args.lpips_apply_prob,
                     lpips_max_sigma=args.lpips_max_sigma,
                 )
+                text_reg = unwrapped.text_delta_regularization_loss()
+                if text_reg is not None:
+                    loss = loss + text_reg
                 
                 accelerator.backward(loss)
                 optimizer.step()
@@ -2955,10 +3029,12 @@ def main():
                     a.zero_conv.weight.detach().float().norm().item()
                     for a in unwrapped.dfm_adapters.values()
                 )
+            text_delta_rms, text_delta_norm = unwrapped.get_text_delta_stats()
 
             extra_tag = f", Gate={gate_value:.4f}"
             if dfm_zc_norm is not None:
                 extra_tag += f", DFM_zc={dfm_zc_norm:.4f}"
+            extra_tag += f", TextDeltaRMS={text_delta_rms:.6f}, TextDeltaNorm={text_delta_norm:.4f}"
             if val_lpips is not None:
                 log_line = (
                     f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, "
