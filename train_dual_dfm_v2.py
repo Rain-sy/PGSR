@@ -2446,8 +2446,19 @@ def main():
                 print("[Data] val_lr_dir not provided: validation LR will use bicubic degradation from HR.")
             print(f"[Data] Training: {len(train_dataset)}, Validation: {len(val_dataset)}")
     
-    # Optimizer and scheduler
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01)
+    # Optimizer and scheduler. Prefer bitsandbytes' 8-bit AdamW when available
+    # (saves ~12-15 GB / GPU on the ControlNet optimizer state); fall back to
+    # standard AdamW silently if bitsandbytes isn't installed.
+    try:
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(optimizer_grouped_parameters, weight_decay=0.01)
+        if is_main:
+            print("[Optim] using bitsandbytes AdamW8bit (8-bit optimizer states)")
+    except ImportError:
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01)
+        if is_main:
+            print("[Optim] using torch.optim.AdamW (fp32 states); "
+                  "install 'bitsandbytes' to enable 8-bit AdamW for ~12 GB / GPU savings")
     
     steps_per_epoch = len(train_loader)
     num_training_steps = args.epochs * steps_per_epoch

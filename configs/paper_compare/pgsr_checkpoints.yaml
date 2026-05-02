@@ -1,0 +1,18 @@
+default_args:
+  num_steps: 20
+  guidance: 3.5
+  strength: 1.0
+  tile_size: 512
+  min_tile_size: 256
+  overlap: 64
+  fid_mode: patch
+  fid_patch_size: 512
+  fid_patches_per_image: 25
+
+checkpoints:
+  DIV2K:
+    path: checkpoints/dual_dfmv2_stage1_df2k_dfm002/20260424_023124_degpaired_x4_str1_pw1_gate4_lpw0_lpp0p25_aug0_bmpsnr_crop2_dfm_dpw0p05_dlw0_dsg0p7_lora_r16_a16_d0_llr0p0001_tpominicontrol/best_model.pt
+  RealSR:
+    path: checkpoints/dual_dfmv2_stage2b_from_dfm002/20260427_014703_degrealesrgan_x4_str1_pw1_gate4_lpw0p05_lpp0p1_aug0_bmlpips_crop1_dfm_dpw0p05_dlw0_dsg0p7_lora_r16_a16_d0_llr0p0001_tpominicontrol/best_model.pt
+  DRealSR:
+    path: checkpoints/dual_dfmv2_stage2b_from_dfm002/20260427_014703_degrealesrgan_x4_str1_pw1_gate4_lpw0p05_lpp0p1_aug0_bmlpips_crop1_dfm_dpw0p05_dlw0_dsg0p7_lora_r16_a16_d0_llr0p0001_tpominicontrol/best_model.pt

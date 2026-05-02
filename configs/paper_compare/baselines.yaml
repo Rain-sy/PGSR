@@ -1,0 +1,167 @@
+workspace: experiments/paper_compare
+external_root: external_baselines
+
+datasets:
+  DIV2K:
+    lr_dir: experiments/paper_compare/visual_inputs/DIV2K/LR_X4
+    hr_dir: experiments/paper_compare/visual_inputs/DIV2K/HR
+  RealSR:
+    lr_dir: experiments/paper_compare/visual_inputs/RealSR/LR_X4
+    hr_dir: experiments/paper_compare/visual_inputs/RealSR/HR
+  DRealSR:
+    lr_dir: experiments/paper_compare/visual_inputs/DRealSR/LR_X4
+    hr_dir: experiments/paper_compare/visual_inputs/DRealSR/HR
+
+methods:
+  ResShift:
+    status: runnable
+    repo_url: https://github.com/zsyOAOA/ResShift.git
+    repo_dir: ResShift
+    commit: journal
+    env_name: resshift
+    entrypoint: inference_resshift.py
+    input_arg: -i
+    output_arg: -o
+    extra_args:
+      - --task
+      - realsr
+      - --scale
+      - "4"
+      - --version
+      - v3
+    expected_output_patterns:
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.jpeg"
+
+  DiffBIR:
+    status: runnable
+    repo_url: https://github.com/XPixelGroup/DiffBIR.git
+    repo_dir: DiffBIR
+    commit: main
+    env_name: diffbir
+    entrypoint: inference.py
+    input_arg: --input
+    output_arg: --output
+    extra_args:
+      - --task
+      - sr
+      - --upscale
+      - "4"
+      - --version
+      - v2
+      - --sampler
+      - spaced
+      - --steps
+      - "50"
+      - --captioner
+      - none
+      - --pos_prompt
+      - ""
+      - --neg_prompt
+      - "low quality, blurry, low-resolution, noisy, unsharp, weird textures"
+      - --cfg_scale
+      - "4"
+      - --device
+      - cuda
+      - --precision
+      - fp32
+    expected_output_patterns:
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.jpeg"
+
+  SeeSR:
+    status: runnable
+    repo_url: https://github.com/cswry/SeeSR.git
+    repo_dir: SeeSR
+    commit: main
+    env_name: seesr
+    entrypoint: test_seesr.py
+    input_arg: --image_path
+    output_arg: --output_dir
+    extra_args:
+      - --pretrained_model_path
+      - preset/models/stable-diffusion-2-base
+      - --prompt
+      - ""
+      - --seesr_model_path
+      - preset/models/seesr
+      - --ram_ft_path
+      - preset/models/DAPE.pth
+      - --start_point
+      - lr
+      - --num_inference_steps
+      - "50"
+      - --guidance_scale
+      - "5.5"
+      - --process_size
+      - "512"
+    expected_output_patterns:
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.jpeg"
+
+  PiSA-SR:
+    status: runnable
+    repo_url: https://github.com/csslc/PiSA-SR.git
+    repo_dir: PiSA-SR
+    commit: main
+    env_name: pisasr
+    entrypoint: test_pisasr.py
+    input_arg: --input_image
+    output_arg: --output_dir
+    extra_args:
+      - --pretrained_model_path
+      - preset/models/stable-diffusion-2-1-base
+      - --pretrained_path
+      - preset/models/pisa_sr.pkl
+      - --process_size
+      - "512"
+      - --upscale
+      - "4"
+      - --default
+    expected_output_patterns:
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.jpeg"
+
+  StableSR:
+    status: public_needs_command
+    repo_url: https://github.com/IceClear/StableSR.git
+    repo_dir: StableSR
+    commit: main
+    env_name: stablesr
+    notes: "Official repo is public, but command/weights vary by release. Fill entrypoint/input_arg/output_arg/extra_args after local setup."
+
+  FluxSR:
+    status: public_needs_command
+    repo_url: https://github.com/JianzeLi-114/FluxSR.git
+    repo_dir: FluxSR
+    commit: master
+    env_name: fluxsr
+    notes: "Official repo is public. Fill exact inference command after local setup and weight download."
+
+  FlowSR:
+    status: pending_public_code
+    repo_url: null
+    repo_dir: FlowSR
+    commit: null
+    env_name: flowsr
+    notes: "Skip visual comparison until reliable official code/checkpoint is available."
+
+  GuideSR:
+    status: pending_public_code
+    repo_url: null
+    repo_dir: GuideSR
+    commit: null
+    env_name: guidesr
+    notes: "Skip visual comparison until reliable official code/checkpoint is available."
+
+  PGSR:
+    status: local
+    repo_url: null
+    repo_dir: .
+    commit: local
+    env_name: null
+    notes: "Run with scripts/paper_compare/run_pgsr.py instead of run_baseline.py."

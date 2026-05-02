@@ -257,7 +257,9 @@ class DualStreamEvaluator(nn.Module):
         self.pixel_fuse_proj.eval()
 
         print("Loading checkpoint...")
-        ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
+        # Keep the large checkpoint on CPU while model weights are already on
+        # GPU; load_state_dict copies tensors to the target modules as needed.
+        ckpt = torch.load(self.checkpoint_path, map_location='cpu', weights_only=False)
 
         if 'pixel_extractor' in ckpt:
             state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}

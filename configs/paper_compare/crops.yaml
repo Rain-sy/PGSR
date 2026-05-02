@@ -1,0 +1,20 @@
+default:
+  crop_size: 256
+  columns:
+    - LR/Bicubic
+    - ResShift
+    - StableSR
+    - DiffBIR
+    - SeeSR
+    - PiSA-SR
+    - FluxSR
+    - PGSR
+    - HR
+
+datasets:
+  DIV2K:
+    images: {}
+  RealSR:
+    images: {}
+  DRealSR:
+    images: {}

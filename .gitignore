@@ -14,3 +14,14 @@ eval_*/
 .claude/worktrees/
 *_tmp.py
 NeurIPS_2026_Dual_SR/
+.claude/
+
+# Paper comparison workspace
+external_baselines/
+experiments/paper_compare/outputs/
+experiments/paper_compare/figures/
+experiments/paper_compare/metrics/
+experiments/paper_compare/visual_inputs/**/*.png
+experiments/paper_compare/visual_inputs/**/*.jpg
+experiments/paper_compare/visual_inputs/**/*.jpeg
+!experiments/paper_compare/visual_inputs/**/.gitkeep
