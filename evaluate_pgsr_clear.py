@@ -1870,11 +1870,12 @@ def main():
     compute_patch_fid = bool(will_compute_fid and args.fid_mode in ('patch', 'both'))
     fid_tmp_ctx = tempfile.TemporaryDirectory(prefix='dfm_eval_fid_') if will_compute_fid else None
     fid_tmp_root = fid_tmp_ctx.name if fid_tmp_ctx is not None else None
-    fid_sr_dir = (
-        os.path.join(output_dir, 'predictions')
-        if args.save_images
-        else os.path.join(fid_tmp_root, 'fid_sr')
-    )
+    if args.save_images:
+        fid_sr_dir = os.path.join(output_dir, 'predictions')
+    elif fid_tmp_root:
+        fid_sr_dir = os.path.join(fid_tmp_root, 'fid_sr')
+    else:
+        fid_sr_dir = None
     fid_hr_dir = os.path.join(fid_tmp_root, 'fid_hr') if fid_tmp_root else None
     fid_bic_dir = os.path.join(fid_tmp_root, 'fid_bicubic') if fid_tmp_root else None
     fid_patch_dirs = {
