@@ -29,6 +29,12 @@ methods:
       - "4"
       - --version
       - v3
+      - --chop_size
+      - "256"
+      - --chop_stride
+      - "224"
+      - --bs
+      - "1"
     expected_output_patterns:
       - "**/*.png"
       - "**/*.jpg"
@@ -49,23 +55,35 @@ methods:
       - --upscale
       - "4"
       - --version
-      - v2
-      - --sampler
-      - spaced
-      - --steps
-      - "50"
+      - v2.1
       - --captioner
       - none
-      - --pos_prompt
-      - ""
-      - --neg_prompt
-      - "low quality, blurry, low-resolution, noisy, unsharp, weird textures"
       - --cfg_scale
-      - "4"
+      - "1"
+      - --noise_aug
+      - "0"
+      - --vae_encoder_tiled
+      - --vae_encoder_tile_size
+      - "256"
+      - --vae_decoder_tiled
+      - --vae_decoder_tile_size
+      - "256"
+      - --cldm_tiled
+      - --cldm_tile_size
+      - "512"
+      - --cldm_tile_stride
+      - "256"
+      - --batch_size
+      - "1"
+      - --n_samples
+      - "1"
+      - --seed
+      - "231"
       - --device
       - cuda
       - --precision
-      - fp32
+      - fp16
+    notes: "Tuned on a 4-image DIV2K subset: cfg_scale=1 improved PSNR/LPIPS/DISTS over the previous cfg_scale=6 while keeping the same v2.1 no-caption setup."
     expected_output_patterns:
       - "**/*.png"
       - "**/*.jpg"
@@ -102,6 +120,78 @@ methods:
       - "**/*.jpg"
       - "**/*.jpeg"
 
+  SeeSR_g3p5_wavelet:
+    status: runnable
+    repo_url: https://github.com/cswry/SeeSR.git
+    repo_dir: SeeSR
+    commit: main
+    env_name: seesr
+    entrypoint: test_seesr.py
+    input_arg: --image_path
+    output_arg: --output_dir
+    extra_args:
+      - --pretrained_model_path
+      - preset/models/stable-diffusion-2-base
+      - --prompt
+      - ""
+      - --seesr_model_path
+      - preset/models/seesr
+      - --ram_ft_path
+      - preset/models/DAPE.pth
+      - --start_point
+      - lr
+      - --num_inference_steps
+      - "50"
+      - --guidance_scale
+      - "3.5"
+      - --process_size
+      - "512"
+      - --align_method
+      - wavelet
+      - --seed
+      - "42"
+    notes: "Visual-check variant: lower guidance than the official 5.5 setting and wavelet color alignment to reduce over-generated/unstable appearance."
+    expected_output_patterns:
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.jpeg"
+
+  SeeSR_g1p5_s40_wavelet:
+    status: runnable
+    repo_url: https://github.com/cswry/SeeSR.git
+    repo_dir: SeeSR
+    commit: main
+    env_name: seesr
+    entrypoint: test_seesr.py
+    input_arg: --image_path
+    output_arg: --output_dir
+    extra_args:
+      - --pretrained_model_path
+      - preset/models/stable-diffusion-2-base
+      - --prompt
+      - ""
+      - --seesr_model_path
+      - preset/models/seesr
+      - --ram_ft_path
+      - preset/models/DAPE.pth
+      - --start_point
+      - lr
+      - --num_inference_steps
+      - "40"
+      - --guidance_scale
+      - "1.5"
+      - --process_size
+      - "512"
+      - --align_method
+      - wavelet
+      - --seed
+      - "42"
+    notes: "Visual-check variant requested by user: lower guidance=1.5 and 40 steps to reduce hallucination."
+    expected_output_patterns:
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.jpeg"
+
   PiSA-SR:
     status: runnable
     repo_url: https://github.com/csslc/PiSA-SR.git
@@ -132,7 +222,74 @@ methods:
     repo_dir: StableSR
     commit: main
     env_name: stablesr
-    notes: "Official repo is public, but command/weights vary by release. Fill entrypoint/input_arg/output_arg/extra_args after local setup."
+    pythonpath_repo: true
+    pythonpath_extra:
+      - src/taming-transformers
+    entrypoint: scripts/sr_val_ddim_text_T_negativeprompt_canvas_tile.py
+    input_arg: --init-img
+    output_arg: --outdir
+    extra_args:
+      - --config
+      - configs/stableSRNew/v2-finetune_text_T_768v.yaml
+      - --ckpt
+      - stablesr_768v_000139.ckpt
+      - --vqgan_ckpt
+      - vqgan_cfw_00011.ckpt
+      - --ddim_steps
+      - "20"
+      - --dec_w
+      - "0.0"
+      - --colorfix_type
+      - wavelet
+      - --scale
+      - "7.0"
+      - --use_negative_prompt
+      - --upscale
+      - "4"
+      - --seed
+      - "42"
+      - --n_samples
+      - "1"
+      - --input_size
+      - "768"
+      - --vqgantile_size
+      - "768"
+      - --vqgantile_stride
+      - "720"
+      - --tile_overlap
+      - "48"
+      - --ddim_eta
+      - "1.0"
+    notes: "Official 768v tiled DDIM command from README. Uses PYTHONPATH=repo because editable install is fragile with modern setuptools."
+    expected_output_patterns:
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.jpeg"
+
+  SinSR:
+    status: runnable
+    repo_url: https://github.com/wyf0912/SinSR.git
+    repo_dir: SinSR
+    commit: main
+    env_name: resshift
+    entrypoint: inference.py
+    input_arg: -i
+    output_arg: -o
+    extra_args:
+      - --scale
+      - "4"
+      - --one_step
+      - --task
+      - SinSR
+      - --chop_size
+      - "256"
+      - --seed
+      - "12345"
+    notes: "Official fast testing command with README low-memory chop_size=256 for large DIV2K images. Checkpoints auto-download from the SinSR/ResShift GitHub releases into external_baselines/SinSR/weights."
+    expected_output_patterns:
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.jpeg"
 
   FluxSR:
     status: public_needs_command
@@ -147,20 +304,30 @@ methods:
     repo_url: https://github.com/yangxy/PASD.git
     repo_dir: PASD
     commit: main
-    env_name: pasd
+    env_name: IR
     entrypoint: test_pasd.py
-    input_arg: --input_image
+    input_arg: --image_path
     output_arg: --output_dir
     extra_args:
       - --pasd_model_path
       - runs/pasd/checkpoint-100000
       - --pretrained_model_path
       - ../weights/hf/stable-diffusion-v1-5-official
+      - --high_level_info
+      - none
       - --upscale
       - "4"
       - --seed
       - "123"
-    notes: "Public repo and pretrained models are available. Verify exact checkpoint path after downloading PASD weights."
+      - --decoder_tiled_size
+      - "224"
+      - --encoder_tiled_size
+      - "1024"
+      - --latent_tiled_size
+      - "320"
+      - --latent_tiled_overlap
+      - "8"
+    notes: "Public repo and pretrained models are available. Uses fixed prompt/no caption and conservative x4 tiling to avoid OOM on large images."
     expected_output_patterns:
       - "**/*.png"
       - "**/*.jpg"
@@ -171,7 +338,7 @@ methods:
     repo_url: https://github.com/cswry/OSEDiff.git
     repo_dir: OSEDiff
     commit: main
-    env_name: osediff
+    env_name: pisasr
     entrypoint: test_osediff.py
     input_arg: -i
     output_arg: -o

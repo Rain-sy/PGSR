@@ -35,6 +35,22 @@ def build_command(method_cfg: dict, input_dir: Path, raw_output_dir: Path) -> tu
     return cmd, repo_root
 
 
+def parse_stems(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+def stage_selected_inputs(manifest: dict, method: str, dataset: str, lr_images: list[Path]) -> Path:
+    """Copy a filtered LR set to a method-local folder for auditable subset runs."""
+    staged_dir = workspace_dir(manifest, "outputs", "_selected_inputs", method, dataset)
+    shutil.rmtree(staged_dir, ignore_errors=True)
+    staged_dir.mkdir(parents=True, exist_ok=True)
+    for src in lr_images:
+        shutil.copy2(src, staged_dir / src.name)
+    return staged_dir
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("method")
@@ -44,6 +60,10 @@ def main() -> int:
     parser.add_argument("--allow-needs-command", action="store_true",
                         help="Try methods marked public_needs_command after you fill their command fields.")
     parser.add_argument("--gpu", default=None, help="Optional CUDA_VISIBLE_DEVICES value for execution.")
+    parser.add_argument("--include-stems", default=None,
+                        help="Comma-separated LR basenames to run, without extensions.")
+    parser.add_argument("--exclude-stems", default=None,
+                        help="Comma-separated LR basenames to skip, without extensions.")
     parser.add_argument("--keep-raw", action="store_true")
     args = parser.parse_args()
 
@@ -60,6 +80,12 @@ def main() -> int:
 
     lr_dir, _ = dataset_dirs(manifest, args.dataset)
     lr_images = list_images(lr_dir)
+    include_stems = parse_stems(args.include_stems)
+    exclude_stems = parse_stems(args.exclude_stems)
+    if include_stems:
+        lr_images = [p for p in lr_images if p.stem in include_stems]
+    if exclude_stems:
+        lr_images = [p for p in lr_images if p.stem not in exclude_stems]
     if not lr_images and args.execute:
         raise SystemExit(f"No LR images found in {lr_dir}")
     if not lr_images:
@@ -71,14 +97,25 @@ def main() -> int:
         ensure_dir(raw_dir)
         ensure_dir(final_dir)
 
-    cmd, cwd = build_command(method_cfg, lr_dir, raw_dir)
+    input_dir = lr_dir
+    if args.execute and (include_stems or exclude_stems):
+        input_dir = stage_selected_inputs(manifest, args.method, args.dataset, lr_images)
+
+    cmd, cwd = build_command(method_cfg, input_dir, raw_dir)
     if not cwd.exists():
         print(f"[SETUP] Missing repo dir: {cwd}")
         if method_cfg.get("repo_url"):
             print(f"Clone command: git clone {method_cfg['repo_url']} {cwd}")
         return 2 if args.execute else 0
 
-    env_updates = {"CUDA_VISIBLE_DEVICES": args.gpu} if args.gpu else None
+    env_updates = {"CUDA_VISIBLE_DEVICES": args.gpu} if args.gpu else {}
+    pythonpath_parts = []
+    if method_cfg.get("pythonpath_repo"):
+        pythonpath_parts.append(str(cwd))
+    for rel_path in method_cfg.get("pythonpath_extra", []):
+        pythonpath_parts.append(str(repo_path(rel_path)))
+    if pythonpath_parts:
+        env_updates["PYTHONPATH"] = ":".join(pythonpath_parts)
     rc = run_command(cmd, cwd=cwd, execute=args.execute, env_updates=env_updates)
     if rc != 0:
         return rc

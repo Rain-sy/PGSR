@@ -63,6 +63,18 @@ BLOCK_MASK = None
 HEIGHT = None
 WIDTH = None
 
+# PyTorch flex_attention's default Triton tile can exceed the shared-memory
+# limit on some GPUs for FLUX head dimensions. Smaller tiles are a bit more
+# conservative but make CLEAR train/eval portable across the cluster.
+FLEX_KERNEL_OPTIONS = {
+    "BLOCK_M": int(os.environ.get("CLEAR_FLEX_BLOCK_M", "32")),
+    "BLOCK_N": int(os.environ.get("CLEAR_FLEX_BLOCK_N", "32")),
+    "BLOCK_M1": int(os.environ.get("CLEAR_FLEX_BLOCK_M1", "32")),
+    "BLOCK_N1": int(os.environ.get("CLEAR_FLEX_BLOCK_N1", "32")),
+    "BLOCK_M2": int(os.environ.get("CLEAR_FLEX_BLOCK_M2", "32")),
+    "BLOCK_N2": int(os.environ.get("CLEAR_FLEX_BLOCK_N2", "32")),
+}
+
 
 class FluxAttnProcessor2_0:
     """Attention processor used typically in processing the SD3-like self-attention projections."""
@@ -222,7 +234,11 @@ class LocalDownsampleFlexAttnProcessor(nn.Module):
         
         if need_recompile:
             self._compiled_flex_attn = torch.compile(
-                partial(flex_attention, block_mask=BLOCK_MASK), 
+                partial(
+                    flex_attention,
+                    block_mask=BLOCK_MASK,
+                    kernel_options=FLEX_KERNEL_OPTIONS,
+                ),
                 dynamic=False
             )
             self._compiled_mask_id = current_mask_id
@@ -368,7 +384,11 @@ class LocalFlexAttnProcessor:
         current_mask_id = id(BLOCK_MASK)
         if self._compiled_flex_attn is None or self._compiled_mask_id != current_mask_id:
             self._compiled_flex_attn = torch.compile(
-                partial(flex_attention, block_mask=BLOCK_MASK), 
+                partial(
+                    flex_attention,
+                    block_mask=BLOCK_MASK,
+                    kernel_options=FLEX_KERNEL_OPTIONS,
+                ),
                 dynamic=False
             )
             self._compiled_mask_id = current_mask_id

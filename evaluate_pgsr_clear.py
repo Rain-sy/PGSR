@@ -1,20 +1,20 @@
 #!/usr/bin/env python
 """
 ======================================================================
-Dual-Stream FLUX SR Evaluation - aligned with official Diffusers pipeline
+PGSR CLEAR FLUX SR Evaluation - aligned with official Diffusers pipeline
 ======================================================================
 
-Companion script for train_dual_dfm.py
+Companion script for train_pgsr_clear.py
 Automatically detects and loads LoRA adapters when checkpoint contains
 `use_lora=True` and `lora_state_dict`.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=0 python evaluate_dual_dfm.py \
+    CUDA_VISIBLE_DEVICES=0 python evaluate_pgsr_clear.py \
         --checkpoint checkpoints/dual_control/xxx/best_model.pt \
         --hr_dir Data/DIV2K/DIV2K_valid_HR \
         --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
         --iqa_device cuda \
-        --lpips_device cuda 
+        --lpips_device cuda
 """
 
 import os
@@ -539,7 +539,7 @@ class DualStreamEvaluator(nn.Module):
         self.pixel_weight = pixel_weight
         self.attention_mode_requested = attention_mode
         self.attention_mode = 'full'
-        
+
         self.vae = None
         self.transformer = None
         self.controlnet = None
@@ -566,7 +566,7 @@ class DualStreamEvaluator(nn.Module):
 
         # Learnable meta text embedding state (filled in by .load() when the
         # checkpoint sets use_learnable_text_embed=True; e.g. ckpts produced
-        # by train_text.py). Auto-detected from the ckpt; no CLI flag needed.
+        # by train_pgsr.py / train_pgsr_clear.py). Auto-detected from the ckpt; no CLI flag needed.
         self.use_learnable_text_embed = False
         self.text_embed_format = None
         self.text_embed_tokens = 0
@@ -588,13 +588,13 @@ class DualStreamEvaluator(nn.Module):
         from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
         dtype = torch.bfloat16
-        
+
         # Load Scheduler
         print("Loading Scheduler...")
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             self.model_name, subfolder="scheduler"
         )
-        
+
         print("Loading VAE...")
         self.vae = AutoencoderKL.from_pretrained(
             self.model_name, subfolder="vae", torch_dtype=dtype
@@ -602,7 +602,7 @@ class DualStreamEvaluator(nn.Module):
         self.vae.requires_grad_(False)
         self.vae.eval()
         self.vae.enable_tiling()
-        
+
         # Peek at the checkpoint metadata BEFORE caching text embeddings, so
         # _cache_text_embeddings knows whether to register a learnable
         # nn.Parameter (warm-started from cached empty-string T5). Loaded on
@@ -720,7 +720,7 @@ class DualStreamEvaluator(nn.Module):
             )
         print(f"Conditioning Scale: {self.conditioning_scale}")
         print(f"Control Guidance Window: [{self.control_guidance_start}, {self.control_guidance_end}]")
-        
+
         try:
             self.transformer.enable_xformers_memory_efficient_attention()
             self.controlnet.enable_xformers_memory_efficient_attention()
@@ -803,7 +803,7 @@ class DualStreamEvaluator(nn.Module):
 
         # --- Learnable / residual text embedding load (eval side) ---
         # `_cache_text_embeddings` creates a full prompt Parameter warm-started
-        # from empty T5. New train_text.py checkpoints store a small residual
+        # from empty T5. New train_pgsr checkpoints store a small residual
         # delta; old checkpoints store a full learned prompt.
         if self.use_learnable_text_embed and self.learnable_text_embed is not None:
             text_format = ckpt.get('text_embed_format', self.text_embed_format)
@@ -1079,22 +1079,22 @@ class DualStreamEvaluator(nn.Module):
             f"(window={self.clear_window_size}, down_factor={self.clear_down_factor}, "
             f"ckpt_states={len(state_list)})"
         )
-    
+
     def _cache_text_embeddings(self):
         from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
-        
+
         dtype = torch.bfloat16
-        
+
         text_enc = CLIPTextModel.from_pretrained(
             self.model_name, subfolder="text_encoder", torch_dtype=dtype
         ).to(self.device)
         tok = CLIPTokenizer.from_pretrained(self.model_name, subfolder="tokenizer")
-        
+
         text_enc_2 = T5EncoderModel.from_pretrained(
             self.model_name, subfolder="text_encoder_2", torch_dtype=dtype
         ).to(self.device)
         tok_2 = T5TokenizerFast.from_pretrained(self.model_name, subfolder="tokenizer_2")
-        
+
         with torch.no_grad():
             clip_out = text_enc(tok([""], padding="max_length", max_length=77,
                                     truncation=True, return_tensors="pt").input_ids.to(self.device))
@@ -1107,7 +1107,7 @@ class DualStreamEvaluator(nn.Module):
             }
 
         # If the checkpoint was trained with a learnable meta text embedding
-        # (e.g. by train_text.py), register a Parameter with shape
+        # (e.g. by train_pgsr.py), register a Parameter with shape
         # (1, 512, 4096) and warm-start from the cached empty-string T5
         # output. The actual learned weights are copied in below from
         # `ckpt['learnable_text_embed']`. We keep the warm-start fallback so
@@ -1123,7 +1123,7 @@ class DualStreamEvaluator(nn.Module):
 
         del text_enc, text_enc_2, tok, tok_2, clip_out, t5_out
         clear_memory(self.device)
-    
+
     @torch.no_grad()
     def encode(self, img):
         lat = self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample()
@@ -1132,7 +1132,7 @@ class DualStreamEvaluator(nn.Module):
         else:
             lat = lat * self.vae.config.scaling_factor
         return lat
-    
+
     @torch.no_grad()
     def decode(self, lat):
         if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
@@ -1173,12 +1173,12 @@ class DualStreamEvaluator(nn.Module):
         sample = dec.conv_act(sample)
         sample = dec.conv_out(sample)
         return sample
-    
+
     def _pack(self, x):
         B, C, H, W = x.shape
         x = x.view(B, C, H // 2, 2, W // 2, 2).permute(0, 2, 4, 1, 3, 5)
         return x.reshape(B, (H // 2) * (W // 2), C * 4)
-    
+
     def _unpack(self, x, H, W):
         B, _, D = x.shape
         C = D // 4
@@ -1194,7 +1194,7 @@ class DualStreamEvaluator(nn.Module):
         if pad_h or pad_w:
             x = F.pad(x, (0, pad_w, 0, pad_h), mode='replicate')
         return x, pad_h, pad_w
-    
+
     def _img_ids(self, H, W, device, dtype):
         h, w = H // 2, W // 2
         ids = torch.zeros(h, w, 3, device=device, dtype=dtype)
@@ -1233,13 +1233,13 @@ class DualStreamEvaluator(nn.Module):
                 # Older diffusers may not accept `mu` in set_timesteps
                 pass
         self.scheduler.set_timesteps(num_steps, device=device)
-    
+
     @torch.no_grad()
     def forward(self, noisy, lr_lat, lr_pixel, timestep, guidance=3.5, controlnet_scale=1.0):
         B, C, H, W = noisy.shape
         device = noisy.device
         dtype = torch.bfloat16
-        
+
         pixel_feat = self.pixel_extractor(lr_pixel)
         if pixel_feat.shape[-2:] != lr_lat.shape[-2:]:
             pixel_feat = F.interpolate(
@@ -1257,15 +1257,15 @@ class DualStreamEvaluator(nn.Module):
         fused_for_pack, _, _ = self._pad_to_even_hw(fused_cond)
         H_pack, W_pack = noisy_for_pack.shape[-2:]
         self._ensure_clear_mask(H_pack, W_pack)
-        
+
         noisy_packed = self._pack(noisy_for_pack)
         fused_packed = self._pack(fused_for_pack)
         del fused_cond
         img_ids = self._img_ids(H_pack, W_pack, device, dtype)
-        
+
         pooled = self._cached_embeds['pooled'].expand(B, -1)
         # T5 prompt (= encoder_hidden_states): learnable meta embedding when
-        # the checkpoint enabled it (train_text.py ckpts), else the cached
+        # the checkpoint enabled it (train_pgsr ckpts), else the cached
         # empty-string T5 output. CLIP `pooled` (temb path) and zero
         # `text_ids` (pos embed path) are unchanged regardless.
         if self.use_learnable_text_embed and self.learnable_text_embed is not None:
@@ -1273,7 +1273,7 @@ class DualStreamEvaluator(nn.Module):
         else:
             prompt = self._cached_embeds['prompt'].expand(B, -1, -1)
         text_ids = self._cached_embeds['text_ids']
-        
+
         if isinstance(timestep, torch.Tensor):
             t_input = timestep.to(device=device, dtype=dtype)
             if t_input.ndim == 0:
@@ -1286,7 +1286,7 @@ class DualStreamEvaluator(nn.Module):
             t_input = torch.full((B,), float(timestep), device=device, dtype=dtype)
         controlnet_guidance = torch.full((B,), guidance, device=device, dtype=dtype)
         transformer_guidance = torch.full((B,), guidance, device=device, dtype=dtype)
-        
+
         ctrl_out = self.controlnet(
             hidden_states=noisy_packed,
             controlnet_cond=fused_packed,
@@ -1300,7 +1300,7 @@ class DualStreamEvaluator(nn.Module):
             return_dict=False,
         )
         del fused_packed
-        
+
         out = self.transformer(
             hidden_states=noisy_packed,
             timestep=t_input,
@@ -1319,7 +1319,7 @@ class DualStreamEvaluator(nn.Module):
         if pad_h or pad_w:
             unpacked = unpacked[:, :, :H, :W]
         return unpacked
-    
+
     @torch.no_grad()
     def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, strength=0.7):
         """Inference using the official scheduler.
@@ -1342,11 +1342,11 @@ class DualStreamEvaluator(nn.Module):
             _, self._last_pixel_taps = self.pixel_extractor(lr_pixel, return_features=True)
         else:
             self._last_pixel_taps = None
-        
+
         # Set timesteps (dynamic shifting may require mu)
         self._set_scheduler_timesteps(num_steps, device, lr_lat)
         timesteps = self.scheduler.timesteps
-        
+
         # Compute start point based on strength
         init_timestep = min(int(num_steps * strength), num_steps)
         t_start = max(num_steps - init_timestep, 0)
@@ -1367,7 +1367,7 @@ class DualStreamEvaluator(nn.Module):
         timestep_batch = timesteps[:1].expand(B)
         latents = self.scheduler.scale_noise(lr_lat, timestep_batch, noise)
         del noise
-        
+
         # Denoising loop
         total_steps = len(timesteps)
         for i, t in enumerate(timesteps):
@@ -1385,7 +1385,7 @@ class DualStreamEvaluator(nn.Module):
             )
             latents = self.scheduler.step(model_output, t, latents, return_dict=False)[0]
             del model_output
-        
+
         return latents
 
 
@@ -1397,7 +1397,7 @@ class DualStreamEvaluator(nn.Module):
 def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
                  tile_size=640, overlap=64, strength=0.7):
     _, _, H, W = lr_t.shape
-    
+
     if H <= tile_size and W <= tile_size:
         lr_lat = evaluator.encode(lr_t)
         sr_lat = evaluator.inference(lr_lat, lr_t, num_steps=num_steps,
@@ -1406,11 +1406,11 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
         result = evaluator.decode_with_dfm(sr_lat, getattr(evaluator, '_last_pixel_taps', None))
         del lr_lat, sr_lat
         return result
-    
+
     stride = tile_size - overlap
     out = torch.zeros((1, 3, H, W), device='cpu', dtype=torch.float32)
     weight = torch.zeros((1, 1, H, W), device='cpu', dtype=torch.float32)
-    
+
     if H <= tile_size:
         y_positions = [0]
     else:
@@ -1419,7 +1419,7 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
             y_positions = [0]
         elif y_positions[-1] + tile_size < H:
             y_positions.append(H - tile_size)
-    
+
     if W <= tile_size:
         x_positions = [0]
     else:
@@ -1428,7 +1428,7 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
             x_positions = [0]
         elif x_positions[-1] + tile_size < W:
             x_positions.append(W - tile_size)
-    
+
     total_tiles = len(y_positions) * len(x_positions)
 
     def build_tile_blend(tile_h, tile_w, y, y_end, x, x_end):
@@ -1459,7 +1459,7 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
             blend[:, :, :, -n:] *= ramp.view(1, 1, 1, n)
 
         return blend
-    
+
     with tqdm(total=total_tiles, desc="Tiled SR", leave=False) as pbar:
         for y in y_positions:
             for x in x_positions:
@@ -1467,14 +1467,14 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
                 x_end = min(x + tile_size, W)
                 tile_h = y_end - y
                 tile_w = x_end - x
-                
+
                 tile = lr_t[:, :, y:y_end, x:x_end]
-                
+
                 if tile_h < tile_size or tile_w < tile_size:
                     padded = torch.zeros((1, 3, tile_size, tile_size), device=device, dtype=lr_t.dtype)
                     padded[:, :, :tile_h, :tile_w] = tile
                     tile = padded
-                
+
                 tile_lat = evaluator.encode(tile)
                 sr_lat = evaluator.inference(tile_lat, tile, num_steps=num_steps,
                                             guidance=guidance, strength=strength)
@@ -1486,15 +1486,15 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
                 sr_tile_cpu = sr_tile[:, :, :tile_h, :tile_w].float().cpu()
                 del tile_lat, sr_lat, sr_tile, tile
                 clear_memory(device)
-                
+
                 tile_blend = build_tile_blend(tile_h, tile_w, y, y_end, x, x_end)
-                
+
                 out[:, :, y:y_end, x:x_end] += sr_tile_cpu * tile_blend
                 weight[:, :, y:y_end, x:x_end] += tile_blend
                 del sr_tile_cpu
-                
+
                 pbar.update(1)
-    
+
     return out / weight.clamp(min=1e-8)
 
 
@@ -1547,6 +1547,7 @@ def run_sr_timed(
     """Run tiled SR with optional warmup/repeats and synchronized timing."""
     warmup = max(0, int(warmup))
     repeats = max(1, int(repeats))
+    denoise_steps = max(1, min(int(num_steps), int(int(num_steps) * float(strength))))
 
     for _ in range(warmup):
         tmp = run_sr_tiled_with_oom_retry(
@@ -1593,12 +1594,19 @@ def run_sr_timed(
         clear_memory(device)
 
     stats = {
+        'denoise_steps': int(denoise_steps),
         'wall_times_sec': wall_times,
         'wall_mean_sec': float(np.mean(wall_times)) if wall_times else None,
         'wall_std_sec': float(np.std(wall_times)) if len(wall_times) > 1 else 0.0,
+        'wall_per_step_sec': (
+            float(np.mean(wall_times) / denoise_steps) if wall_times and denoise_steps > 0 else None
+        ),
         'cuda_times_sec': cuda_times,
         'cuda_mean_sec': float(np.mean(cuda_times)) if cuda_times else None,
         'cuda_std_sec': float(np.std(cuda_times)) if len(cuda_times) > 1 else 0.0,
+        'cuda_per_step_sec': (
+            float(np.mean(cuda_times) / denoise_steps) if cuda_times and denoise_steps > 0 else None
+        ),
         'peak_mem_mb': float(peak_mem / (1024 ** 2)) if peak_mem else None,
     }
     return result, stats
@@ -1609,8 +1617,8 @@ def run_sr_timed(
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Dual-Stream FLUX SR Evaluation (Official Scheduler)')
-    
+    parser = argparse.ArgumentParser(description='PGSR CLEAR FLUX SR Evaluation')
+
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--hr_dir', type=str, default=None,
                         help='Optional HR directory. Omit for speed-only LR evaluation.')
@@ -1628,7 +1636,7 @@ def main():
                         help='Warmup runs per image before timing.')
     parser.add_argument('--timing_repeats', type=int, default=1,
                         help='Timed repeats per image. The final repeat is used for saved images/metrics.')
-    
+
     parser.add_argument('--num_steps', type=int, default=20)
     parser.add_argument('--guidance', type=float, default=3.5)
     parser.add_argument('--pixel_weight', type=float, default=None)
@@ -1683,7 +1691,7 @@ def main():
                              'patch coordinates from separate random streams and is the paper-table '
                              'default; aligned reuses coordinates and usually gives lower FID.')
     parser.add_argument('--fid_patch_seed', type=int, default=42)
-    
+
     parser.add_argument('--output_base', type=str, default='./outputs')
     parser.add_argument('--dataset', type=str, default=None)
     parser.add_argument('--exp_name', type=str, default=None)
@@ -1694,7 +1702,7 @@ def main():
                              'Default is off so evaluate outputs contain only predictions/ '
                              'and results.txt.')
     parser.add_argument('--device', type=str, default='cuda')
-    
+
     args = parser.parse_args()
     if args.control_guidance_start is not None and not (0.0 <= args.control_guidance_start <= 1.0):
         parser.error("--control_guidance_start must be within [0, 1]")
@@ -1718,18 +1726,18 @@ def main():
         parser.error("--timing_warmup must be >= 0")
     if args.timing_repeats < 1:
         parser.error("--timing_repeats must be >= 1")
-    
+
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     has_hr = bool(args.hr_dir)
     if not has_hr:
         args.calc_lpips = False
         args.calc_fid = False
-    
+
     # Auto-detect dataset tag when not provided, then normalize to canonical name.
     if args.dataset is None:
         args.dataset = infer_dataset_name(args.hr_dir, args.lr_dir)
     dataset_name = infer_dataset_name(args.dataset, args.hr_dir, args.lr_dir)
-    
+
     # Load model
     initial_pixel_weight = args.pixel_weight if args.pixel_weight is not None else 1.0
     evaluator = DualStreamEvaluator(
@@ -1737,10 +1745,10 @@ def main():
         attention_mode=args.attention_mode,
     )
     evaluator.load()
-    
+
     if args.pixel_weight is not None:
         evaluator.pixel_weight = args.pixel_weight
-    
+
     strength = args.strength if args.strength is not None else evaluator.strength
     control_guidance_start = (
         args.control_guidance_start
@@ -1754,7 +1762,7 @@ def main():
     )
     evaluator.control_guidance_start = control_guidance_start
     evaluator.control_guidance_end = control_guidance_end
-    
+
     # Experiment name
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1788,7 +1796,7 @@ def main():
                 f"_a{cfg.get('alpha', '?')}"
                 f"_tp{cfg.get('target_preset', '?')}"
             )
-    
+
     if evaluator.use_dfm and evaluator.use_lora:
         method_tag = 'DualDFMLoRA'
     elif evaluator.use_dfm:
@@ -1801,9 +1809,9 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     if args.save_images:
         os.makedirs(os.path.join(output_dir, 'predictions'), exist_ok=True)
-    
+
     print("=" * 70)
-    print("Dual-Stream FLUX SR Evaluation - Official Scheduler")
+    print("PGSR CLEAR FLUX SR Evaluation")
     print("=" * 70)
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Dataset: {args.dataset} (canonical: {dataset_name})")
@@ -1834,7 +1842,7 @@ def main():
         print("LoRA: inactive")
     print(f"Output: {output_dir}")
     print("=" * 70)
-    
+
     lpips_fn = None
     lpips_device = torch.device('cpu')
     if args.calc_lpips:
@@ -1900,7 +1908,7 @@ def main():
     psnr_bic_list, ssim_bic_list, lpips_bic_list = [], [], []
     filenames = []
     timing_rows = []
-    
+
     for eval_name in tqdm(eval_files, desc="Evaluating"):
         if has_hr:
             hf = eval_name
@@ -1920,9 +1928,9 @@ def main():
         else:
             lf = eval_name
             base_name = os.path.splitext(lf)[0]
-        
+
         filenames.append(base_name)
-        
+
         lr_img = Image.open(os.path.join(args.lr_dir, lf)).convert('RGB')
         if has_hr:
             hr_img = Image.open(os.path.join(args.hr_dir, hf)).convert('RGB')
@@ -1940,7 +1948,7 @@ def main():
             if hr_np is not None:
                 hr_np = center_crop_or_pad_np(hr_np, args.benchmark_square_size)
         H, W = lr_bicubic_np.shape[0], lr_bicubic_np.shape[1]
-        
+
         lr_t = torch.from_numpy(lr_bicubic_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
         lr_t = lr_t.to(device).to(torch.bfloat16)
         # The FLUX VAE downsamples by 8x; odd/non-divisible image sizes like
@@ -1968,7 +1976,7 @@ def main():
         timing_rows.append(timing)
         sr_t = sr_t[:, :, :H, :W]
         sr_np = ((sr_t[0].float().cpu().clamp(-1, 1) + 1) * 127.5).permute(1, 2, 0).numpy().astype(np.uint8)
-        
+
         if hr_np is not None:
             psnr_val = calculate_psnr(sr_np, hr_np)
             ssim_val = calculate_ssim(sr_np, hr_np)
@@ -2021,7 +2029,7 @@ def main():
         if hr_np is not None:
             del hr_np
         clear_memory(device)
-    
+
     avg_psnr = float(np.mean(psnr_list)) if psnr_list else 0.0
     avg_ssim = float(np.mean(ssim_list)) if ssim_list else 0.0
     avg_psnr_bic = float(np.mean(psnr_bic_list)) if psnr_bic_list else 0.0
@@ -2030,11 +2038,15 @@ def main():
     avg_lpips_bic = np.mean(lpips_bic_list) if lpips_bic_list else 0
     timing_wall = [r['wall_mean_sec'] for r in timing_rows if r.get('wall_mean_sec') is not None]
     timing_cuda = [r['cuda_mean_sec'] for r in timing_rows if r.get('cuda_mean_sec') is not None]
+    timing_wall_step = [r['wall_per_step_sec'] for r in timing_rows if r.get('wall_per_step_sec') is not None]
+    timing_cuda_step = [r['cuda_per_step_sec'] for r in timing_rows if r.get('cuda_per_step_sec') is not None]
     timing_summary = {
         'wall_mean_sec': float(np.mean(timing_wall)) if timing_wall else None,
         'wall_std_sec': float(np.std(timing_wall)) if len(timing_wall) > 1 else 0.0,
+        'wall_per_step_mean_sec': float(np.mean(timing_wall_step)) if timing_wall_step else None,
         'cuda_mean_sec': float(np.mean(timing_cuda)) if timing_cuda else None,
         'cuda_std_sec': float(np.std(timing_cuda)) if len(timing_cuda) > 1 else 0.0,
+        'cuda_per_step_mean_sec': float(np.mean(timing_cuda_step)) if timing_cuda_step else None,
         'images_per_sec_wall': float(1.0 / np.mean(timing_wall)) if timing_wall and np.mean(timing_wall) > 0 else None,
         'peak_mem_mb': float(max([r.get('peak_mem_mb') or 0.0 for r in timing_rows])) if timing_rows else None,
     }
@@ -2083,12 +2095,14 @@ def main():
     print("---------- Timing ----------")
     print(
         f"Wall: mean={_fmt(timing_summary['wall_mean_sec'])}s, "
+        f"per_step={_fmt(timing_summary['wall_per_step_mean_sec'])}s, "
         f"std={_fmt(timing_summary['wall_std_sec'])}s, "
         f"throughput={_fmt(timing_summary['images_per_sec_wall'])} img/s"
     )
     if timing_summary['cuda_mean_sec'] is not None:
         print(
             f"CUDA: mean={_fmt(timing_summary['cuda_mean_sec'])}s, "
+            f"per_step={_fmt(timing_summary['cuda_per_step_mean_sec'])}s, "
             f"std={_fmt(timing_summary['cuda_std_sec'])}s, "
             f"peak={_fmt(timing_summary['peak_mem_mb'], 1)} MB"
         )
@@ -2128,10 +2142,10 @@ def main():
             v = fid_results['full']
             print(f"  FID-full  (↓): SR={_fmt(v['sr'])},  BIC={_fmt(v['bic'])}")
     print("=" * 70)
-    
+
     results_path = os.path.join(output_dir, 'results.txt')
     with open(results_path, 'w', encoding='utf-8') as f:
-        f.write("Dual-Stream FLUX SR - Official Scheduler\n")
+        f.write("PGSR CLEAR FLUX SR Evaluation\n")
         f.write("=" * 60 + "\n")
         f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Checkpoint: {args.checkpoint}\n")
@@ -2172,7 +2186,9 @@ def main():
         f.write(
             f"Timing: warmup={args.timing_warmup}, repeats={args.timing_repeats}, "
             f"wall_mean={_fmt(timing_summary['wall_mean_sec'])}s, "
+            f"wall_per_step={_fmt(timing_summary['wall_per_step_mean_sec'])}s, "
             f"cuda_mean={_fmt(timing_summary['cuda_mean_sec'])}s, "
+            f"cuda_per_step={_fmt(timing_summary['cuda_per_step_mean_sec'])}s, "
             f"throughput={_fmt(timing_summary['images_per_sec_wall'])} img/s, "
             f"peak_mem={_fmt(timing_summary['peak_mem_mb'], 1)} MB\n"
         )
@@ -2201,11 +2217,13 @@ def main():
         f.write("[Timing]\n")
         f.write(
             f"  Wall: mean={_fmt(timing_summary['wall_mean_sec'])}s, "
+            f"per_step={_fmt(timing_summary['wall_per_step_mean_sec'])}s, "
             f"std={_fmt(timing_summary['wall_std_sec'])}s, "
             f"throughput={_fmt(timing_summary['images_per_sec_wall'])} img/s\n"
         )
         f.write(
             f"  CUDA: mean={_fmt(timing_summary['cuda_mean_sec'])}s, "
+            f"per_step={_fmt(timing_summary['cuda_per_step_mean_sec'])}s, "
             f"std={_fmt(timing_summary['cuda_std_sec'])}s, "
             f"peak={_fmt(timing_summary['peak_mem_mb'], 1)} MB\n"
         )
@@ -2246,7 +2264,10 @@ def main():
         iqa_names = list(iqa_avg.keys())
         header_parts = [
             'filename', 'height', 'width',
-            'wall_mean_sec', 'cuda_mean_sec', 'peak_mem_mb',
+            'denoise_steps',
+            'wall_mean_sec', 'wall_per_step_sec',
+            'cuda_mean_sec', 'cuda_per_step_sec',
+            'peak_mem_mb',
         ]
         if has_hr:
             header_parts += ['PSNR', 'dPSNR', 'SSIM', 'dSSIM']
@@ -2263,8 +2284,11 @@ def main():
                 fname,
                 str(tr.get('height', '')),
                 str(tr.get('width', '')),
+                str(tr.get('denoise_steps', '')),
                 _fmt(tr.get('wall_mean_sec')),
+                _fmt(tr.get('wall_per_step_sec')),
                 _fmt(tr.get('cuda_mean_sec')),
+                _fmt(tr.get('cuda_per_step_sec')),
                 _fmt(tr.get('peak_mem_mb'), 1),
             ]
             if has_hr:

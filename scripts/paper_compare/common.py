@@ -69,9 +69,15 @@ def workspace_dir(manifest: dict[str, Any], *parts: str) -> Path:
 
 
 def copy_image_as_png(src: Path, dst: Path) -> None:
-    from PIL import Image
-
     dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from PIL import Image
+    except ImportError:
+        if src.suffix.lower() == ".png" and dst.suffix.lower() == ".png":
+            shutil.copy2(src, dst)
+            return
+        raise SystemExit("Pillow is required to normalize non-PNG baseline outputs.") from None
+
     Image.open(src).convert("RGB").save(dst)
 
 

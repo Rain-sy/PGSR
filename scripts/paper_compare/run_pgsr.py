@@ -80,7 +80,7 @@ def main() -> int:
         "--exp_name",
         exp_name,
         "--save_images",
-        "--no_save_comparisons",
+        "--save_metrics_json",
     ]
     for key, flag in [
         ("num_steps", "--num_steps"),
@@ -92,6 +92,7 @@ def main() -> int:
         ("fid_mode", "--fid_mode"),
         ("fid_patch_size", "--fid_patch_size"),
         ("fid_patches_per_image", "--fid_patches_per_image"),
+        ("fid_patch_pairing", "--fid_patch_pairing"),
     ]:
         _arg(cmd, flag, defaults.get(key))
 

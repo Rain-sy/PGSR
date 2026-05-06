@@ -72,6 +72,8 @@ def main() -> int:
     parser.add_argument("--crops", default="configs/paper_compare/crops.yaml")
     parser.add_argument("--methods", default=None,
                         help="Comma-separated method columns. Defaults to crops.yaml columns.")
+    parser.add_argument("--include-stems", default=None,
+                        help="Comma-separated LR basenames to include, without extensions.")
     parser.add_argument("--crop-size", type=int, default=None)
     parser.add_argument("--max-images", type=int, default=None)
     args = parser.parse_args()
@@ -80,6 +82,9 @@ def main() -> int:
     crop_cfg = load_crop_config(args.crops)
     lr_dir, hr_dir = dataset_dirs(manifest, args.dataset)
     lr_images = list_images(lr_dir)
+    if args.include_stems:
+        include_stems = {item.strip() for item in args.include_stems.split(",") if item.strip()}
+        lr_images = [p for p in lr_images if p.stem in include_stems]
     if not lr_images:
         raise SystemExit(f"No LR images found in {lr_dir}")
     if args.max_images:

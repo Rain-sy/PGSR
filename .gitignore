@@ -18,10 +18,16 @@ NeurIPS_2026_Dual_SR/
 
 # Paper comparison workspace
 external_baselines/
+src/taming-transformers/
 experiments/paper_compare/outputs/
 experiments/paper_compare/figures/
 experiments/paper_compare/metrics/
+experiments/paper_compare/logs/
+experiments/paper_compare/organized_visual_outputs/
+experiments/paper_compare/our_method_runs/
+experiments/paper_compare/pisa_extra/
 experiments/paper_compare/visual_inputs/**/*.png
 experiments/paper_compare/visual_inputs/**/*.jpg
 experiments/paper_compare/visual_inputs/**/*.jpeg
 !experiments/paper_compare/visual_inputs/**/.gitkeep
+experiments/paper_compare_quant/
