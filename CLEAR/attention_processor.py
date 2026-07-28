@@ -14,6 +14,8 @@ import math
 # 🌟 禁用 torch.compile 的 autotune 日志
 try:
     import torch._inductor.config as inductor_config
+    inductor_config.max_autotune = True
+    inductor_config.coordinate_descent_tuning = True
     inductor_config.verbose_progress = False
     inductor_config.benchmark_kernel = False
 except:
@@ -142,6 +144,10 @@ class FluxAttnProcessor2_0:
         if image_rotary_emb is not None:
             query = apply_rotary_emb(query, image_rotary_emb)
             key = apply_rotary_emb(key, image_rotary_emb)
+        if key.dtype != query.dtype:
+            key = key.to(query.dtype)
+        if value.dtype != query.dtype:
+            value = value.to(query.dtype)
 
         train_seq_len = 64 ** 2 + 512
         if proportional_attention:
@@ -293,6 +299,10 @@ class LocalDownsampleFlexAttnProcessor(nn.Module):
         if image_rotary_emb is not None:
             query = apply_rotary_emb(query, image_rotary_emb)
             key = apply_rotary_emb(key, image_rotary_emb)
+        if key.dtype != query.dtype:
+            key = key.to(query.dtype)
+        if value.dtype != query.dtype:
+            value = value.to(query.dtype)
 
         train_seq_len = 64 ** 2 + 512
         if proportional_attention:
@@ -443,6 +453,10 @@ class LocalFlexAttnProcessor:
         if image_rotary_emb is not None:
             query = apply_rotary_emb(query, image_rotary_emb)
             key = apply_rotary_emb(key, image_rotary_emb)
+        if key.dtype != query.dtype:
+            key = key.to(query.dtype)
+        if value.dtype != query.dtype:
+            value = value.to(query.dtype)
 
         train_seq_len = 64 ** 2 + 512
         if proportional_attention:

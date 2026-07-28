@@ -104,11 +104,21 @@ Typical commands (DF2K → Mix16K workflow):
 
 
 import os
+import warnings
+
+# Match the original CLEAR training runtime: these must be set before torch is
+# imported so Triton/Inductor compile the flex-attention kernels with the same
+# tuning policy used by train/train_clear_control_v2.py.
+os.environ.setdefault("TRITON_NUM_STAGES", "2")
+os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "0")
+os.environ.setdefault("TORCHINDUCTOR_LOG_LEVEL", "ERROR")
+
 import sys
 import gc
 import math
 import io
 import argparse
+import logging
 import numpy as np
 
 # Make CLEAR/attention_processor.py importable when this script is launched
@@ -133,6 +143,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
+
+try:
+    import torch._inductor.config as inductor_config
+    inductor_config.max_autotune = True
+    inductor_config.coordinate_descent_tuning = True
+    inductor_config.verbose_progress = False
+except Exception:
+    pass
+
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor.select_algorithm").setLevel(logging.ERROR)
+logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*out of resource.*")
+warnings.filterwarnings("ignore", message=".*shared memory.*")
 
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed, DistributedType
@@ -1058,6 +1082,7 @@ class DualStreamFLUXSR(nn.Module):
                  pixel_gate_init=4.0,
                  use_clear=True, clear_window_size=16, clear_down_factor=4,
                  clear_ckpt=None, clear_resolution=512,
+                 clear_load_attn_weights=True, clear_apply_single_blocks=False,
                  train_clear_samplers=True, clear_lr=1e-5,
                  text_embed_freeze=False, text_embed_tokens=32,
                  text_embed_scale=0.1, text_embed_l2=1e-4,
@@ -1082,6 +1107,8 @@ class DualStreamFLUXSR(nn.Module):
         self.clear_down_factor = int(clear_down_factor)
         self.clear_ckpt = clear_ckpt
         self.clear_resolution = int(clear_resolution)
+        self.clear_load_attn_weights = bool(clear_load_attn_weights)
+        self.clear_apply_single_blocks = bool(clear_apply_single_blocks)
         # When True, CLEAR processor down/up samplers are added to the
         # optimizer (their own param group, ``clear_lr``); when False they
         # remain frozen (loaded from safetensors only).
@@ -1203,6 +1230,9 @@ class DualStreamFLUXSR(nn.Module):
         except Exception:
             if local_rank == 0:
                 print("[Flash] Transformer: using PyTorch 2.0 SDPA")
+
+        if self.use_clear and self.clear_load_attn_weights:
+            self._load_clear_attention_linears(local_rank=local_rank)
 
         if self.use_lora:
             self._apply_lora_to_transformer(local_rank=local_rank)
@@ -1406,6 +1436,55 @@ class DualStreamFLUXSR(nn.Module):
         if local_rank == 0:
             print(f"[LoRA] trainable params: {n_trainable:,}, state tensors: {n_lora_tensors}")
 
+    def _clear_targets_module(self, name):
+        """Whether a FLUX attention module should use CLEAR."""
+        is_dual = ('transformer_blocks.' in name and 'single' not in name)
+        is_single = ('single_transformer_blocks.' in name)
+        return is_dual or (self.clear_apply_single_blocks and is_single)
+
+    def _load_clear_attention_linears(self, local_rank=0):
+        """Load official CLEAR-distilled attention projection weights.
+
+        Official CLEAR checkpoints contain the distilled attention linears
+        (`to_q`, `to_k`, `to_v`, etc.) in addition to optional processor
+        sampler weights. Load the linears before LoRA wrapping so LoRA adapts
+        on top of the CLEAR base weights.
+        """
+        if not (self.clear_ckpt and os.path.exists(self.clear_ckpt)):
+            if local_rank == 0:
+                print(f"[CLEAR][WARN] cannot load attention linears; "
+                      f"clear_ckpt not found ({self.clear_ckpt}).")
+            return
+
+        from safetensors.torch import load_file
+        dtype = torch.bfloat16
+        clear_weights = load_file(self.clear_ckpt)
+        base = self._get_transformer_base()
+        n_modules = 0
+        n_tensors = 0
+        for name, module in base.named_modules():
+            if not (hasattr(module, 'set_processor') and self._clear_targets_module(name)):
+                continue
+            prefix = f"{name}."
+            attn_state = {
+                k[len(prefix):]: v.to(self.device, dtype)
+                for k, v in clear_weights.items()
+                if k.startswith(prefix) and not k[len(prefix):].startswith("processor.")
+            }
+            if not attn_state:
+                continue
+            module.load_state_dict(attn_state, strict=False)
+            n_modules += 1
+            n_tensors += len(attn_state)
+
+        if local_rank == 0:
+            scope = "dual+single" if self.clear_apply_single_blocks else "dual"
+            print(
+                f"[CLEAR] loaded official attention linears: "
+                f"{n_tensors} tensors into {n_modules} {scope} attention modules "
+                f"from {self.clear_ckpt}"
+            )
+
     def _init_clear(self, local_rank=0):
         """Replace dual-block attention processors with CLEAR local-window
         FlexAttn variants. CLEAR processor weights are loaded from
@@ -1467,28 +1546,20 @@ class DualStreamFLUXSR(nn.Module):
                 print(f"[CLEAR] loaded {len(clear_weights)} weight tensors "
                       f"from {self.clear_ckpt}")
 
-        # Walk the underlying FluxTransformer (unwrap PEFT) to find dual
-        # transformer blocks. PEFT keeps original module structure; calling
-        # set_processor on the wrapped transformer's submodules also reaches
-        # the underlying attn.
+        # Walk the underlying FluxTransformer (unwrap PEFT) to find the CLEAR
+        # target attention modules. PEFT keeps original module structure;
+        # calling set_processor on the wrapped transformer's submodules also
+        # reaches the underlying attn.
         base = self._get_transformer_base()
         n_replaced = 0
         for name, module in base.named_modules():
-            if not (
-                hasattr(module, 'set_processor')
-                and 'transformer_blocks.' in name
-                and 'single' not in name
-            ):
+            if not (hasattr(module, 'set_processor') and self._clear_targets_module(name)):
                 continue
-            try:
-                block_idx = int(name.split('transformer_blocks.')[1].split('.')[0])
-            except (ValueError, IndexError):
-                continue
-            prefix = f"transformer_blocks.{block_idx}.attn."
-            block_weights = {
-                k.replace(prefix, ''): v.to(dtype)
+            prefix = f"{name}."
+            processor_weights = {
+                k[len(prefix + "processor."):]: v.to(dtype)
                 for k, v in clear_weights.items()
-                if k.startswith(prefix)
+                if k.startswith(prefix + "processor.")
             }
 
             if self.clear_down_factor > 1:
@@ -1498,22 +1569,25 @@ class DualStreamFLUXSR(nn.Module):
             else:
                 processor = LocalFlexAttnProcessor()
 
-            if block_weights:
+            if processor_weights and hasattr(processor, 'load_state_dict'):
                 # strict=False because some buffers (masks etc.) are init'd
                 # by the processor itself and not in the safetensors.
-                processor.load_state_dict(block_weights, strict=False)
-            processor = processor.to(self.device, dtype)
+                processor.load_state_dict(processor_weights, strict=False)
+            if hasattr(processor, 'to'):
+                processor = processor.to(self.device, dtype)
             # Optionally fine-tune CLEAR's own learnable down/up samplers
             # alongside LoRA. When train_clear_samplers=False they remain at
             # the pretrained CLEAR weights.
-            processor.requires_grad_(self.train_clear_samplers)
+            if hasattr(processor, 'requires_grad_'):
+                processor.requires_grad_(self.train_clear_samplers)
             module.set_processor(processor)
             self._clear_processors.append(processor)
             n_replaced += 1
 
         if local_rank == 0:
+            scope = "dual+single" if self.clear_apply_single_blocks else "dual"
             print(
-                f"[CLEAR] replaced {n_replaced} dual-block attention "
+                f"[CLEAR] replaced {n_replaced} {scope} attention "
                 f"processors (window={self.clear_window_size}, "
                 f"down_factor={self.clear_down_factor}, "
                 f"resolution={self.clear_resolution}, "
@@ -2426,12 +2500,16 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
     if getattr(unwrapped, 'use_clear', False):
         payload['clear_processors'] = [
             {k: v.detach().cpu() for k, v in proc.state_dict().items()}
+            if hasattr(proc, 'state_dict') else {}
             for proc in unwrapped._clear_processors
         ]
         payload['clear_config'] = {
             'window_size': unwrapped.clear_window_size,
             'down_factor': unwrapped.clear_down_factor,
             'resolution': unwrapped.clear_resolution,
+            'ckpt': unwrapped.clear_ckpt,
+            'load_attn_weights': unwrapped.clear_load_attn_weights,
+            'apply_single_blocks': unwrapped.clear_apply_single_blocks,
             'train_samplers': unwrapped.train_clear_samplers,
             'lr': unwrapped.clear_lr,
         }
@@ -2519,6 +2597,17 @@ def main():
     parser.add_argument('--clear_ckpt', type=str,
                         default='ckpt/clear_local_16_down_4.safetensors',
                         help='Pretrained CLEAR processor weights (safetensors).')
+    parser.add_argument('--clear_load_attn_weights', dest='clear_load_attn_weights',
+                        action='store_true', default=True,
+                        help='Load official CLEAR-distilled attention projection weights from --clear_ckpt.')
+    parser.add_argument('--no_clear_load_attn_weights', dest='clear_load_attn_weights',
+                        action='store_false',
+                        help='Only swap processors; do not load CLEAR attention projection weights.')
+    parser.add_argument('--clear_apply_single_blocks', dest='clear_apply_single_blocks',
+                        action='store_true', default=False,
+                        help='Also apply CLEAR processors/weights to FLUX single_transformer_blocks.')
+    parser.add_argument('--no_clear_apply_single_blocks', dest='clear_apply_single_blocks',
+                        action='store_false')
     parser.add_argument('--train_clear_samplers', dest='train_clear_samplers',
                         action='store_true', default=True,
                         help='Add CLEAR processor (down/up samplers) params to optimizer.')
@@ -2751,6 +2840,10 @@ def main():
             f"_w{args.clear_window_size}"
             f"_df{args.clear_down_factor}"
         )
+        if args.clear_apply_single_blocks:
+            exp_name += "_single"
+        if not args.clear_load_attn_weights:
+            exp_name += "_noattnw"
     if not args.freeze_text_embed:
         exp_name += (
             f"_text"
@@ -2857,6 +2950,8 @@ def main():
         clear_down_factor=args.clear_down_factor,
         clear_ckpt=args.clear_ckpt,
         clear_resolution=args.resolution,
+        clear_load_attn_weights=args.clear_load_attn_weights,
+        clear_apply_single_blocks=args.clear_apply_single_blocks,
         train_clear_samplers=args.train_clear_samplers,
         clear_lr=args.clear_lr,
         text_embed_freeze=args.freeze_text_embed,
@@ -3146,9 +3241,10 @@ def main():
         if unwrapped.use_clear and ckpt_clear is not None:
             try:
                 for proc, state in zip(unwrapped._clear_processors, ckpt_clear):
-                    proc.load_state_dict(
-                        _strip_module_prefix(state), strict=False
-                    )
+                    if hasattr(proc, 'load_state_dict'):
+                        proc.load_state_dict(
+                            _strip_module_prefix(state), strict=False
+                        )
                 if is_main:
                     print(f"[Resume] CLEAR processor weights loaded "
                           f"({len(ckpt_clear)} blocks).")

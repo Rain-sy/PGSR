@@ -66,7 +66,7 @@ def main() -> int:
 
     cmd = [
         "python",
-        "evaluate_dual_dfm.py",
+        "evaluate_pgsr.py",
         "--checkpoint",
         str(checkpoint),
         "--hr_dir",

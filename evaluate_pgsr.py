@@ -132,7 +132,7 @@ def infer_dataset_name(*candidates):
 # ============================================================================
 
 class PixelFeatureExtractor(nn.Module):
-    """Inference-time extractor mirrored from ``train_dual_dfm.py``.
+    """Inference-time extractor mirrored from ``train_pgsr.py``.
 
     Uses the stage-grouped architecture with widened ``s3`` tap (256ch):
       s1: 32ch @ H/2, s2: 64ch @ H/4, s3: 256ch @ H/8.
@@ -174,7 +174,7 @@ class PixelFeatureExtractor(nn.Module):
         )
 
         # Name kept as ``zero_conv`` for checkpoint-key compatibility, but
-        # weights are kaiming-init -- see train_dual_dfm.py for the
+        # weights are kaiming-init -- see train_pgsr.py for the
         # dead-gradient explanation.
         self.zero_conv = nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
         nn.init.kaiming_normal_(self.zero_conv.weight, nonlinearity='relu')
@@ -191,7 +191,7 @@ class PixelFeatureExtractor(nn.Module):
 
 
 class DFMAdapter(nn.Module):
-    """Inference-time DFM adapter (mirror of train_dual_dfm.DFMAdapter).
+    """Inference-time DFM adapter (mirror of train_pgsr.DFMAdapter).
 
     Residual + zero-conv injection:
         decoder_feat <- decoder_feat + zero_conv(silu(align(pixel_feat)))
@@ -523,19 +523,24 @@ def clear_memory(device):
 # ============================================================================
 
 class DualStreamEvaluator(nn.Module):
-    def __init__(self, model_name, device, checkpoint_path, pixel_weight=1.0):
+    def __init__(self, model_name, device, checkpoint_path, pixel_weight=1.0,
+                 controlnet_name="jasperai/Flux.1-dev-Controlnet-Upscaler"):
         super().__init__()
         self.model_name = model_name
+        self.controlnet_name = controlnet_name
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.pixel_weight = pixel_weight
+        self.condition_source = 'fused'
+        self.vae_posterior = 'sample'
 
         self.vae = None
         self.transformer = None
         self.controlnet = None
         self.pixel_extractor = None
         self.pixel_fuse_proj = None
-        self.fusion_source = 'identity'  # 'concat' | 'migrated' | 'identity'
+        self.pixel_gate_logit = None
+        self.fusion_source = "identity"
         self.scheduler = None
         self._cached_embeds = None
         self.strength = 0.7
@@ -617,7 +622,7 @@ class DualStreamEvaluator(nn.Module):
 
         print("Loading ControlNet...")
         self.controlnet = FluxControlNetModel.from_pretrained(
-            "jasperai/Flux.1-dev-Controlnet-Upscaler", torch_dtype=dtype
+            self.controlnet_name, torch_dtype=dtype
         ).to(self.device)
         self.controlnet.requires_grad_(False)
         self.controlnet.eval()
@@ -626,11 +631,9 @@ class DualStreamEvaluator(nn.Module):
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         self.pixel_extractor.requires_grad_(False)
         self.pixel_extractor.eval()
-        # Concat-based fusion: [lr_lat || pixel_feat] (32ch) -> 16ch.
-        self.pixel_fuse_proj = nn.Conv2d(32, 16, kernel_size=1).to(self.device).to(dtype)
+        # Match train_pgsr exactly: gated residual projection is 16 -> 16.
+        self.pixel_fuse_proj = nn.Conv2d(16, 16, kernel_size=1).to(self.device).to(dtype)
         self._reset_pixel_fuse_proj_to_identity()
-        self.pixel_fuse_proj.requires_grad_(False)
-        self.pixel_fuse_proj.eval()
 
         print("Loading checkpoint...")
         ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
@@ -639,10 +642,8 @@ class DualStreamEvaluator(nn.Module):
             state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
             if any(k.startswith("encoder.") for k in state.keys()):
                 raise RuntimeError(
-                    "[Eval] Incompatible checkpoint: pixel_extractor uses legacy "
-                    "'encoder.*' keys (train_dual_control style). "
-                    "Use evaluate_dual_control.py for that checkpoint, or evaluate a "
-                    "train_dual_dfm checkpoint with this script."
+                    "[Eval] Unsupported checkpoint: final train_pgsr.py checkpoints "
+                    "must use the stage-grouped pixel_extractor keys, not encoder.*."
                 )
             self.pixel_extractor.load_state_dict(state)
 
@@ -650,10 +651,17 @@ class DualStreamEvaluator(nn.Module):
             state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
             self.controlnet.load_state_dict(state)
 
-        self._load_pixel_fuse_proj_with_migration(ckpt)
+        self._load_pixel_fusion(ckpt)
+        self.pixel_fuse_proj.requires_grad_(False)
+        self.pixel_fuse_proj.eval()
 
         if 'pixel_weight' in ckpt:
             self.pixel_weight = ckpt['pixel_weight']
+        self.condition_source = ckpt.get('condition_source', 'fused')
+        if self.condition_source not in {'fused', 'pixel_only', 'latent_only'}:
+            raise RuntimeError(
+                f"Unsupported checkpoint condition_source: {self.condition_source}"
+            )
         self.conditioning_scale = ckpt.get('conditioning_scale', 1.0)
         self.strength = ckpt.get('strength', 0.7)
         self.control_guidance_start = ckpt.get('control_guidance_start', 0.0)
@@ -679,7 +687,8 @@ class DualStreamEvaluator(nn.Module):
 
         print(f"Checkpoint: epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', 0):.2f}")
         print(f"Pixel Weight: {self.pixel_weight}, Strength: {self.strength}")
-        print(f"Pixel Fusion: concat+1x1 conv (source={self.fusion_source})")
+        print(f"Condition Source: {self.condition_source}")
+        print(f"Pixel Fusion: {self.fusion_description()}")
         print(f"Train LPIPS: weight={self.train_lpips_weight}, prob={self.train_lpips_apply_prob}")
         if self.train_data.get('train_hr_dir'):
             print(
@@ -839,72 +848,58 @@ class DualStreamEvaluator(nn.Module):
             print("[TextEmbed] inactive (checkpoint trained with cached empty T5)")
 
     def _reset_pixel_fuse_proj_to_identity(self):
-        """Identity-init lr_lat passthrough (first 16 in-channels); zero pixel branch."""
+        """Identity-initialize the native 16-channel pixel projection."""
         if self.pixel_fuse_proj is None:
             return
         with torch.no_grad():
             self.pixel_fuse_proj.weight.zero_()
             self.pixel_fuse_proj.bias.zero_()
-            out_ch = self.pixel_fuse_proj.out_channels
-            in_ch = self.pixel_fuse_proj.in_channels
-            passthrough = min(out_ch, in_ch // 2 if in_ch >= 2 * out_ch else in_ch)
-            idx = torch.arange(passthrough, device=self.pixel_fuse_proj.weight.device)
+            channels = min(
+                self.pixel_fuse_proj.out_channels,
+                self.pixel_fuse_proj.in_channels,
+            )
+            idx = torch.arange(channels, device=self.pixel_fuse_proj.weight.device)
             self.pixel_fuse_proj.weight[idx, idx, 0, 0] = 1.0
 
-    def _load_pixel_fuse_proj_with_migration(self, ckpt):
-        """Load pixel_fuse_proj from ckpt; migrate legacy gated-fusion format if needed."""
-        if 'pixel_fuse_proj' not in ckpt:
-            self.fusion_source = 'identity'
-            print("[Eval] pixel_fuse_proj missing in checkpoint; using identity init.")
-            return
+    def _load_pixel_fusion(self, ckpt):
+        """Load the gated fusion saved by the final PGSR trainers."""
+        if ckpt.get("fusion_type") != "gated":
+            raise RuntimeError(
+                "This evaluator only supports final PGSR gated-fusion checkpoints; "
+                f"got fusion_type={ckpt.get('fusion_type')!r}."
+            )
+        if "pixel_fuse_proj" not in ckpt:
+            raise KeyError("Checkpoint is missing pixel_fuse_proj.")
+        if "pixel_gate_logit" not in ckpt:
+            raise KeyError("Checkpoint is missing pixel_gate_logit.")
 
-        state = {k.replace('module.', ''): v for k, v in ckpt['pixel_fuse_proj'].items()}
-        target = self.pixel_fuse_proj
-        target_w = target.weight
-        src_w = state.get('weight')
-        src_b = state.get('bias')
+        state = {
+            key.replace("module.", ""): value
+            for key, value in ckpt["pixel_fuse_proj"].items()
+        }
+        weight = state.get("weight")
+        expected_shape = tuple(self.pixel_fuse_proj.weight.shape)
+        if weight is None or tuple(weight.shape) != expected_shape:
+            raise RuntimeError(
+                "Final PGSR pixel_fuse_proj must be a 16->16 convolution; "
+                f"got {tuple(weight.shape) if weight is not None else None}."
+            )
+        self.pixel_fuse_proj.load_state_dict(state, strict=True)
 
-        is_legacy = (
-            src_w is not None
-            and src_w.shape == (16, 16, 1, 1)
-            and target_w.shape == (16, 32, 1, 1)
+        gate_raw = ckpt["pixel_gate_logit"]
+        gate_value = (
+            float(gate_raw.detach().float().item())
+            if isinstance(gate_raw, torch.Tensor)
+            else float(gate_raw)
         )
-
-        if not is_legacy and src_w is not None and src_w.shape == target_w.shape:
-            target.load_state_dict(state)
-            self.fusion_source = ckpt.get('fusion_type', 'concat')
-            return
-
-        if is_legacy:
-            gate_raw = ckpt.get('pixel_gate_logit', None)
-            if gate_raw is None:
-                gate_sig = 1.0
-            else:
-                if isinstance(gate_raw, torch.Tensor):
-                    gate_val = float(gate_raw.detach().float().item())
-                else:
-                    gate_val = float(gate_raw)
-                gate_sig = 1.0 / (1.0 + math.exp(-gate_val))
-            with torch.no_grad():
-                target.weight.zero_()
-                target.bias.zero_()
-                idx = torch.arange(16, device=target_w.device)
-                target.weight[idx, idx, 0, 0] = 1.0
-                legacy_w = src_w.to(device=target_w.device, dtype=target_w.dtype) * gate_sig
-                target.weight[:, 16:32, :, :].copy_(legacy_w)
-                if src_b is not None:
-                    legacy_b = src_b.to(device=target.bias.device, dtype=target.bias.dtype) * gate_sig
-                    target.bias.copy_(legacy_b)
-            self.fusion_source = f'migrated(gate={gate_sig:.3f})'
-            print(f"[Eval] Legacy gated-fusion checkpoint migrated to concat layout (sigmoid(gate)={gate_sig:.4f}).")
-            return
-
-        self.fusion_source = 'identity'
-        print(
-            f"[Eval][WARN] pixel_fuse_proj shape mismatch: "
-            f"ckpt={tuple(src_w.shape) if src_w is not None else None}, "
-            f"model={tuple(target_w.shape)}. Using identity init."
+        self.pixel_gate_logit = torch.tensor(
+            gate_value, device=self.device, dtype=torch.float32
         )
+        self.fusion_source = "checkpoint"
+
+    def fusion_description(self):
+        gate = torch.sigmoid(self.pixel_gate_logit.float()).item()
+        return f"gated residual add (gate={gate:.4f}, source={self.fusion_source})"
 
     def _cache_text_embeddings(self):
         from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
@@ -952,7 +947,8 @@ class DualStreamEvaluator(nn.Module):
 
     @torch.no_grad()
     def encode(self, img):
-        lat = self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample()
+        posterior = self.vae.encode(img.to(self.vae.dtype)).latent_dist
+        lat = posterior.mode() if self.vae_posterior == 'mode' else posterior.sample()
         if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
             lat = (lat - self.vae.config.shift_factor) * self.vae.config.scaling_factor
         else:
@@ -1072,11 +1068,18 @@ class DualStreamEvaluator(nn.Module):
                 pixel_feat, size=lr_lat.shape[-2:], mode='bilinear', align_corners=False
             )
 
-        # Concat fusion: [lr_lat || pixel_weight*pixel_feat] -> 1x1 conv -> 16ch.
-        fused_cond = self.pixel_fuse_proj(
-            torch.cat([lr_lat.to(dtype), (self.pixel_weight * pixel_feat).to(dtype)], dim=1)
-        ).to(dtype)
-        del pixel_feat
+        # Native gated residual fusion, identical to train_pgsr.
+        projected = self.pixel_fuse_proj(pixel_feat.to(dtype))
+        gate = torch.sigmoid(self.pixel_gate_logit.float()).to(dtype)
+        pixel_cond = self.pixel_weight * gate * projected
+        if self.condition_source == 'fused':
+            fused_cond = lr_lat.to(dtype) + pixel_cond
+        elif self.condition_source == 'pixel_only':
+            fused_cond = pixel_cond
+        else:
+            fused_cond = lr_lat.to(dtype)
+        fused_cond = fused_cond.to(dtype)
+        del pixel_feat, projected, pixel_cond
 
         # FLUX pack() requires even latent H/W. RealSR can produce odd latent sizes.
         noisy_for_pack, pad_h, pad_w = self._pad_to_even_hw(noisy.to(dtype))
@@ -1188,10 +1191,14 @@ class DualStreamEvaluator(nn.Module):
 
         noise = torch.randn_like(lr_lat)
 
+        # A pixel-only checkpoint must not use LR VAE content as an img2img
+        # initialization shortcut. The full model keeps the original behavior.
+        init_sample = torch.zeros_like(lr_lat) if self.condition_source == 'pixel_only' else lr_lat
+
         # Use official scale_noise
         timestep_batch = timesteps[:1].expand(B)
-        latents = self.scheduler.scale_noise(lr_lat, timestep_batch, noise)
-        del noise
+        latents = self.scheduler.scale_noise(init_sample, timestep_batch, noise)
+        del noise, init_sample
 
         # Denoising loop
         total_steps = len(timesteps)
@@ -1449,6 +1456,7 @@ def main():
                         help='Optional HR directory. Omit for speed-only LR evaluation.')
     parser.add_argument('--lr_dir', type=str, required=True)
     parser.add_argument('--model_name', type=str, default='black-forest-labs/FLUX.1-dev')
+    parser.add_argument('--controlnet_name', type=str, default='jasperai/Flux.1-dev-Controlnet-Upscaler')
     parser.add_argument('--input_scale', type=int, default=4,
                         help='When --hr_dir is omitted, upsample LR by this factor before SR.')
     parser.add_argument('--benchmark_square_size', type=int, default=0,
@@ -1460,6 +1468,10 @@ def main():
 
     parser.add_argument('--num_steps', type=int, default=20)
     parser.add_argument('--guidance', type=float, default=3.5)
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for VAE sampling and diffusion noise.')
+    parser.add_argument('--vae_posterior', choices=['sample', 'mode'], default='sample',
+                        help='Use the training-matched sampled VAE posterior or deterministic mode.')
     parser.add_argument('--pixel_weight', type=float, default=None)
     parser.add_argument('--strength', type=float, default=None,
                         help='Inference start strength (omit to use checkpoint value)')
@@ -1548,6 +1560,11 @@ def main():
     if args.timing_repeats < 1:
         parser.error("--timing_repeats must be >= 1")
 
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     has_hr = bool(args.hr_dir)
     if not has_hr:
@@ -1563,8 +1580,10 @@ def main():
     initial_pixel_weight = args.pixel_weight if args.pixel_weight is not None else 1.0
     evaluator = DualStreamEvaluator(
         args.model_name, device, args.checkpoint, initial_pixel_weight,
+        controlnet_name=args.controlnet_name,
     )
     evaluator.load()
+    evaluator.vae_posterior = args.vae_posterior
 
     if args.pixel_weight is not None:
         evaluator.pixel_weight = args.pixel_weight
@@ -1593,7 +1612,7 @@ def main():
     if args.exp_name:
         exp_name = args.exp_name
     else:
-        fusion_tag = "concat"
+        fusion_tag = "gated"
         fusion_source_tag = str(evaluator.fusion_source).replace("(", "").replace(")", "").replace(" ", "_")
         exp_name = (
             f"{ts}"
@@ -1601,6 +1620,8 @@ def main():
             f"_step{args.num_steps}"
             f"_g{_fmt_tag(args.guidance)}"
             f"_pw{_fmt_tag(evaluator.pixel_weight)}"
+            f"_seed{args.seed}"
+            f"_vae{args.vae_posterior}"
             f"_cgs{_fmt_tag(control_guidance_start)}"
             f"_cge{_fmt_tag(control_guidance_end)}"
             "_attnfull"
@@ -1640,6 +1661,7 @@ def main():
     print(f"Pixel Weight: {evaluator.pixel_weight}")
     print(f"Train LPIPS: weight={evaluator.train_lpips_weight}, prob={evaluator.train_lpips_apply_prob}")
     print(f"Steps: {args.num_steps}, Guidance: {args.guidance}")
+    print(f"Seed: {args.seed}, VAE posterior: {args.vae_posterior}")
     print("Attention: full")
     print(f"Timing: warmup={args.timing_warmup}, repeats={args.timing_repeats}")
     if args.benchmark_square_size > 0:
@@ -1910,7 +1932,7 @@ def main():
     print("=" * 70)
     print(f"Strength: {strength}")
     print(f"Pixel Weight: {evaluator.pixel_weight}")
-    print(f"Pixel Fusion: concat+1x1 conv (source={evaluator.fusion_source})")
+    print(f"Pixel Fusion: {evaluator.fusion_description()}")
     print("---------- Timing ----------")
     print(
         f"Wall: mean={_fmt(timing_summary['wall_mean_sec'])}s, "
@@ -1971,10 +1993,12 @@ def main():
         f.write(f"Strength: {strength}\n")
         f.write(f"Control Guidance Window: [{control_guidance_start}, {control_guidance_end}]\n")
         f.write(f"Pixel Weight: {evaluator.pixel_weight}\n")
+        f.write(f"Seed: {args.seed}\n")
+        f.write(f"VAE Posterior: {args.vae_posterior}\n")
         f.write("Attention Mode: full\n")
         f.write(f"Train LPIPS Weight: {evaluator.train_lpips_weight}\n")
         f.write(f"Train LPIPS Apply Prob: {evaluator.train_lpips_apply_prob}\n")
-        f.write(f"Pixel Fusion: concat+1x1 conv (source={evaluator.fusion_source})\n")
+        f.write(f"Pixel Fusion: {evaluator.fusion_description()}\n")
         train_data = evaluator.train_data or {}
         if any(v is not None for v in train_data.values()):
             f.write("Train Data (from checkpoint):\n")

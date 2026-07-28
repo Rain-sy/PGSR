@@ -37,9 +37,10 @@ import torch.nn.functional as F
 
 from diffusers import FlowMatchEulerDiscreteScheduler
 
-# Make CLEAR/attention_processor.py importable when this script is launched
-# from the repo root. CLEAR is optional and only imported when requested.
-_CLEAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CLEAR")
+# Make CLEAR/attention_processor.py importable after this legacy evaluator was
+# archived under train/. CLEAR is optional and only imported when requested.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_CLEAR_DIR = os.path.join(_REPO_ROOT, "CLEAR")
 if os.path.isdir(_CLEAR_DIR) and _CLEAR_DIR not in sys.path:
     sys.path.insert(0, _CLEAR_DIR)
 

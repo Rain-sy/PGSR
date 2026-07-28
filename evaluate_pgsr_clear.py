@@ -18,6 +18,15 @@ Usage:
 """
 
 import os
+import warnings
+
+# CLEAR's flex-attention kernels are compiled by Triton/Inductor.  The old
+# CLEAR evaluator set these before importing torch; keep the same defaults here
+# so the new PGSR evaluator uses comparable kernel tuning behavior.
+os.environ.setdefault("TRITON_NUM_STAGES", "1")
+os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "0")
+os.environ.setdefault("TORCHINDUCTOR_LOG_LEVEL", "ERROR")
+
 import sys
 import gc
 import math
@@ -26,6 +35,7 @@ import json
 import shutil
 import tempfile
 import time
+import logging
 import numpy as np
 from PIL import Image
 from datetime import datetime
@@ -34,6 +44,20 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    import torch._inductor.config as inductor_config
+    inductor_config.max_autotune = True
+    inductor_config.coordinate_descent_tuning = True
+    inductor_config.verbose_progress = False
+except Exception:
+    pass
+
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor.select_algorithm").setLevel(logging.ERROR)
+logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*out of resource.*")
+warnings.filterwarnings("ignore", message=".*shared memory.*")
 
 from diffusers import FlowMatchEulerDiscreteScheduler
 
@@ -139,7 +163,7 @@ def infer_dataset_name(*candidates):
 # ============================================================================
 
 class PixelFeatureExtractor(nn.Module):
-    """Inference-time extractor mirrored from ``train_dual_dfm.py``.
+    """Inference-time extractor mirrored from ``train_pgsr_clear.py``.
 
     Uses the stage-grouped architecture with widened ``s3`` tap (256ch):
       s1: 32ch @ H/2, s2: 64ch @ H/4, s3: 256ch @ H/8.
@@ -181,7 +205,7 @@ class PixelFeatureExtractor(nn.Module):
         )
 
         # Name kept as ``zero_conv`` for checkpoint-key compatibility, but
-        # weights are kaiming-init -- see train_dual_dfm.py for the
+        # weights are kaiming-init -- see train_pgsr_clear.py for the
         # dead-gradient explanation.
         self.zero_conv = nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
         nn.init.kaiming_normal_(self.zero_conv.weight, nonlinearity='relu')
@@ -198,7 +222,7 @@ class PixelFeatureExtractor(nn.Module):
 
 
 class DFMAdapter(nn.Module):
-    """Inference-time DFM adapter (mirror of train_dual_dfm.DFMAdapter).
+    """Inference-time DFM adapter (mirror of train_pgsr_clear.DFMAdapter).
 
     Residual + zero-conv injection:
         decoder_feat <- decoder_feat + zero_conv(silu(align(pixel_feat)))
@@ -531,9 +555,11 @@ def clear_memory(device):
 
 class DualStreamEvaluator(nn.Module):
     def __init__(self, model_name, device, checkpoint_path, pixel_weight=1.0,
-                 attention_mode='auto'):
+                 attention_mode='auto',
+                 controlnet_name="jasperai/Flux.1-dev-Controlnet-Upscaler"):
         super().__init__()
         self.model_name = model_name
+        self.controlnet_name = controlnet_name
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.pixel_weight = pixel_weight
@@ -545,7 +571,8 @@ class DualStreamEvaluator(nn.Module):
         self.controlnet = None
         self.pixel_extractor = None
         self.pixel_fuse_proj = None
-        self.fusion_source = 'identity'  # 'concat' | 'migrated' | 'identity'
+        self.pixel_gate_logit = None
+        self.fusion_source = "identity"
         self.scheduler = None
         self._cached_embeds = None
         self.strength = 0.7
@@ -646,7 +673,7 @@ class DualStreamEvaluator(nn.Module):
 
         print("Loading ControlNet...")
         self.controlnet = FluxControlNetModel.from_pretrained(
-            "jasperai/Flux.1-dev-Controlnet-Upscaler", torch_dtype=dtype
+            self.controlnet_name, torch_dtype=dtype
         ).to(self.device)
         self.controlnet.requires_grad_(False)
         self.controlnet.eval()
@@ -655,11 +682,9 @@ class DualStreamEvaluator(nn.Module):
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         self.pixel_extractor.requires_grad_(False)
         self.pixel_extractor.eval()
-        # Concat-based fusion: [lr_lat || pixel_feat] (32ch) -> 16ch.
-        self.pixel_fuse_proj = nn.Conv2d(32, 16, kernel_size=1).to(self.device).to(dtype)
+        # Match train_pgsr exactly: gated residual projection is 16 -> 16.
+        self.pixel_fuse_proj = nn.Conv2d(16, 16, kernel_size=1).to(self.device).to(dtype)
         self._reset_pixel_fuse_proj_to_identity()
-        self.pixel_fuse_proj.requires_grad_(False)
-        self.pixel_fuse_proj.eval()
 
         print("Loading checkpoint...")
         ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
@@ -668,10 +693,8 @@ class DualStreamEvaluator(nn.Module):
             state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
             if any(k.startswith("encoder.") for k in state.keys()):
                 raise RuntimeError(
-                    "[Eval] Incompatible checkpoint: pixel_extractor uses legacy "
-                    "'encoder.*' keys (train_dual_control style). "
-                    "Use evaluate_dual_control.py for that checkpoint, or evaluate a "
-                    "train_dual_dfm checkpoint with this script."
+                    "[Eval] Unsupported checkpoint: final train_pgsr_clear.py checkpoints "
+                    "must use the stage-grouped pixel_extractor keys, not encoder.*."
                 )
             self.pixel_extractor.load_state_dict(state)
 
@@ -679,7 +702,9 @@ class DualStreamEvaluator(nn.Module):
             state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
             self.controlnet.load_state_dict(state)
 
-        self._load_pixel_fuse_proj_with_migration(ckpt)
+        self._load_pixel_fusion(ckpt)
+        self.pixel_fuse_proj.requires_grad_(False)
+        self.pixel_fuse_proj.eval()
 
         if 'pixel_weight' in ckpt:
             self.pixel_weight = ckpt['pixel_weight']
@@ -708,7 +733,7 @@ class DualStreamEvaluator(nn.Module):
 
         print(f"Checkpoint: epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', 0):.2f}")
         print(f"Pixel Weight: {self.pixel_weight}, Strength: {self.strength}")
-        print(f"Pixel Fusion: concat+1x1 conv (source={self.fusion_source})")
+        print(f"Pixel Fusion: {self.fusion_description()}")
         print(f"Train LPIPS: weight={self.train_lpips_weight}, prob={self.train_lpips_apply_prob}")
         if self.train_data.get('train_hr_dir'):
             print(
@@ -720,6 +745,11 @@ class DualStreamEvaluator(nn.Module):
             )
         print(f"Conditioning Scale: {self.conditioning_scale}")
         print(f"Control Guidance Window: [{self.control_guidance_start}, {self.control_guidance_end}]")
+
+        if self.attention_mode == 'clear':
+            self._load_clear_attention_linears_from_config(
+                ckpt.get('clear_config', {}) or {}, dtype
+            )
 
         try:
             self.transformer.enable_xformers_memory_efficient_attention()
@@ -870,72 +900,58 @@ class DualStreamEvaluator(nn.Module):
             print("[TextEmbed] inactive (checkpoint trained with cached empty T5)")
 
     def _reset_pixel_fuse_proj_to_identity(self):
-        """Identity-init lr_lat passthrough (first 16 in-channels); zero pixel branch."""
+        """Identity-initialize the native 16-channel pixel projection."""
         if self.pixel_fuse_proj is None:
             return
         with torch.no_grad():
             self.pixel_fuse_proj.weight.zero_()
             self.pixel_fuse_proj.bias.zero_()
-            out_ch = self.pixel_fuse_proj.out_channels
-            in_ch = self.pixel_fuse_proj.in_channels
-            passthrough = min(out_ch, in_ch // 2 if in_ch >= 2 * out_ch else in_ch)
-            idx = torch.arange(passthrough, device=self.pixel_fuse_proj.weight.device)
+            channels = min(
+                self.pixel_fuse_proj.out_channels,
+                self.pixel_fuse_proj.in_channels,
+            )
+            idx = torch.arange(channels, device=self.pixel_fuse_proj.weight.device)
             self.pixel_fuse_proj.weight[idx, idx, 0, 0] = 1.0
 
-    def _load_pixel_fuse_proj_with_migration(self, ckpt):
-        """Load pixel_fuse_proj from ckpt; migrate legacy gated-fusion format if needed."""
-        if 'pixel_fuse_proj' not in ckpt:
-            self.fusion_source = 'identity'
-            print("[Eval] pixel_fuse_proj missing in checkpoint; using identity init.")
-            return
+    def _load_pixel_fusion(self, ckpt):
+        """Load the gated fusion saved by the final PGSR trainers."""
+        if ckpt.get("fusion_type") != "gated":
+            raise RuntimeError(
+                "This evaluator only supports final PGSR gated-fusion checkpoints; "
+                f"got fusion_type={ckpt.get('fusion_type')!r}."
+            )
+        if "pixel_fuse_proj" not in ckpt:
+            raise KeyError("Checkpoint is missing pixel_fuse_proj.")
+        if "pixel_gate_logit" not in ckpt:
+            raise KeyError("Checkpoint is missing pixel_gate_logit.")
 
-        state = {k.replace('module.', ''): v for k, v in ckpt['pixel_fuse_proj'].items()}
-        target = self.pixel_fuse_proj
-        target_w = target.weight
-        src_w = state.get('weight')
-        src_b = state.get('bias')
+        state = {
+            key.replace("module.", ""): value
+            for key, value in ckpt["pixel_fuse_proj"].items()
+        }
+        weight = state.get("weight")
+        expected_shape = tuple(self.pixel_fuse_proj.weight.shape)
+        if weight is None or tuple(weight.shape) != expected_shape:
+            raise RuntimeError(
+                "Final PGSR pixel_fuse_proj must be a 16->16 convolution; "
+                f"got {tuple(weight.shape) if weight is not None else None}."
+            )
+        self.pixel_fuse_proj.load_state_dict(state, strict=True)
 
-        is_legacy = (
-            src_w is not None
-            and src_w.shape == (16, 16, 1, 1)
-            and target_w.shape == (16, 32, 1, 1)
+        gate_raw = ckpt["pixel_gate_logit"]
+        gate_value = (
+            float(gate_raw.detach().float().item())
+            if isinstance(gate_raw, torch.Tensor)
+            else float(gate_raw)
         )
-
-        if not is_legacy and src_w is not None and src_w.shape == target_w.shape:
-            target.load_state_dict(state)
-            self.fusion_source = ckpt.get('fusion_type', 'concat')
-            return
-
-        if is_legacy:
-            gate_raw = ckpt.get('pixel_gate_logit', None)
-            if gate_raw is None:
-                gate_sig = 1.0
-            else:
-                if isinstance(gate_raw, torch.Tensor):
-                    gate_val = float(gate_raw.detach().float().item())
-                else:
-                    gate_val = float(gate_raw)
-                gate_sig = 1.0 / (1.0 + math.exp(-gate_val))
-            with torch.no_grad():
-                target.weight.zero_()
-                target.bias.zero_()
-                idx = torch.arange(16, device=target_w.device)
-                target.weight[idx, idx, 0, 0] = 1.0
-                legacy_w = src_w.to(device=target_w.device, dtype=target_w.dtype) * gate_sig
-                target.weight[:, 16:32, :, :].copy_(legacy_w)
-                if src_b is not None:
-                    legacy_b = src_b.to(device=target.bias.device, dtype=target.bias.dtype) * gate_sig
-                    target.bias.copy_(legacy_b)
-            self.fusion_source = f'migrated(gate={gate_sig:.3f})'
-            print(f"[Eval] Legacy gated-fusion checkpoint migrated to concat layout (sigmoid(gate)={gate_sig:.4f}).")
-            return
-
-        self.fusion_source = 'identity'
-        print(
-            f"[Eval][WARN] pixel_fuse_proj shape mismatch: "
-            f"ckpt={tuple(src_w.shape) if src_w is not None else None}, "
-            f"model={tuple(target_w.shape)}. Using identity init."
+        self.pixel_gate_logit = torch.tensor(
+            gate_value, device=self.device, dtype=torch.float32
         )
+        self.fusion_source = "checkpoint"
+
+    def fusion_description(self):
+        gate = torch.sigmoid(self.pixel_gate_logit.float()).item()
+        return f"gated residual add (gate={gate:.4f}, source={self.fusion_source})"
 
     def _get_transformer_base(self):
         """Return base FluxTransformer2DModel regardless of PEFT wrapping."""
@@ -949,6 +965,55 @@ class DualStreamEvaluator(nn.Module):
         if hasattr(self.transformer, "base_model") and hasattr(self.transformer.base_model, "model"):
             return self.transformer.base_model.model
         return self.transformer
+
+    @staticmethod
+    def _clear_targets_module_name(name, apply_single_blocks=False):
+        is_dual = ('transformer_blocks.' in name and 'single' not in name)
+        is_single = ('single_transformer_blocks.' in name)
+        return is_dual or (bool(apply_single_blocks) and is_single)
+
+    def _load_clear_attention_linears_from_config(self, clear_cfg, dtype):
+        """Load official CLEAR attention projection weights when requested."""
+        if not bool(clear_cfg.get('load_attn_weights', False)):
+            return
+        clear_ckpt = clear_cfg.get('ckpt', None)
+        if not clear_ckpt:
+            print("[CLEAR][WARN] load_attn_weights=True but clear_config has no ckpt path.")
+            return
+        if not os.path.exists(clear_ckpt):
+            print(f"[CLEAR][WARN] official attention weights not found: {clear_ckpt}")
+            return
+
+        from safetensors.torch import load_file
+        clear_weights = load_file(clear_ckpt)
+        apply_single = bool(clear_cfg.get('apply_single_blocks', False))
+        base = self._get_transformer_base()
+        n_modules = 0
+        n_tensors = 0
+        for name, module in base.named_modules():
+            if not (
+                hasattr(module, 'set_processor')
+                and self._clear_targets_module_name(name, apply_single)
+            ):
+                continue
+            prefix = f"{name}."
+            attn_state = {
+                k[len(prefix):]: v.to(self.device, dtype)
+                for k, v in clear_weights.items()
+                if k.startswith(prefix) and not k[len(prefix):].startswith("processor.")
+            }
+            if not attn_state:
+                continue
+            module.load_state_dict(attn_state, strict=False)
+            n_modules += 1
+            n_tensors += len(attn_state)
+
+        scope = "dual+single" if apply_single else "dual"
+        print(
+            f"[CLEAR] loaded official attention linears: "
+            f"{n_tensors} tensors into {n_modules} {scope} attention modules "
+            f"from {clear_ckpt}"
+        )
 
     def _init_clear_mask(self, patch_h, patch_w):
         """Initialize CLEAR's global flex-attention mask for the current grid."""
@@ -1037,6 +1102,7 @@ class DualStreamEvaluator(nn.Module):
         self.clear_window_size = int(clear_cfg.get('window_size', 16))
         self.clear_down_factor = int(clear_cfg.get('down_factor', 4))
         self.clear_resolution = int(clear_cfg.get('resolution', 512))
+        apply_single = bool(clear_cfg.get('apply_single_blocks', False))
         self._clear_processors = []
 
         default_patch = max(1, self.clear_resolution // 16)
@@ -1048,8 +1114,7 @@ class DualStreamEvaluator(nn.Module):
         for name, module in base.named_modules():
             if not (
                 hasattr(module, 'set_processor')
-                and 'transformer_blocks.' in name
-                and 'single' not in name
+                and self._clear_targets_module_name(name, apply_single)
             ):
                 continue
             if self.clear_down_factor > 1:
@@ -1075,7 +1140,8 @@ class DualStreamEvaluator(nn.Module):
             n_replaced += 1
 
         print(
-            f"[CLEAR] ACTIVE: replaced {n_replaced} dual-block processors "
+            f"[CLEAR] ACTIVE: replaced {n_replaced} "
+            f"{'dual+single' if apply_single else 'dual-block'} processors "
             f"(window={self.clear_window_size}, down_factor={self.clear_down_factor}, "
             f"ckpt_states={len(state_list)})"
         )
@@ -1246,11 +1312,13 @@ class DualStreamEvaluator(nn.Module):
                 pixel_feat, size=lr_lat.shape[-2:], mode='bilinear', align_corners=False
             )
 
-        # Concat fusion: [lr_lat || pixel_weight*pixel_feat] -> 1x1 conv -> 16ch.
-        fused_cond = self.pixel_fuse_proj(
-            torch.cat([lr_lat.to(dtype), (self.pixel_weight * pixel_feat).to(dtype)], dim=1)
+        # Native gated residual fusion, identical to train_pgsr.
+        projected = self.pixel_fuse_proj(pixel_feat.to(dtype))
+        gate = torch.sigmoid(self.pixel_gate_logit.float()).to(dtype)
+        fused_cond = (
+            lr_lat.to(dtype) + self.pixel_weight * gate * projected
         ).to(dtype)
-        del pixel_feat
+        del pixel_feat, projected
 
         # FLUX pack() requires even latent H/W. RealSR can produce odd latent sizes.
         noisy_for_pack, pad_h, pad_w = self._pad_to_even_hw(noisy.to(dtype))
@@ -1628,6 +1696,9 @@ def main():
                         choices=['auto', 'clear', 'full'],
                         help='auto uses CLEAR when the checkpoint has CLEAR state; '
                              'clear/full force the attention implementation.')
+    parser.add_argument('--clear_window_size_override', type=int, default=None,
+                        help='Override CLEAR local window size at evaluation time. '
+                             'Only affects --attention_mode=clear; useful for speed ablations.')
     parser.add_argument('--input_scale', type=int, default=4,
                         help='When --hr_dir is omitted, upsample LR by this factor before SR.')
     parser.add_argument('--benchmark_square_size', type=int, default=0,
@@ -1746,6 +1817,18 @@ def main():
     )
     evaluator.load()
 
+    if args.clear_window_size_override is not None:
+        if args.clear_window_size_override < 1:
+            parser.error("--clear_window_size_override must be >= 1")
+        if not evaluator.use_clear:
+            print("[CLEAR] window override ignored because CLEAR attention is inactive.")
+        else:
+            old_window = evaluator.clear_window_size
+            evaluator.clear_window_size = int(args.clear_window_size_override)
+            evaluator.clear_config['window_size'] = evaluator.clear_window_size
+            evaluator._clear_mask_hw = None
+            print(f"[CLEAR] eval window override: {old_window} -> {evaluator.clear_window_size}")
+
     if args.pixel_weight is not None:
         evaluator.pixel_weight = args.pixel_weight
 
@@ -1773,7 +1856,7 @@ def main():
     if args.exp_name:
         exp_name = args.exp_name
     else:
-        fusion_tag = "concat"
+        fusion_tag = "gated"
         fusion_source_tag = str(evaluator.fusion_source).replace("(", "").replace(")", "").replace(" ", "_")
         exp_name = (
             f"{ts}"
@@ -2092,7 +2175,7 @@ def main():
     print("=" * 70)
     print(f"Strength: {strength}")
     print(f"Pixel Weight: {evaluator.pixel_weight}")
-    print(f"Pixel Fusion: concat+1x1 conv (source={evaluator.fusion_source})")
+    print(f"Pixel Fusion: {evaluator.fusion_description()}")
     print("---------- Timing ----------")
     print(
         f"Wall: mean={_fmt(timing_summary['wall_mean_sec'])}s, "
@@ -2162,7 +2245,7 @@ def main():
             )
         f.write(f"Train LPIPS Weight: {evaluator.train_lpips_weight}\n")
         f.write(f"Train LPIPS Apply Prob: {evaluator.train_lpips_apply_prob}\n")
-        f.write(f"Pixel Fusion: concat+1x1 conv (source={evaluator.fusion_source})\n")
+        f.write(f"Pixel Fusion: {evaluator.fusion_description()}\n")
         train_data = evaluator.train_data or {}
         if any(v is not None for v in train_data.values()):
             f.write("Train Data (from checkpoint):\n")

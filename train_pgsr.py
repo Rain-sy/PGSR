@@ -104,6 +104,8 @@ import os
 import gc
 import math
 import io
+import json
+import time
 import argparse
 import numpy as np
 from contextlib import nullcontext
@@ -1034,6 +1036,7 @@ class DualStreamFLUXSR(nn.Module):
 
     def __init__(self, model_name, device, pretrained_controlnet=None,
                  train_controlnet=True, pixel_weight=1.0,
+                 condition_source='fused',
                  control_guidance_start=0.0, control_guidance_end=1.0,
                  conditioning_scale=1.0,
                  use_lora=True, lora_rank=16, lora_alpha=16,
@@ -1053,6 +1056,9 @@ class DualStreamFLUXSR(nn.Module):
         self.device = device
         self.train_controlnet = train_controlnet
         self.pixel_weight = pixel_weight
+        if condition_source not in {'fused', 'pixel_only', 'latent_only'}:
+            raise ValueError(f"Unsupported condition_source: {condition_source}")
+        self.condition_source = condition_source
         self.pixel_gate_init = float(pixel_gate_init)
         self.control_guidance_start = control_guidance_start
         self.control_guidance_end = control_guidance_end
@@ -1659,29 +1665,40 @@ class DualStreamFLUXSR(nn.Module):
         dtype = torch.bfloat16
 
         # Pixel features -- collect multi-scale taps only when explicitly
-        # requested (training DFM loss path). In inference/validation we cache
-        # taps once in `inference()` to avoid per-step extractor overhead.
+        # requested (training DFM loss path). A latent-only control must not
+        # execute the pixel branch, otherwise its cost is artificially inflated.
         need_taps = bool(return_dfm_taps)
-        if need_taps:
-            pixel_feat, pixel_taps = self.pixel_extractor(lr_pixel, return_features=True)
-        else:
+        use_pixel_branch = self.condition_source != 'latent_only' or need_taps
+        if use_pixel_branch and need_taps:
+            pixel_feat, pixel_taps = self.pixel_extractor(
+                lr_pixel, return_features=True
+            )
+        elif use_pixel_branch:
             pixel_feat = self.pixel_extractor(lr_pixel)
             pixel_taps = None
+        else:
+            pixel_taps = None
 
-        if pixel_feat.shape[-2:] != lr_lat.shape[-2:]:
-            pixel_feat = F.interpolate(
-                pixel_feat, size=lr_lat.shape[-2:], mode='bilinear', align_corners=False
-            )
+        if not use_pixel_branch:
+            fused_cond = lr_lat.to(dtype)
+        else:
+            if pixel_feat.shape[-2:] != lr_lat.shape[-2:]:
+                pixel_feat = F.interpolate(
+                    pixel_feat, size=lr_lat.shape[-2:],
+                    mode='bilinear', align_corners=False
+                )
 
-        # Gated residual fusion (v2):
-        #   fused_cond = lr_lat + pixel_weight * sigmoid(gate) * proj(pixel_feat)
-        # proj is identity-init (see _reset_pixel_fuse_proj_to_identity); with
-        # pixel_gate_init=4.0 the sigmoid gate starts at ~0.98, so the pixel
-        # branch contributes from step 1 without a cold-start zero-gradient
-        # phase.
-        projected = self.pixel_fuse_proj(pixel_feat.to(dtype))
-        gate = torch.sigmoid(self.pixel_gate_logit.float()).to(dtype)
-        fused_cond = (lr_lat.to(dtype) + self.pixel_weight * gate * projected).to(dtype)
+            # Gated residual fusion (v2).
+            projected = self.pixel_fuse_proj(pixel_feat.to(dtype))
+            gate = torch.sigmoid(self.pixel_gate_logit.float()).to(dtype)
+            pixel_cond = self.pixel_weight * gate * projected
+            if self.condition_source == 'fused':
+                fused_cond = lr_lat.to(dtype) + pixel_cond
+            elif self.condition_source == 'pixel_only':
+                fused_cond = pixel_cond
+            else:
+                fused_cond = lr_lat.to(dtype)
+        fused_cond = fused_cond.to(dtype)
 
         # Pack
         noisy_packed = self._pack(noisy.to(dtype))
@@ -1790,10 +1807,16 @@ class DualStreamFLUXSR(nn.Module):
         # 生成噪声
         noise = torch.randn_like(lr_lat)
 
+        # Pixel-only must not retain an LR-VAE shortcut through the img2img
+        # initialization. At strength=1 this is numerically pure noise either
+        # way, but using zeros makes the condition-source contract explicit for
+        # every scheduler configuration.
+        init_sample = torch.zeros_like(lr_lat) if self.condition_source == 'pixel_only' else lr_lat
+
         # 🌟 使用官方 scale_noise 加噪
         # scale_noise: sample = sigma * noise + (1 - sigma) * sample
         timestep_batch = timesteps[:1].expand(B)
-        latents = self.scheduler.scale_noise(lr_lat, timestep_batch, noise)
+        latents = self.scheduler.scale_noise(init_sample, timestep_batch, noise)
 
         # 去噪循环
         total_steps = len(timesteps)
@@ -1884,7 +1907,11 @@ def compute_flow_matching_loss(
 
     # 🌟 传给模型的 timestep = sigma（因为官方是 timestep / 1000，而 timestep = sigma * 1000）
     # IMPORTANT: keep forward on wrapped `system` so DDP/DeepSpeed hooks remain active.
-    use_dfm = bool(getattr(unwrapped, 'use_dfm', False)) and hr_pixel is not None
+    use_dfm = (
+        bool(getattr(unwrapped, 'use_dfm', False))
+        and float(getattr(unwrapped, 'dfm_pixel_weight', 0.0)) > 0
+        and hr_pixel is not None
+    )
     if use_dfm:
         v_pred, pixel_taps = system(
             noisy, lr_lat, lr_pixel, sigma, guidance, return_dfm_taps=True
@@ -2197,6 +2224,7 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
         'best_metric': best_metric,
         'best_metric_value': best_metric_value,
         'pixel_weight': pixel_weight,
+        'condition_source': unwrapped.condition_source,
         'conditioning_scale': unwrapped.conditioning_scale,
         'strength': strength,
         'lpips_weight': lpips_weight,
@@ -2307,6 +2335,12 @@ def main():
     parser.add_argument('--model_name', type=str, default='black-forest-labs/FLUX.1-dev')
     parser.add_argument('--pretrained_controlnet', type=str, default=None)
     parser.add_argument('--pixel_weight', type=float, default=1.0)
+    parser.add_argument(
+        '--condition_source', type=str, default='fused',
+        choices=['fused', 'pixel_only', 'latent_only'],
+        help='Control condition source. pixel_only removes the LR VAE latent '
+             'from both ControlNet conditioning and img2img initialization.',
+    )
     parser.add_argument('--pixel_gate_init', type=float, default=4.0,
                         help='Initial logit for sigmoid gate on pixel branch '
                              '(v2 gated fusion). 4.0 => sigmoid ~ 0.982, i.e. '
@@ -2394,6 +2428,8 @@ def main():
                         help='When resuming, also restore optimizer momentum (default: off; Stage 2 typically wants a fresh optimizer).')
     parser.add_argument('--resume_lr_scheduler', action='store_true', default=False,
                         help='When resuming, restore the LambdaLR step counter. Default OFF: the new stage gets a fresh warmup + cosine over --epochs.')
+    parser.add_argument('--resume_scheduler_source_batch_size', type=int, default=None,
+                        help='Legacy-checkpoint per-device batch size used to rescale the restored LambdaLR phase.')
     parser.add_argument('--reset_pixel_gate', action='store_true', default=False,
                         help='On resume, reset pixel_fuse_proj to identity and '
                              'pixel_gate_logit back to --pixel_gate_init. Useful when '
@@ -2425,6 +2461,19 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--train_controlnet', action='store_true', default=True)
     parser.add_argument('--freeze_controlnet', action='store_true', default=False)
+    parser.add_argument(
+        '--benchmark_steps', type=int, default=0,
+        help='Measure this many synchronized training iterations, then exit '
+             'without validation or checkpointing (0 disables benchmarking).'
+    )
+    parser.add_argument(
+        '--benchmark_warmup_steps', type=int, default=10,
+        help='Warm-up iterations excluded from benchmark measurements.'
+    )
+    parser.add_argument(
+        '--benchmark_output', type=str, default=None,
+        help='Optional JSON path for benchmark results (written by rank 0).'
+    )
 
     args = parser.parse_args()
     if args.text_embed_tokens < 1:
@@ -2446,6 +2495,10 @@ def main():
         parser.error("--controlnet_lr_scale must be >= 0")
     if args.lpips_max_sigma < 0:
         parser.error("--lpips_max_sigma must be >= 0")
+    if args.benchmark_steps < 0 or args.benchmark_warmup_steps < 0:
+        parser.error("--benchmark_steps and --benchmark_warmup_steps must be >= 0")
+    if args.benchmark_steps > 0 and not args.benchmark_output:
+        parser.error("--benchmark_output is required when --benchmark_steps > 0")
     if args.degrade_mode == 'paired' and not args.lr_dir:
         parser.error("--lr_dir is required when --degrade_mode is 'paired'")
     if args.real_paired_repeat < 1:
@@ -2517,6 +2570,7 @@ def main():
         f"_x{args.scale}"
         f"_str{_fmt_tag(args.strength)}"
         f"_pw{_fmt_tag(args.pixel_weight)}"
+        f"_cond{args.condition_source}"
         f"_gate{_fmt_tag(args.pixel_gate_init)}"
         f"_lpw{_fmt_tag(args.lpips_weight)}"
         f"_lpp{_fmt_tag(args.lpips_apply_prob)}"
@@ -2555,6 +2609,9 @@ def main():
         'scale': int(args.scale),
         'resolution': int(args.resolution),
         'num_crops': int(args.num_crops),
+        'batch_size': int(args.batch_size),
+        'world_size': int(getattr(accelerator, 'num_processes', 1)),
+        'condition_source': args.condition_source,
     }
 
     if is_main:
@@ -2574,6 +2631,7 @@ def main():
         print(f"Num Crops: {args.num_crops}")
         print(f"Batch Size: {args.batch_size}")
         print(f"Pixel Weight: {args.pixel_weight}")
+        print(f"Condition Source: {args.condition_source}")
         gate_sig_print = 1.0 / (1.0 + math.exp(-args.pixel_gate_init))
         print(f"Pixel Fusion: gated residual add (identity-init conv, "
               f"logit={args.pixel_gate_init}, sigmoid={gate_sig_print:.4f})")
@@ -2611,6 +2669,7 @@ def main():
     system = DualStreamFLUXSR(
         args.model_name, device, args.pretrained_controlnet,
         train_controlnet=args.train_controlnet, pixel_weight=args.pixel_weight,
+        condition_source=args.condition_source,
         control_guidance_start=args.control_guidance_start,
         control_guidance_end=args.control_guidance_end,
         conditioning_scale=args.conditioning_scale,
@@ -2834,9 +2893,35 @@ def main():
     if args.resume:
         if is_main:
             print(f"[Resume] Loading from {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        # Keep the full checkpoint (including optimizer state) off each GPU.
+        # load_state_dict copies tensors into the prepared modules as needed.
+        ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
 
         unwrapped = accelerator.unwrap_model(system)
+        if 'condition_source' in ckpt:
+            resume_condition_source = ckpt['condition_source']
+        else:
+            # Legacy no-pixel checkpoints predate the explicit condition-source
+            # field. A zero pixel weight makes their fused condition exactly
+            # lr_lat, so they are valid latent-only initializations.
+            legacy_pixel_weight = float(ckpt.get('pixel_weight', 1.0))
+            resume_condition_source = (
+                'latent_only'
+                if legacy_pixel_weight == 0.0 and args.condition_source == 'latent_only'
+                else 'fused'
+            )
+            if is_main and resume_condition_source == 'latent_only':
+                print(
+                    "[Resume] Interpreting legacy pixel_weight=0 checkpoint "
+                    "as latent_only."
+                )
+        if resume_condition_source != args.condition_source:
+            raise RuntimeError(
+                "[Resume] condition_source mismatch: checkpoint="
+                f"{resume_condition_source}, requested={args.condition_source}. "
+                "A pixel-only ablation must be trained from its own initialization "
+                "rather than adapted from a fused checkpoint."
+            )
         if 'pixel_extractor' in ckpt:
             state = _strip_module_prefix(ckpt['pixel_extractor'])
             if any(k.startswith("encoder.") for k in state.keys()):
@@ -3000,7 +3085,26 @@ def main():
             print("[Resume] Optimizer starts fresh (pass --resume_optimizer to keep AdamW momentum).")
         if args.resume_lr_scheduler and 'lr_scheduler_state_dict' in ckpt:
             try:
-                lr_scheduler.load_state_dict(ckpt['lr_scheduler_state_dict'])
+                scheduler_state = dict(ckpt['lr_scheduler_state_dict'])
+                saved_train_data = ckpt.get('train_data') or {}
+                source_batch_size = saved_train_data.get(
+                    'batch_size', args.resume_scheduler_source_batch_size
+                )
+                if source_batch_size is not None:
+                    phase_scale = float(source_batch_size) / float(args.batch_size)
+                    if abs(phase_scale - 1.0) > 1e-8:
+                        old_last_epoch = int(scheduler_state.get('last_epoch', 0))
+                        new_last_epoch = int(round(old_last_epoch * phase_scale))
+                        scheduler_state['last_epoch'] = new_last_epoch
+                        if '_step_count' in scheduler_state:
+                            scheduler_state['_step_count'] = new_last_epoch + 1
+                        if is_main:
+                            print(
+                                f"[Resume] Rescaled lr_scheduler phase {old_last_epoch} -> "
+                                f"{new_last_epoch} for per-device batch "
+                                f"{source_batch_size} -> {args.batch_size}."
+                            )
+                lr_scheduler.load_state_dict(scheduler_state)
                 if is_main:
                     print(f"[Resume] Restored lr_scheduler (last_lr={lr_scheduler.get_last_lr()}).")
             except Exception as e:
@@ -3035,6 +3139,8 @@ def main():
             else:
                 lpips_msg = f", best LPIPS: {best_lpips:.4f}" if np.isfinite(best_lpips) else ""
                 print(f"[Resume] Starting from epoch {start_epoch}, best PSNR: {best_psnr:.2f}{lpips_msg}")
+        del ckpt
+        gc.collect()
 
     # Log file
     log_path = os.path.join(save_dir, 'training_log.txt')
@@ -3106,6 +3212,9 @@ def main():
     # Resume global_step so empty_cache cycles and any step-indexed logic stay
     # consistent across restarts; 0 on a fresh run.
     global_step = resumed_global_step if args.resume else 0
+    benchmark_seen = 0
+    benchmark_elapsed = 0.0
+    benchmark_measured = 0
     if args.resume and is_main:
         print(f"[Resume] global_step resumed at {global_step}")
 
@@ -3143,6 +3252,22 @@ def main():
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{end_epoch}", disable=not is_main)
 
         for batch in pbar:
+            benchmark_measure = (
+                args.benchmark_steps > 0
+                and benchmark_seen >= args.benchmark_warmup_steps
+            )
+            if (
+                args.benchmark_steps > 0
+                and benchmark_seen == args.benchmark_warmup_steps
+                and device.type == 'cuda'
+            ):
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
+            if benchmark_measure:
+                if device.type == 'cuda':
+                    torch.cuda.synchronize(device)
+                benchmark_start = time.perf_counter()
+
             hr = batch['hr'].to(device).to(torch.bfloat16)
             lr = batch['lr'].to(device).to(torch.bfloat16)
 
@@ -3174,6 +3299,12 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
+            if benchmark_measure:
+                if device.type == 'cuda':
+                    torch.cuda.synchronize(device)
+                benchmark_elapsed += time.perf_counter() - benchmark_start
+                benchmark_measured += 1
+
             loss_item = loss.item()
             epoch_losses.append(loss_item)
             postfix = {'loss': f'{loss_item:.4f}', 'lr': f'{lr_scheduler.get_last_lr()[0]:.2e}'}
@@ -3187,6 +3318,56 @@ def main():
                 gc.collect()
                 if device.type == 'cuda':
                     torch.cuda.empty_cache()
+            benchmark_seen += 1
+
+            if (
+                args.benchmark_steps > 0
+                and benchmark_measured >= args.benchmark_steps
+            ):
+                peak_bytes = (
+                    torch.cuda.max_memory_allocated(device)
+                    if device.type == 'cuda' else 0
+                )
+                values = torch.tensor(
+                    [benchmark_elapsed, float(peak_bytes)],
+                    device=device, dtype=torch.float64,
+                )
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(
+                        values, op=torch.distributed.ReduceOp.MAX
+                    )
+                result = {
+                    'time_per_iteration_s': values[0].item() / benchmark_measured,
+                    'peak_memory_gib_per_gpu': values[1].item() / (1024 ** 3),
+                    'measured_iterations': benchmark_measured,
+                    'warmup_iterations': args.benchmark_warmup_steps,
+                    'resolution': args.resolution,
+                    'batch_size_per_gpu': args.batch_size,
+                    'world_size': accelerator.num_processes,
+                    'effective_batch_size': (
+                        args.batch_size * accelerator.num_processes
+                        * grad_accum_steps
+                    ),
+                    'gradient_accumulation_steps': grad_accum_steps,
+                    'mixed_precision': 'bf16',
+                    'condition_source': args.condition_source,
+                    'dfm_pixel_weight': args.dfm_pixel_weight,
+                    'degrade_mode': args.degrade_mode,
+                }
+                if is_main:
+                    output_dir = os.path.dirname(os.path.abspath(args.benchmark_output))
+                    os.makedirs(output_dir, exist_ok=True)
+                    with open(args.benchmark_output, 'w') as f:
+                        json.dump(result, f, indent=2)
+                        f.write('\n')
+                    print(f"[Benchmark] {json.dumps(result, sort_keys=True)}")
+                    print(f"[Benchmark] Wrote {args.benchmark_output}")
+                accelerator.wait_for_everyone()
+                try:
+                    accelerator.end_training()
+                except Exception:
+                    pass
+                return
 
         avg_loss = np.mean(epoch_losses)
 
