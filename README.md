@@ -21,16 +21,23 @@ pip install diffusers==0.36.0 accelerate==0.34.0 transformers==4.57.5 \
   peft==0.18.1 deepspeed lpips scikit-image pyiqa
 ```
 
-Access to [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) is required. By default, PGSR initializes its ControlNet from [Flux.1-dev-Controlnet-Upscaler](https://huggingface.co/jasperai/Flux.1-dev-Controlnet-Upscaler).
+## Pretrained Models
+
+- [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev): frozen diffusion transformer and VAE backbone.
+- [Flux.1-dev-Controlnet-Upscaler](https://huggingface.co/jasperai/Flux.1-dev-Controlnet-Upscaler): initialization of the restoration ControlNet.
+- PGSR checkpoint: coming soon.
+
+FLUX.1-dev is gated; request access and authenticate with Hugging Face before running the code. Model identifiers can be replaced by local paths through the corresponding command-line arguments.
 
 ## Data
 
-Dataset download and preparation utilities are provided in `download/`:
+The paper uses the following datasets:
 
-```bash
-python download/download_datasets.py --help
-python download/build_dataset.py --help
-```
+- **Stage 1:** DF2K (DIV2K + Flickr2K), with paired bicubic x4 LR-HR images.
+- **Stage 2:** the union of DF2K, LSDIR, FFHQ, and OST. LR inputs are synthesized online with the second-order Real-ESRGAN degradation pipeline.
+- **Evaluation:** DIV2K validation, RealSR, and DRealSR.
+
+Place downloaded datasets under `Data/`, or pass their locations directly with `--hr_dir`, `--lr_dir`, `--val_hr_dir`, and `--val_lr_dir`.
 
 ## Inference
 

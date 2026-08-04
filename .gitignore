@@ -15,26 +15,14 @@ eval_*/
 *_tmp.py
 .claude/
 
-# Local paper/rebuttal workspace (never publish)
+# Local research and rebuttal workspaces (never publish)
 rebuttal/
-experiments/rebuttal_*/
-experiments/rebuttal_*.log
-experiments/rebuttal_*.nohup.log
-experiments/rebuttal_*.done
-experiments/paper_compare/vae_recon_figures/
-
-# Paper comparison workspace
+experiments/
+scripts/
+configs/paper_compare/
 external_baselines/
 src/taming-transformers/
-experiments/paper_compare/outputs/
-experiments/paper_compare/figures/
-experiments/paper_compare/metrics/
-experiments/paper_compare/logs/
-experiments/paper_compare/organized_visual_outputs/
-experiments/paper_compare/our_method_runs/
-experiments/paper_compare/pisa_extra/
-experiments/paper_compare/visual_inputs/**/*.png
-experiments/paper_compare/visual_inputs/**/*.jpg
-experiments/paper_compare/visual_inputs/**/*.jpeg
-!experiments/paper_compare/visual_inputs/**/.gitkeep
-experiments/paper_compare_quant/
+
+# Local data/model acquisition utilities
+download/
+download_flux.py
