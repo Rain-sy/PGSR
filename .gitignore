@@ -13,8 +13,15 @@ outputs/
 eval_*/
 .claude/worktrees/
 *_tmp.py
-NeurIPS_2026_Dual_SR/
 .claude/
+
+# Local paper/rebuttal workspace (never publish)
+rebuttal/
+experiments/rebuttal_*/
+experiments/rebuttal_*.log
+experiments/rebuttal_*.nohup.log
+experiments/rebuttal_*.done
+experiments/paper_compare/vae_recon_figures/
 
 # Paper comparison workspace
 external_baselines/

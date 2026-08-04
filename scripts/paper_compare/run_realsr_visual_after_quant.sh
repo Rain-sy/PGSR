@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /jumbo/yuwingtai/sy/Dual_SR
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
 export HF_HOME="${HF_HOME:-/jumbo/yuwingtai/sy/}"
 
 STEMS="Canon_002,Canon_034,Nikon_009,Nikon_015,Nikon_025,Nikon_032,Nikon_041,Nikon_044,Nikon_046"
