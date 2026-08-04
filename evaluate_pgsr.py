@@ -10,7 +10,7 @@ Automatically detects and loads LoRA adapters when checkpoint contains
 
 Usage:
     CUDA_VISIBLE_DEVICES=0 python evaluate_pgsr.py \
-        --checkpoint checkpoints/dual_control/xxx/best_model.pt \
+        --checkpoint checkpoints/pgsr/best_model.pt \
         --hr_dir Data/DIV2K/DIV2K_valid_HR \
         --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
         --iqa_device cuda \
@@ -518,6 +518,14 @@ def clear_memory(device):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+
+def reset_inference_seed(seed, device):
+    """Reset CPU/CUDA RNGs so timing repeats produce identical outputs."""
+    torch.manual_seed(int(seed))
+    if device.type == 'cuda':
+        torch.cuda.manual_seed_all(int(seed))
+
+
 # ============================================================================
 # Evaluator
 # ============================================================================
@@ -594,7 +602,7 @@ class DualStreamEvaluator(nn.Module):
         # CPU to avoid GPU memory pressure; the full ckpt is re-loaded below.
         try:
             _ckpt_peek = torch.load(
-                self.checkpoint_path, map_location='cpu', weights_only=False
+                self.checkpoint_path, map_location='cpu', weights_only=False, mmap=True
             )
             self.use_learnable_text_embed = bool(
                 _ckpt_peek.get('use_learnable_text_embed', False)
@@ -636,7 +644,9 @@ class DualStreamEvaluator(nn.Module):
         self._reset_pixel_fuse_proj_to_identity()
 
         print("Loading checkpoint...")
-        ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
+        ckpt = torch.load(
+            self.checkpoint_path, map_location='cpu', weights_only=False, mmap=True
+        )
 
         if 'pixel_extractor' in ckpt:
             state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
@@ -846,6 +856,9 @@ class DualStreamEvaluator(nn.Module):
                       "using warm-start init from cached empty-string T5.")
         else:
             print("[TextEmbed] inactive (checkpoint trained with cached empty T5)")
+
+        del ckpt
+        clear_memory(self.device)
 
     def _reset_pixel_fuse_proj_to_identity(self):
         """Identity-initialize the native 16-channel pixel projection."""
@@ -1334,7 +1347,7 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
 def run_sr_tiled_with_oom_retry(
     evaluator, lr_t, device, num_steps=20, guidance=3.5,
     tile_size=640, overlap=64, strength=0.7,
-    min_tile_size=256
+    min_tile_size=256, seed=None
 ):
     """
     OOM-safe tiled inference:
@@ -1345,6 +1358,8 @@ def run_sr_tiled_with_oom_retry(
     last_err = None
     while current_tile >= min_tile_size:
         try:
+            if seed is not None:
+                reset_inference_seed(seed, device)
             clear_memory(device)
             return run_sr_tiled(
                 evaluator, lr_t, device, num_steps=num_steps, guidance=guidance,
@@ -1374,7 +1389,7 @@ def run_sr_tiled_with_oom_retry(
 def run_sr_timed(
     evaluator, lr_t, device, num_steps=20, guidance=3.5,
     tile_size=640, overlap=64, strength=0.7, min_tile_size=256,
-    warmup=0, repeats=1,
+    warmup=0, repeats=1, seed=42,
 ):
     """Run tiled SR with optional warmup/repeats and synchronized timing."""
     warmup = max(0, int(warmup))
@@ -1385,7 +1400,7 @@ def run_sr_timed(
         tmp = run_sr_tiled_with_oom_retry(
             evaluator, lr_t, device, num_steps=num_steps, guidance=guidance,
             tile_size=tile_size, min_tile_size=min_tile_size,
-            overlap=overlap, strength=strength,
+            overlap=overlap, strength=strength, seed=seed,
         )
         del tmp
         clear_memory(device)
@@ -1412,7 +1427,7 @@ def run_sr_timed(
         result = run_sr_tiled_with_oom_retry(
             evaluator, lr_t, device, num_steps=num_steps, guidance=guidance,
             tile_size=tile_size, min_tile_size=min_tile_size,
-            overlap=overlap, strength=strength,
+            overlap=overlap, strength=strength, seed=seed,
         )
         if device.type == 'cuda':
             end_event.record()
@@ -1559,6 +1574,16 @@ def main():
         parser.error("--timing_warmup must be >= 0")
     if args.timing_repeats < 1:
         parser.error("--timing_repeats must be >= 1")
+    if args.num_steps < 1:
+        parser.error("--num_steps must be >= 1")
+    if args.strength is not None and not (0.0 < args.strength <= 1.0):
+        parser.error("--strength must be within (0, 1]")
+    if args.tile_size < 1 or args.min_tile_size < 1:
+        parser.error("--tile_size and --min_tile_size must be >= 1")
+    if args.min_tile_size > args.tile_size:
+        parser.error("--min_tile_size must be <= --tile_size")
+    if args.overlap < 0:
+        parser.error("--overlap must be >= 0")
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1589,6 +1614,8 @@ def main():
         evaluator.pixel_weight = args.pixel_weight
 
     strength = args.strength if args.strength is not None else evaluator.strength
+    if not (0.0 < strength <= 1.0):
+        parser.error(f"Effective strength must be within (0, 1], got {strength}")
     control_guidance_start = (
         args.control_guidance_start
         if args.control_guidance_start is not None
@@ -1752,7 +1779,7 @@ def main():
     filenames = []
     timing_rows = []
 
-    for eval_name in tqdm(eval_files, desc="Evaluating"):
+    for image_index, eval_name in enumerate(tqdm(eval_files, desc="Evaluating")):
         if has_hr:
             hf = eval_name
             base_name = os.path.splitext(hf)[0]
@@ -1810,8 +1837,10 @@ def main():
             strength=strength,
             warmup=args.timing_warmup,
             repeats=args.timing_repeats,
+            seed=args.seed + image_index,
         )
         timing['filename'] = base_name
+        timing['seed'] = args.seed + image_index
         timing['height'] = int(H)
         timing['width'] = int(W)
         timing_rows.append(timing)
@@ -1993,6 +2022,7 @@ def main():
         f.write(f"Strength: {strength}\n")
         f.write(f"Control Guidance Window: [{control_guidance_start}, {control_guidance_end}]\n")
         f.write(f"Pixel Weight: {evaluator.pixel_weight}\n")
+        f.write(f"Condition Source: {evaluator.condition_source}\n")
         f.write(f"Seed: {args.seed}\n")
         f.write(f"VAE Posterior: {args.vae_posterior}\n")
         f.write("Attention Mode: full\n")
@@ -2150,6 +2180,17 @@ def main():
         'images': len(filenames),
         'has_hr': has_hr,
         'attention_mode': 'full',
+        'inference': {
+            'seed': args.seed,
+            'vae_posterior': args.vae_posterior,
+            'num_steps': args.num_steps,
+            'guidance': args.guidance,
+            'strength': strength,
+            'condition_source': evaluator.condition_source,
+            'pixel_weight': evaluator.pixel_weight,
+            'control_guidance_start': control_guidance_start,
+            'control_guidance_end': control_guidance_end,
+        },
         'timing': {
             'warmup': args.timing_warmup,
             'repeats': args.timing_repeats,

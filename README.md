@@ -25,9 +25,10 @@ pip install diffusers==0.36.0 accelerate==0.34.0 transformers==4.57.5 \
 
 - [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev): frozen diffusion transformer and VAE backbone.
 - [Flux.1-dev-Controlnet-Upscaler](https://huggingface.co/jasperai/Flux.1-dev-Controlnet-Upscaler): initialization of the restoration ControlNet.
+- [CLEAR FLUX weights](https://huggingface.co/Huage001/CLEAR): required only by the sparse-attention variant; use the checkpoint matching its window size and downsample factor.
 - PGSR checkpoint: coming soon.
 
-FLUX.1-dev is gated; request access and authenticate with Hugging Face before running the code. Model identifiers can be replaced by local paths through the corresponding command-line arguments.
+FLUX.1-dev is gated; request access and authenticate with Hugging Face before running the code. Model identifiers can be replaced by local paths through the corresponding command-line arguments. Pass the CLEAR weights to the sparse evaluator with `--clear_ckpt`.
 
 ## Data
 
@@ -58,7 +59,7 @@ Results and metrics are written to `outputs/`. The HR directory is optional when
 PGSR uses two-stage training: paired bicubic pretraining followed by Real-ESRGAN degradation fine-tuning. The complete commands and resume settings are documented at the top of `train_pgsr.py`.
 
 ```bash
-accelerate launch --config_file configs/accelerate_deepspeed.yaml \
+accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
   train_pgsr.py \
   --hr_dir Data/DF2K_HR \
   --lr_dir Data/DF2K_LR_bicubic_X4 \
@@ -69,6 +70,10 @@ accelerate launch --config_file configs/accelerate_deepspeed.yaml \
 ```
 
 The final entry points are `train_pgsr.py` and `evaluate_pgsr.py`. The corresponding CLEAR sparse-attention variant is provided in `train_pgsr_clear.py` and `evaluate_pgsr_clear.py`.
+
+## Acknowledgements
+
+This implementation builds on [Diffusers](https://github.com/huggingface/diffusers), [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev), the [FLUX ControlNet Upscaler](https://huggingface.co/jasperai/Flux.1-dev-Controlnet-Upscaler), and [CLEAR](https://github.com/Huage001/CLEAR).
 
 ## Citation
 

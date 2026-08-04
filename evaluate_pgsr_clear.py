@@ -10,7 +10,7 @@ Automatically detects and loads LoRA adapters when checkpoint contains
 
 Usage:
     CUDA_VISIBLE_DEVICES=0 python evaluate_pgsr_clear.py \
-        --checkpoint checkpoints/dual_control/xxx/best_model.pt \
+        --checkpoint checkpoints/pgsr_clear/best_model.pt \
         --hr_dir Data/DIV2K/DIV2K_valid_HR \
         --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
         --iqa_device cuda \
@@ -549,6 +549,14 @@ def clear_memory(device):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+
+def reset_inference_seed(seed, device):
+    """Reset CPU/CUDA RNGs so timing repeats produce identical outputs."""
+    torch.manual_seed(int(seed))
+    if device.type == 'cuda':
+        torch.cuda.manual_seed_all(int(seed))
+
+
 # ============================================================================
 # Evaluator
 # ============================================================================
@@ -556,15 +564,19 @@ def clear_memory(device):
 class DualStreamEvaluator(nn.Module):
     def __init__(self, model_name, device, checkpoint_path, pixel_weight=1.0,
                  attention_mode='auto',
-                 controlnet_name="jasperai/Flux.1-dev-Controlnet-Upscaler"):
+                 controlnet_name="jasperai/Flux.1-dev-Controlnet-Upscaler",
+                 clear_ckpt_override=None):
         super().__init__()
         self.model_name = model_name
         self.controlnet_name = controlnet_name
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.pixel_weight = pixel_weight
+        self.condition_source = 'fused'
+        self.vae_posterior = 'sample'
         self.attention_mode_requested = attention_mode
         self.attention_mode = 'full'
+        self.clear_ckpt_override = clear_ckpt_override
 
         self.vae = None
         self.transformer = None
@@ -636,7 +648,7 @@ class DualStreamEvaluator(nn.Module):
         # CPU to avoid GPU memory pressure; the full ckpt is re-loaded below.
         try:
             _ckpt_peek = torch.load(
-                self.checkpoint_path, map_location='cpu', weights_only=False
+                self.checkpoint_path, map_location='cpu', weights_only=False, mmap=True
             )
             self.use_learnable_text_embed = bool(
                 _ckpt_peek.get('use_learnable_text_embed', False)
@@ -687,7 +699,9 @@ class DualStreamEvaluator(nn.Module):
         self._reset_pixel_fuse_proj_to_identity()
 
         print("Loading checkpoint...")
-        ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
+        ckpt = torch.load(
+            self.checkpoint_path, map_location='cpu', weights_only=False, mmap=True
+        )
 
         if 'pixel_extractor' in ckpt:
             state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
@@ -708,6 +722,11 @@ class DualStreamEvaluator(nn.Module):
 
         if 'pixel_weight' in ckpt:
             self.pixel_weight = ckpt['pixel_weight']
+        self.condition_source = ckpt.get('condition_source', 'fused')
+        if self.condition_source not in {'fused', 'pixel_only', 'latent_only'}:
+            raise RuntimeError(
+                f"Unsupported checkpoint condition_source: {self.condition_source}"
+            )
         self.conditioning_scale = ckpt.get('conditioning_scale', 1.0)
         self.strength = ckpt.get('strength', 0.7)
         self.control_guidance_start = ckpt.get('control_guidance_start', 0.0)
@@ -733,6 +752,7 @@ class DualStreamEvaluator(nn.Module):
 
         print(f"Checkpoint: epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', 0):.2f}")
         print(f"Pixel Weight: {self.pixel_weight}, Strength: {self.strength}")
+        print(f"Condition Source: {self.condition_source}")
         print(f"Pixel Fusion: {self.fusion_description()}")
         print(f"Train LPIPS: weight={self.train_lpips_weight}, prob={self.train_lpips_apply_prob}")
         if self.train_data.get('train_hr_dir'):
@@ -899,6 +919,9 @@ class DualStreamEvaluator(nn.Module):
         else:
             print("[TextEmbed] inactive (checkpoint trained with cached empty T5)")
 
+        del ckpt
+        clear_memory(self.device)
+
     def _reset_pixel_fuse_proj_to_identity(self):
         """Identity-initialize the native 16-channel pixel projection."""
         if self.pixel_fuse_proj is None:
@@ -976,13 +999,17 @@ class DualStreamEvaluator(nn.Module):
         """Load official CLEAR attention projection weights when requested."""
         if not bool(clear_cfg.get('load_attn_weights', False)):
             return
-        clear_ckpt = clear_cfg.get('ckpt', None)
+        clear_ckpt = self.clear_ckpt_override or clear_cfg.get('ckpt', None)
         if not clear_ckpt:
-            print("[CLEAR][WARN] load_attn_weights=True but clear_config has no ckpt path.")
-            return
+            raise RuntimeError(
+                "CLEAR attention weights are required but no checkpoint was provided. "
+                "Pass --clear_ckpt with the matching official CLEAR safetensors file."
+            )
         if not os.path.exists(clear_ckpt):
-            print(f"[CLEAR][WARN] official attention weights not found: {clear_ckpt}")
-            return
+            raise FileNotFoundError(
+                f"CLEAR attention weights not found: {clear_ckpt}. "
+                "Pass --clear_ckpt with the matching official checkpoint."
+            )
 
         from safetensors.torch import load_file
         clear_weights = load_file(clear_ckpt)
@@ -1192,7 +1219,8 @@ class DualStreamEvaluator(nn.Module):
 
     @torch.no_grad()
     def encode(self, img):
-        lat = self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample()
+        posterior = self.vae.encode(img.to(self.vae.dtype)).latent_dist
+        lat = posterior.mode() if self.vae_posterior == 'mode' else posterior.sample()
         if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
             lat = (lat - self.vae.config.shift_factor) * self.vae.config.scaling_factor
         else:
@@ -1315,10 +1343,15 @@ class DualStreamEvaluator(nn.Module):
         # Native gated residual fusion, identical to train_pgsr.
         projected = self.pixel_fuse_proj(pixel_feat.to(dtype))
         gate = torch.sigmoid(self.pixel_gate_logit.float()).to(dtype)
-        fused_cond = (
-            lr_lat.to(dtype) + self.pixel_weight * gate * projected
-        ).to(dtype)
-        del pixel_feat, projected
+        pixel_cond = self.pixel_weight * gate * projected
+        if self.condition_source == 'fused':
+            fused_cond = lr_lat.to(dtype) + pixel_cond
+        elif self.condition_source == 'pixel_only':
+            fused_cond = pixel_cond
+        else:
+            fused_cond = lr_lat.to(dtype)
+        fused_cond = fused_cond.to(dtype)
+        del pixel_feat, projected, pixel_cond
 
         # FLUX pack() requires even latent H/W. RealSR can produce odd latent sizes.
         noisy_for_pack, pad_h, pad_w = self._pad_to_even_hw(noisy.to(dtype))
@@ -1431,10 +1464,12 @@ class DualStreamEvaluator(nn.Module):
 
         noise = torch.randn_like(lr_lat)
 
-        # Use official scale_noise
+        # Use official scale_noise. Pixel-only checkpoints must not receive an
+        # LR-latent shortcut through img2img initialization.
         timestep_batch = timesteps[:1].expand(B)
-        latents = self.scheduler.scale_noise(lr_lat, timestep_batch, noise)
-        del noise
+        init_sample = torch.zeros_like(lr_lat) if self.condition_source == 'pixel_only' else lr_lat
+        latents = self.scheduler.scale_noise(init_sample, timestep_batch, noise)
+        del noise, init_sample
 
         # Denoising loop
         total_steps = len(timesteps)
@@ -1570,7 +1605,7 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
 def run_sr_tiled_with_oom_retry(
     evaluator, lr_t, device, num_steps=20, guidance=3.5,
     tile_size=640, overlap=64, strength=0.7,
-    min_tile_size=256
+    min_tile_size=256, seed=None
 ):
     """
     OOM-safe tiled inference:
@@ -1581,6 +1616,8 @@ def run_sr_tiled_with_oom_retry(
     last_err = None
     while current_tile >= min_tile_size:
         try:
+            if seed is not None:
+                reset_inference_seed(seed, device)
             clear_memory(device)
             return run_sr_tiled(
                 evaluator, lr_t, device, num_steps=num_steps, guidance=guidance,
@@ -1610,7 +1647,7 @@ def run_sr_tiled_with_oom_retry(
 def run_sr_timed(
     evaluator, lr_t, device, num_steps=20, guidance=3.5,
     tile_size=640, overlap=64, strength=0.7, min_tile_size=256,
-    warmup=0, repeats=1,
+    warmup=0, repeats=1, seed=42,
 ):
     """Run tiled SR with optional warmup/repeats and synchronized timing."""
     warmup = max(0, int(warmup))
@@ -1621,7 +1658,7 @@ def run_sr_timed(
         tmp = run_sr_tiled_with_oom_retry(
             evaluator, lr_t, device, num_steps=num_steps, guidance=guidance,
             tile_size=tile_size, min_tile_size=min_tile_size,
-            overlap=overlap, strength=strength,
+            overlap=overlap, strength=strength, seed=seed,
         )
         del tmp
         clear_memory(device)
@@ -1648,7 +1685,7 @@ def run_sr_timed(
         result = run_sr_tiled_with_oom_retry(
             evaluator, lr_t, device, num_steps=num_steps, guidance=guidance,
             tile_size=tile_size, min_tile_size=min_tile_size,
-            overlap=overlap, strength=strength,
+            overlap=overlap, strength=strength, seed=seed,
         )
         if device.type == 'cuda':
             end_event.record()
@@ -1692,6 +1729,7 @@ def main():
                         help='Optional HR directory. Omit for speed-only LR evaluation.')
     parser.add_argument('--lr_dir', type=str, required=True)
     parser.add_argument('--model_name', type=str, default='black-forest-labs/FLUX.1-dev')
+    parser.add_argument('--controlnet_name', type=str, default='jasperai/Flux.1-dev-Controlnet-Upscaler')
     parser.add_argument('--attention_mode', type=str, default='auto',
                         choices=['auto', 'clear', 'full'],
                         help='auto uses CLEAR when the checkpoint has CLEAR state; '
@@ -1699,6 +1737,9 @@ def main():
     parser.add_argument('--clear_window_size_override', type=int, default=None,
                         help='Override CLEAR local window size at evaluation time. '
                              'Only affects --attention_mode=clear; useful for speed ablations.')
+    parser.add_argument('--clear_ckpt', type=str, default=None,
+                        help='Path to the matching official CLEAR safetensors checkpoint. '
+                             'Overrides the path recorded in the PGSR checkpoint.')
     parser.add_argument('--input_scale', type=int, default=4,
                         help='When --hr_dir is omitted, upsample LR by this factor before SR.')
     parser.add_argument('--benchmark_square_size', type=int, default=0,
@@ -1710,6 +1751,10 @@ def main():
 
     parser.add_argument('--num_steps', type=int, default=20)
     parser.add_argument('--guidance', type=float, default=3.5)
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Base random seed; image i uses seed+i.')
+    parser.add_argument('--vae_posterior', choices=['sample', 'mode'], default='sample',
+                        help='Use the training-matched sampled VAE posterior or deterministic mode.')
     parser.add_argument('--pixel_weight', type=float, default=None)
     parser.add_argument('--strength', type=float, default=None,
                         help='Inference start strength (omit to use checkpoint value)')
@@ -1797,6 +1842,21 @@ def main():
         parser.error("--timing_warmup must be >= 0")
     if args.timing_repeats < 1:
         parser.error("--timing_repeats must be >= 1")
+    if args.num_steps < 1:
+        parser.error("--num_steps must be >= 1")
+    if args.strength is not None and not (0.0 < args.strength <= 1.0):
+        parser.error("--strength must be within (0, 1]")
+    if args.tile_size < 1 or args.min_tile_size < 1:
+        parser.error("--tile_size and --min_tile_size must be >= 1")
+    if args.min_tile_size > args.tile_size:
+        parser.error("--min_tile_size must be <= --tile_size")
+    if args.overlap < 0:
+        parser.error("--overlap must be >= 0")
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     has_hr = bool(args.hr_dir)
@@ -1814,8 +1874,11 @@ def main():
     evaluator = DualStreamEvaluator(
         args.model_name, device, args.checkpoint, initial_pixel_weight,
         attention_mode=args.attention_mode,
+        controlnet_name=args.controlnet_name,
+        clear_ckpt_override=args.clear_ckpt,
     )
     evaluator.load()
+    evaluator.vae_posterior = args.vae_posterior
 
     if args.clear_window_size_override is not None:
         if args.clear_window_size_override < 1:
@@ -1833,6 +1896,8 @@ def main():
         evaluator.pixel_weight = args.pixel_weight
 
     strength = args.strength if args.strength is not None else evaluator.strength
+    if not (0.0 < strength <= 1.0):
+        parser.error(f"Effective strength must be within (0, 1], got {strength}")
     control_guidance_start = (
         args.control_guidance_start
         if args.control_guidance_start is not None
@@ -1864,6 +1929,8 @@ def main():
             f"_step{args.num_steps}"
             f"_g{_fmt_tag(args.guidance)}"
             f"_pw{_fmt_tag(evaluator.pixel_weight)}"
+            f"_seed{args.seed}"
+            f"_vae{args.vae_posterior}"
             f"_cgs{_fmt_tag(control_guidance_start)}"
             f"_cge{_fmt_tag(control_guidance_end)}"
             f"_attn{evaluator.attention_mode}"
@@ -1903,6 +1970,7 @@ def main():
     print(f"Pixel Weight: {evaluator.pixel_weight}")
     print(f"Train LPIPS: weight={evaluator.train_lpips_weight}, prob={evaluator.train_lpips_apply_prob}")
     print(f"Steps: {args.num_steps}, Guidance: {args.guidance}")
+    print(f"Seed: {args.seed}, VAE posterior: {args.vae_posterior}")
     print(f"Attention: {evaluator.attention_mode} (requested={args.attention_mode})")
     print(f"Timing: warmup={args.timing_warmup}, repeats={args.timing_repeats}")
     if args.benchmark_square_size > 0:
@@ -1993,7 +2061,7 @@ def main():
     filenames = []
     timing_rows = []
 
-    for eval_name in tqdm(eval_files, desc="Evaluating"):
+    for image_index, eval_name in enumerate(tqdm(eval_files, desc="Evaluating")):
         if has_hr:
             hf = eval_name
             base_name = os.path.splitext(hf)[0]
@@ -2053,8 +2121,10 @@ def main():
             strength=strength,
             warmup=args.timing_warmup,
             repeats=args.timing_repeats,
+            seed=args.seed + image_index,
         )
         timing['filename'] = base_name
+        timing['seed'] = args.seed + image_index
         timing['height'] = int(H)
         timing['width'] = int(W)
         timing_rows.append(timing)
@@ -2236,6 +2306,9 @@ def main():
         f.write(f"Strength: {strength}\n")
         f.write(f"Control Guidance Window: [{control_guidance_start}, {control_guidance_end}]\n")
         f.write(f"Pixel Weight: {evaluator.pixel_weight}\n")
+        f.write(f"Condition Source: {evaluator.condition_source}\n")
+        f.write(f"Seed: {args.seed}\n")
+        f.write(f"VAE Posterior: {args.vae_posterior}\n")
         f.write(f"Attention Mode: {evaluator.attention_mode} (requested={args.attention_mode})\n")
         if evaluator.use_clear:
             f.write(
@@ -2398,6 +2471,22 @@ def main():
         'has_hr': has_hr,
         'attention_mode': evaluator.attention_mode,
         'attention_mode_requested': args.attention_mode,
+        'inference': {
+            'seed': args.seed,
+            'vae_posterior': args.vae_posterior,
+            'num_steps': args.num_steps,
+            'guidance': args.guidance,
+            'strength': strength,
+            'condition_source': evaluator.condition_source,
+            'pixel_weight': evaluator.pixel_weight,
+            'control_guidance_start': control_guidance_start,
+            'control_guidance_end': control_guidance_end,
+            'clear_checkpoint': (
+                evaluator.clear_ckpt_override
+                or evaluator.clear_config.get('ckpt')
+                if evaluator.use_clear else None
+            ),
+        },
         'timing': {
             'warmup': args.timing_warmup,
             'repeats': args.timing_repeats,

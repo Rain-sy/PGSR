@@ -4,62 +4,18 @@
 PGSR + CLEAR Local Attention (DFM + Gated Fusion + LoRA + CLEAR)
 ======================================================================
 
-Variant of ``train_dual_dfm_v2.py``: keeps the full PGSR architecture
-(gated pixel fusion + DFM adapters + ControlNet + LoRA) and additionally
-swaps FLUX transformer's full self-attention for CLEAR local-window
-attention. CLEAR processor weights themselves are frozen (loaded from a
-pretrained safetensors checkpoint); only LoRA, ControlNet, the pixel
-branch, and DFM adapters are trained.
+Sparse-attention variant of ``train_pgsr.py``. It retains the complete
+PGSR architecture and replaces FLUX attention processors with CLEAR
+local-window attention. The matching official CLEAR safetensors checkpoint
+provides distilled attention projections and sampler initialization; sampler
+modules can be fine-tuned or frozen.
 
-Differences relative to train_dual_dfm_v2.py:
-  * New CLI: ``--window_size``, ``--down_factor``, ``--clear_ckpt``,
-    ``--use_clear/--no_use_clear``.
-  * After LoRA injection, the transformer dual-block attention
-    processors are replaced with LocalDownsample/Local FlexAttn
-    variants from ``CLEAR/attention_processor.py``. Single transformer
-    blocks keep their default processor (CLEAR ckpt only ships dual
-    blocks).
-  * CLEAR processor parameters set to ``requires_grad_(False)``; LoRA
-    on attn.to_q / attn.to_k still receives gradient because CLEAR's
-    processor calls ``attn.to_q(x)`` / ``attn.to_k(x)`` via forward.
-  * Training resolution is constrained to 512 (CLEAR mask fixed at
-    32x32 patches). Other resolutions need a different mask init.
+The attention mask is initialized from the configured training resolution,
+which must be divisible by 16 times the CLEAR downsample factor. Checkpoints
+store the trained CLEAR sampler state, while the official CLEAR projection
+weights remain an explicit external dependency for evaluation.
 
-Below: original v2 docstring kept for reference.
-====================================================================
-
-Original v2 design notes (gated fusion vs concat):
-the Level-1 pixel fusion is switched from concat+1x1 back to the
-original legacy *gated residual add*:
-
-    fused_cond = lr_lat + pixel_weight * sigmoid(pixel_gate_logit)
-                          * pixel_fuse_proj(pixel_feat)
-
-Rationale: in concat+identity-init fusion, the pixel-slice of
-``pixel_fuse_proj`` is zero-init, so the pixel branch contributes
-nothing at step 0 and has to slowly grow ``W_px`` before it starts
-helping. Gated fusion with ``pixel_gate_init`` > 0 (default 4 →
-sigmoid = 0.98) starts with the pixel branch ~fully open at step 1,
-which observationally gives 2-3 dB faster PSNR convergence in the
-early epochs.
-
-Everything else (PixelFeatureExtractor stage1/stage2/stage3, DFM
-adapters, dataset, scheduler, LoRA, loss, resume, eval) is kept
-identical to train_dual_dfm.py so A/B comparisons isolate the fusion
-change.
-
-Checkpoints saved by this file set ``fusion_type='gated'`` and store a
-``pixel_gate_logit`` scalar. On resume they best-effort migrate from
-concat-layout DFM checkpoints (lr_lat identity on the first 16 input
-channels is stripped; W_px slice is folded into the 16x16 conv).
-
-This is the NEW training entry.
-- Supports `--degrade_mode {paired, bicubic, realesrgan}`
-- `realesrgan` mode performs on-the-fly second-order degradation from HR patches
-- Keeps scheduler semantics aligned with official FlowMatch usage
-- FLUX LoRA training is enabled by default
-
-Typical commands (DF2K → Mix16K workflow):
+Typical commands (DF2K -> mixed HR corpus):
 
     NOTE on resume semantics:
     - default `--epochs_mode absolute` (backward compatible): --epochs is target absolute epoch.
@@ -69,29 +25,29 @@ Typical commands (DF2K → Mix16K workflow):
 
 1) Stage 1: paired bicubic pretraining on DF2K
     accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
-        train_dual_dfm_v2.py \
+        train_pgsr_clear.py \
         --hr_dir Data/DF2K_HR \
         --lr_dir Data/DF2K_LR_bicubic_X4 \
         --degrade_mode paired --scale 4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --batch_size 4 --epochs 40 --num_crops 2 --lr 1e-5 \
+        --batch_size 4 --epochs 60 --num_crops 2 --lr 1e-5 \
         --warmup_epochs 5 \
         --strength 1 \
         --lpips_weight 0 \
         --empty_cache_steps 50
 
-2) Stage 2: realesrgan degradation fine-tuning on Mix16K
+2) Stage 2: Real-ESRGAN degradation fine-tuning on the mixed HR corpus
     accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
-        train_dual_dfm_v2.py \
-        --hr_dir Data/Mix16K_HR \
-        --lr_dir Data/Mix16K_LR_bicubic_X4 \
+        train_pgsr_clear.py \
+        --hr_dir Data/Mixed_HR \
         --degrade_mode realesrgan --scale 4 \
-        --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
-        --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --resume checkpoints/dual_dfm/<stage1_exp>/best_model.pt \
+        --val_hr_dir Data/RealSR_test/HR \
+        --val_lr_dir Data/RealSR_test/LR_X4 \
+        --resume checkpoints/pgsr_clear/<stage1_exp>/best_model.pt \
         --epochs_mode stage \
-        --reset_pixel_gate \
+        --best_metric lpips --val_calc_lpips --reset_best_on_resume \
+        --reset_pixel_gate --reset_text_embed \
         --controlnet_lr_scale 0.1 \
         --batch_size 4 --epochs 20 --num_crops 2 --lr 5e-6 \
         --warmup_epochs 2 \
@@ -104,6 +60,8 @@ Typical commands (DF2K → Mix16K workflow):
 
 
 import os
+import json
+import time
 import warnings
 
 # Match the original CLEAR training runtime: these must be set before torch is
@@ -2451,6 +2409,7 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
         'best_metric': best_metric,
         'best_metric_value': best_metric_value,
         'pixel_weight': pixel_weight,
+        'condition_source': 'fused',
         'conditioning_scale': unwrapped.conditioning_scale,
         'strength': strength,
         'lpips_weight': lpips_weight,
@@ -2516,7 +2475,11 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
 
     # Learnable residual text delta (always present in this script).
     if getattr(unwrapped, 'learnable_text_delta', None) is not None:
+        payload['use_learnable_text_embed'] = True
         payload['learnable_text_delta'] = unwrapped.learnable_text_delta.detach().cpu()
+        payload['learnable_text_embed'] = (
+            unwrapped.get_effective_text_embed(dtype=torch.float32).detach().cpu()
+        )
         payload['text_embed_format'] = 'residual_delta_v1'
         payload['text_embed_tokens'] = int(unwrapped.text_embed_tokens)
         payload['text_embed_scale'] = float(unwrapped.text_embed_scale)
@@ -2550,7 +2513,7 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Dual-Stream FLUX SR Training (Official Scheduler)')
+    parser = argparse.ArgumentParser(description='PGSR + CLEAR FLUX SR Training')
 
     # Data
     parser.add_argument('--hr_dir', type=str, required=True)
@@ -2589,7 +2552,7 @@ def main():
     parser.add_argument('--use_clear', dest='use_clear', action='store_true', default=True,
                         help='Enable CLEAR local-window attention on FLUX dual blocks.')
     parser.add_argument('--no_use_clear', dest='use_clear', action='store_false',
-                        help='Disable CLEAR; behaves identically to train_dual_dfm_v2.py.')
+                        help='Disable CLEAR; use standard FLUX full attention.')
     parser.add_argument('--clear_window_size', type=int, default=16,
                         help='CLEAR local attention window size (in patches).')
     parser.add_argument('--clear_down_factor', type=int, default=4,
@@ -2705,7 +2668,7 @@ def main():
                              'use when you want to tune DFM without perturbing the diffusion '
                              'backbone (e.g. frozen Stage-2).')
     # Checkpointing
-    parser.add_argument('--save_dir', type=str, default='./checkpoints/dual_dfmv2')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints/pgsr_clear')
     parser.add_argument('--save_interval', type=int, default=10)
     parser.add_argument('--val_interval', type=int, default=1)
     parser.add_argument('--resume', type=str, default=None)
@@ -2728,17 +2691,53 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--train_controlnet', action='store_true', default=True)
     parser.add_argument('--freeze_controlnet', action='store_true', default=False)
+    parser.add_argument('--benchmark_steps', type=int, default=0,
+                        help='Measure synchronized training iterations, then exit.')
+    parser.add_argument('--benchmark_warmup_steps', type=int, default=10)
+    parser.add_argument('--benchmark_output', type=str, default=None)
 
     args = parser.parse_args()
 
     if args.scale < 1:
         parser.error("--scale must be >= 1")
+    if args.resolution < 1:
+        parser.error("--resolution must be >= 1")
     if args.epochs < 1:
         parser.error("--epochs must be >= 1")
+    if args.batch_size < 1 or args.num_crops < 1:
+        parser.error("--batch_size and --num_crops must be >= 1")
+    if args.val_num_steps < 1 or args.val_interval < 1 or args.save_interval < 1:
+        parser.error("--val_num_steps, --val_interval, and --save_interval must be >= 1")
+    if not (0.0 < args.strength <= 1.0):
+        parser.error("--strength must be within (0, 1]")
+    if not (0.0 <= args.control_guidance_start <= args.control_guidance_end <= 1.0):
+        parser.error("--control_guidance_start/end must satisfy 0 <= start <= end <= 1")
+    if args.text_embed_tokens < 1:
+        parser.error("--text_embed_tokens must be >= 1")
+    if args.text_embed_scale <= 0 or args.text_embed_lr <= 0 or args.text_embed_l2 < 0:
+        parser.error("--text_embed_scale/lr must be > 0 and --text_embed_l2 must be >= 0")
     if args.resolution % args.scale != 0:
         parser.error("--resolution must be divisible by --scale")
     if args.controlnet_lr_scale < 0:
         parser.error("--controlnet_lr_scale must be >= 0")
+    if args.benchmark_steps < 0 or args.benchmark_warmup_steps < 0:
+        parser.error("--benchmark_steps and --benchmark_warmup_steps must be >= 0")
+    if args.benchmark_steps > 0 and not args.benchmark_output:
+        parser.error("--benchmark_output is required when --benchmark_steps > 0")
+    if args.use_clear:
+        if args.clear_window_size < 1 or args.clear_down_factor < 1:
+            parser.error("--clear_window_size and --clear_down_factor must be >= 1")
+        clear_multiple = 16 * args.clear_down_factor
+        if args.resolution % clear_multiple != 0:
+            parser.error(
+                f"--resolution must be divisible by {clear_multiple} "
+                "for the configured CLEAR downsample factor"
+            )
+        if args.clear_load_attn_weights and not os.path.isfile(args.clear_ckpt):
+            parser.error(
+                "--clear_ckpt must point to the matching official CLEAR "
+                "safetensors file when --clear_load_attn_weights is enabled"
+            )
     if args.lpips_max_sigma < 0:
         parser.error("--lpips_max_sigma must be >= 0")
     if args.real_paired_repeat < 1:
@@ -3175,17 +3174,20 @@ def main():
     if args.resume:
         if is_main:
             print(f"[Resume] Loading from {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        # Keep the full checkpoint (including optimizer state) off each GPU.
+        # load_state_dict copies tensors into the prepared modules as needed.
+        ckpt = torch.load(
+            args.resume, map_location='cpu', weights_only=False, mmap=True
+        )
 
         unwrapped = accelerator.unwrap_model(system)
         if 'pixel_extractor' in ckpt:
             state = _strip_module_prefix(ckpt['pixel_extractor'])
             if any(k.startswith("encoder.") for k in state.keys()):
                 raise RuntimeError(
-                    "[Resume] Incompatible pixel_extractor checkpoint format: found legacy "
-                    "'encoder.*' keys from train_dual_control.py, but train_dual_dfm.py "
-                    "expects 'stage*' keys. Please resume from a train_dual_dfm checkpoint "
-                    "or start a fresh run."
+                    "[Resume] Incompatible pixel_extractor checkpoint format: "
+                    "final PGSR trainers require stage-grouped 'stage*' keys. "
+                    "Use a final PGSR checkpoint or start a fresh run."
                 )
             unwrapped.pixel_extractor.load_state_dict(state, strict=True)
         _load_pixel_fuse_proj_with_migration(unwrapped, ckpt, is_main=is_main)
@@ -3372,6 +3374,9 @@ def main():
                 lpips_msg = f", best LPIPS: {best_lpips:.4f}" if np.isfinite(best_lpips) else ""
                 print(f"[Resume] Starting from epoch {start_epoch}, best PSNR: {best_psnr:.2f}{lpips_msg}")
 
+        del ckpt
+        gc.collect()
+
     # Log file
     log_path = os.path.join(save_dir, 'training_log.txt')
     if is_main:
@@ -3460,6 +3465,9 @@ def main():
     # Resume global_step so empty_cache cycles and any step-indexed logic stay
     # consistent across restarts; 0 on a fresh run.
     global_step = resumed_global_step if args.resume else 0
+    benchmark_seen = 0
+    benchmark_elapsed = 0.0
+    benchmark_measured = 0
     if args.resume and is_main:
         print(f"[Resume] global_step resumed at {global_step}")
 
@@ -3497,6 +3505,19 @@ def main():
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{end_epoch}", disable=not is_main)
 
         for batch in pbar:
+            benchmark_measure = (
+                args.benchmark_steps > 0 and
+                benchmark_seen >= args.benchmark_warmup_steps)
+            if (args.benchmark_steps > 0 and
+                    benchmark_seen == args.benchmark_warmup_steps and
+                    device.type == 'cuda'):
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
+            if benchmark_measure:
+                if device.type == 'cuda':
+                    torch.cuda.synchronize(device)
+                benchmark_start = time.perf_counter()
+
             hr = batch['hr'].to(device).to(torch.bfloat16)
             lr = batch['lr'].to(device).to(torch.bfloat16)
 
@@ -3525,6 +3546,12 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
+            if benchmark_measure:
+                if device.type == 'cuda':
+                    torch.cuda.synchronize(device)
+                benchmark_elapsed += time.perf_counter() - benchmark_start
+                benchmark_measured += 1
+
             loss_item = loss.item()
             epoch_losses.append(loss_item)
             postfix = {'loss': f'{loss_item:.4f}', 'lr': f'{lr_scheduler.get_last_lr()[0]:.2e}'}
@@ -3538,6 +3565,42 @@ def main():
                 gc.collect()
                 if device.type == 'cuda':
                     torch.cuda.empty_cache()
+            benchmark_seen += 1
+
+            if args.benchmark_steps > 0 and benchmark_measured >= args.benchmark_steps:
+                peak_bytes = torch.cuda.max_memory_allocated(device) if device.type == 'cuda' else 0
+                values = torch.tensor([benchmark_elapsed, float(peak_bytes)],
+                                      device=device, dtype=torch.float64)
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.MAX)
+                result = {
+                    'method': 'PGSR + sparse attention',
+                    'time_per_iteration_s': values[0].item() / benchmark_measured,
+                    'peak_memory_gib_per_gpu': values[1].item() / (1024 ** 3),
+                    'measured_iterations': benchmark_measured,
+                    'warmup_iterations': args.benchmark_warmup_steps,
+                    'resolution': args.resolution,
+                    'batch_size_per_gpu': args.batch_size,
+                    'world_size': accelerator.num_processes,
+                    'effective_batch_size': args.batch_size * accelerator.num_processes * grad_accum_steps,
+                    'gradient_accumulation_steps': grad_accum_steps,
+                    'mixed_precision': 'bf16',
+                    'degrade_mode': args.degrade_mode,
+                    'clear_window_size': args.clear_window_size,
+                    'clear_down_factor': args.clear_down_factor,
+                }
+                if is_main:
+                    os.makedirs(os.path.dirname(os.path.abspath(args.benchmark_output)), exist_ok=True)
+                    with open(args.benchmark_output, 'w') as f:
+                        json.dump(result, f, indent=2)
+                        f.write('\n')
+                    print(f"[Benchmark] {json.dumps(result, sort_keys=True)}")
+                accelerator.wait_for_everyone()
+                try:
+                    accelerator.end_training()
+                except Exception:
+                    pass
+                return
 
         avg_loss = np.mean(epoch_losses)
 

@@ -4,59 +4,18 @@
 PGSR FLUX SR ControlNet Training -- DFM + Gated Fusion + Text
 ======================================================================
 
-A/B variant of ``train_dual_dfm_v2.py``. Inherits the v2 architecture
-(stage-grouped PixelFeatureExtractor, gated residual Level-1 fusion,
-DFM adapters at decoder up_blocks) and adds **one new component**:
+PGSR combines a pretrained FLUX restoration ControlNet with pre-VAE pixel
+features. Pixel evidence is fused into the latent condition through a gated
+residual path and injected into the frozen VAE decoder through DFM adapters.
+The FLUX backbone is frozen and adapted with LoRA; a small residual over the
+cached empty T5 prompt provides a task-specific SR prior.
 
-    encoder_hidden_states <- empty T5 + scale * learnable residual delta
-    learnable_text_delta  <- nn.Parameter (1, N, 4096), zero-init
+The script supports paired bicubic pretraining and on-the-fly second-order
+Real-ESRGAN degradation. Checkpoints contain the ControlNet, Pixel Extractor,
+gated fusion, DFM adapters, LoRA weights, and residual text prior required by
+``evaluate_pgsr.py``.
 
-i.e., the cached empty-string T5 prompt fed into FLUX
-``encoder_hidden_states`` is preserved, but the first N T5 tokens receive a
-small learned residual. The residual is zero-initialized so step-0 forward is
-bit-identical to the v2 baseline; from step 1 onwards the network can learn a
-task-specific SR prior without a natural-language prompt and without fully
-rewriting the text branch.
-
-Other text-branch inputs are NOT changed (per the FLUX MMDiT
-pre-process figure):
-- CLIP `pooled_projections` -> still cached empty-string CLIP pooled
-  (feeds the timestep+guidance temb path)
-- `text_ids` -> still all-zero (1, 512, 3) (feeds the positional
-  embedder together with `img_ids`)
-
-Default param cost: 1*32*4096 = 131,072 fp32 trainables (~0.5 MB) -- small
-next to ControlNet (1.8B) and LoRA. CLIP/T5 encoders are still loaded once at
-startup to seed the cached empty-string prompt and pooled, then dropped --
-identical VRAM profile to v2.
-
-Difference from train_dual_dfm_v2.py:
-    forward(): prompt = empty_t5_prompt + text_embed_scale * learnable_text_delta
-              (instead of self._cached_embeds['prompt'].expand(B,-1,-1))
-Everything else (dataset, scheduler, LoRA, gated fusion, DFM adapters,
-loss, resume, eval) is kept identical so A/B vs train_dual_dfm_v2.py
-isolates the learnable text embedding contribution.
-
-Checkpoints saved by this file additionally store:
-    use_learnable_text_embed = True
-    text_embed_format        = residual_delta_v1
-    learnable_text_delta     = (1, N, 4096) fp32 tensor
-    learnable_text_embed     = effective full prompt for eval compatibility
-    text_embed_freeze        = bool (mirrors --freeze_text_embed)
-
-Resume from a v2 checkpoint (no text prior key): keeps zero delta -> equivalent
-to v2 at step 0, then learns. Resume from older full-prompt train_text
-checkpoints converts the first N tokens to residual delta.
-
-This is the PGSR training entry for the text-embed variant.
-- Supports `--degrade_mode {paired, bicubic, realesrgan}`
-- `realesrgan` mode performs on-the-fly second-order degradation from HR patches
-- Keeps scheduler semantics aligned with official FlowMatch usage
-- FLUX LoRA training is enabled by default
-- Residual learnable text prior is ALWAYS ON in this script (the whole point
-  of the variant). Use --freeze_text_embed for ablation.
-
-Typical commands (DF2K -> Mix16K workflow):
+Typical commands (DF2K -> mixed HR corpus):
 
     NOTE on resume semantics:
     - default `--epochs_mode absolute` (backward compatible): --epochs is target absolute epoch.
@@ -72,22 +31,22 @@ Typical commands (DF2K -> Mix16K workflow):
         --degrade_mode paired --scale 4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --batch_size 4 --epochs 40 --num_crops 2 --lr 1e-5 \
+        --batch_size 4 --epochs 60 --num_crops 2 --lr 1e-5 \
         --warmup_epochs 5 \
         --strength 1 \
         --lpips_weight 0 \
         --empty_cache_steps 50
 
-2) Stage 2: realesrgan degradation fine-tuning on Mix16K
+2) Stage 2: Real-ESRGAN degradation fine-tuning on the mixed HR corpus
     accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
         train_pgsr.py \
-        --hr_dir Data/Mix16K_HR \
-        --lr_dir Data/Mix16K_LR_bicubic_X4 \
+        --hr_dir Data/Mixed_HR \
         --degrade_mode realesrgan --scale 4 \
-        --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
-        --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --resume checkpoints/dual_text/<stage1_exp>/best_model.pt \
+        --val_hr_dir Data/RealSR_test/HR \
+        --val_lr_dir Data/RealSR_test/LR_X4 \
+        --resume checkpoints/pgsr/<stage1_exp>/best_model.pt \
         --epochs_mode stage \
+        --best_metric lpips --val_calc_lpips --reset_best_on_resume \
         --reset_pixel_gate --reset_text_embed \
         --controlnet_lr_scale 0.1 \
         --batch_size 4 --epochs 20 --num_crops 2 --lr 5e-6 \
@@ -2420,7 +2379,7 @@ def main():
                              'use when you want to tune DFM without perturbing the diffusion '
                              'backbone (e.g. frozen Stage-2).')
     # Checkpointing
-    parser.add_argument('--save_dir', type=str, default='./checkpoints/dual_text')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints/pgsr')
     parser.add_argument('--save_interval', type=int, default=10)
     parser.add_argument('--val_interval', type=int, default=1)
     parser.add_argument('--resume', type=str, default=None)
@@ -2487,8 +2446,18 @@ def main():
 
     if args.scale < 1:
         parser.error("--scale must be >= 1")
+    if args.resolution < 1:
+        parser.error("--resolution must be >= 1")
     if args.epochs < 1:
         parser.error("--epochs must be >= 1")
+    if args.batch_size < 1 or args.num_crops < 1:
+        parser.error("--batch_size and --num_crops must be >= 1")
+    if args.val_num_steps < 1 or args.val_interval < 1 or args.save_interval < 1:
+        parser.error("--val_num_steps, --val_interval, and --save_interval must be >= 1")
+    if not (0.0 < args.strength <= 1.0):
+        parser.error("--strength must be within (0, 1]")
+    if not (0.0 <= args.control_guidance_start <= args.control_guidance_end <= 1.0):
+        parser.error("--control_guidance_start/end must satisfy 0 <= start <= end <= 1")
     if args.resolution % args.scale != 0:
         parser.error("--resolution must be divisible by --scale")
     if args.controlnet_lr_scale < 0:
@@ -2895,7 +2864,9 @@ def main():
             print(f"[Resume] Loading from {args.resume}")
         # Keep the full checkpoint (including optimizer state) off each GPU.
         # load_state_dict copies tensors into the prepared modules as needed.
-        ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
+        ckpt = torch.load(
+            args.resume, map_location='cpu', weights_only=False, mmap=True
+        )
 
         unwrapped = accelerator.unwrap_model(system)
         if 'condition_source' in ckpt:
@@ -2926,10 +2897,9 @@ def main():
             state = _strip_module_prefix(ckpt['pixel_extractor'])
             if any(k.startswith("encoder.") for k in state.keys()):
                 raise RuntimeError(
-                    "[Resume] Incompatible pixel_extractor checkpoint format: found legacy "
-                    "'encoder.*' keys from train_dual_control.py, but train_dual_dfm.py "
-                    "expects 'stage*' keys. Please resume from a train_dual_dfm checkpoint "
-                    "or start a fresh run."
+                    "[Resume] Incompatible pixel_extractor checkpoint format: "
+                    "final PGSR trainers require stage-grouped 'stage*' keys. "
+                    "Use a final PGSR checkpoint or start a fresh run."
                 )
             unwrapped.pixel_extractor.load_state_dict(state, strict=True)
         _load_pixel_fuse_proj_with_migration(unwrapped, ckpt, is_main=is_main)
@@ -2992,7 +2962,7 @@ def main():
                             "keeping zero init."
                         )
                 elif is_main:
-                    print("[Resume] Checkpoint has no text prior (likely train_dual_dfm_v2); "
+                    print("[Resume] Checkpoint has no residual text prior; "
                           "using zero residual delta over cached empty-string T5.")
 
         if getattr(args, 'reset_text_embed', False):
