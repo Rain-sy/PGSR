@@ -1,61 +1,54 @@
 # PGSR
 
-Official research code for pixel-grounded image super-resolution with a
-FLUX.1-dev backbone. The repository keeps the final PGSR and PGSR+CLEAR
-training/evaluation entry points at the top level; earlier experimental
-variants are retained under `train/` for reference.
+## When Latents Forget Pixels: Restoring Fidelity in Diffusion Transformer Super-Resolution
 
-## Repository layout
+The official implementation of the paper **"When Latents Forget Pixels: Restoring Fidelity in Diffusion Transformer Super-Resolution."**
 
-```text
-PGSR/
-|-- train_pgsr.py              # final PGSR training
-|-- evaluate_pgsr.py           # final PGSR evaluation
-|-- train_pgsr_clear.py        # PGSR with CLEAR sparse attention
-|-- evaluate_pgsr_clear.py     # PGSR+CLEAR evaluation
-|-- CLEAR/                     # sparse-attention implementation
-|-- configs/                   # Accelerate/DeepSpeed and comparison configs
-|-- download/                  # dataset preparation utilities
-|-- scripts/paper_compare/     # reproducible baseline/evaluation pipeline
-|-- train/                     # archived training/evaluation variants
-|-- Data/                      # local datasets (ignored)
-|-- checkpoints/               # local model weights (ignored)
-|-- outputs/                   # local inference outputs (ignored)
-|-- experiments/               # local experiment outputs (mostly ignored)
-|-- external_baselines/        # local third-party repositories (ignored)
-`-- rebuttal/                  # local rebuttal code/results (ignored)
+PGSR preserves pixel-level evidence from the low-resolution input and uses it to guide both the diffusion trajectory and VAE decoding. The implementation is based on FLUX.1-dev and its super-resolution ControlNet.
+
+> Paper and pretrained checkpoints will be released soon.
+
+## Installation
+
+The code was tested with Python 3.11, PyTorch 2.5.1, Diffusers 0.36.0, Accelerate 0.34.0, Transformers 4.57.5, and PEFT 0.18.1.
+
+```bash
+conda create -n pgsr python=3.11 -y
+conda activate pgsr
+
+pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+pip install diffusers==0.36.0 accelerate==0.34.0 transformers==4.57.5 \
+  peft==0.18.1 deepspeed lpips scikit-image pyiqa
 ```
 
-## Environment
+Access to [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) is required. By default, PGSR initializes its ControlNet from [Flux.1-dev-Controlnet-Upscaler](https://huggingface.co/jasperai/Flux.1-dev-Controlnet-Upscaler).
 
-The final code was tested with Python 3.11, PyTorch 2.5.1+cu121,
-Diffusers 0.36.0, Accelerate 0.34.0, Transformers 4.57.5, and PEFT 0.18.1.
-Training additionally uses DeepSpeed ZeRO-2. LPIPS is optional for training;
-evaluation can additionally use `scikit-image` and `pyiqa`.
+## Data
 
-The default pretrained components are:
-
-- `black-forest-labs/FLUX.1-dev`
-- `jasperai/Flux.1-dev-Controlnet-Upscaler`
-
-Access to FLUX.1-dev must be configured through Hugging Face before the first
-run.
-
-## Dataset preparation
-
-Dataset download and preparation helpers are under `download/`. Prepared data
-is expected under `Data/`, which is intentionally excluded from version
-control.
+Dataset download and preparation utilities are provided in `download/`:
 
 ```bash
 python download/download_datasets.py --help
 python download/build_dataset.py --help
 ```
 
+## Inference
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python evaluate_pgsr.py \
+  --checkpoint checkpoints/pgsr/best_model.pt \
+  --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
+  --hr_dir Data/DIV2K/DIV2K_valid_HR \
+  --num_steps 20 \
+  --iqa_device cuda \
+  --lpips_device cuda
+```
+
+Results and metrics are written to `outputs/`. The HR directory is optional when only restored images are needed.
+
 ## Training
 
-The training script supports paired bicubic data and on-the-fly Real-ESRGAN
-degradation. A typical two-stage workflow is documented in the module header.
+PGSR uses two-stage training: paired bicubic pretraining followed by Real-ESRGAN degradation fine-tuning. The complete commands and resume settings are documented at the top of `train_pgsr.py`.
 
 ```bash
 accelerate launch --config_file configs/accelerate_deepspeed.yaml \
@@ -68,24 +61,8 @@ accelerate launch --config_file configs/accelerate_deepspeed.yaml \
   --scale 4 --resolution 512
 ```
 
-Use `train_pgsr_clear.py` with the same dataset/checkpoint conventions to train
-the sparse-attention variant.
+The final entry points are `train_pgsr.py` and `evaluate_pgsr.py`. The corresponding CLEAR sparse-attention variant is provided in `train_pgsr_clear.py` and `evaluate_pgsr_clear.py`.
 
-## Evaluation
+## Citation
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python evaluate_pgsr.py \
-  --checkpoint checkpoints/pgsr/<run>/best_model.pt \
-  --hr_dir Data/DIV2K/DIV2K_valid_HR \
-  --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-  --num_steps 20
-```
-
-Use `evaluate_pgsr_clear.py` for checkpoints trained with CLEAR. Run any entry
-point with `--help` for the complete option set.
-
-## Local-only material
-
-Datasets, checkpoints, generated outputs, third-party baselines, and all
-rebuttal-specific code/results are ignored by Git. They remain available in
-the local workspace but are not part of the public PGSR repository.
+Citation information will be added with the paper release.
