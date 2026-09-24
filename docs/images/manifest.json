@@ -1,0 +1,66 @@
+{
+  "0492": {
+    "lr_size": [
+      1680,
+      1296
+    ],
+    "output_size": [
+      6720,
+      5184
+    ],
+    "output_crop_xyxy": [
+      3128,
+      2752,
+      3640,
+      3264
+    ],
+    "lr_crop_xyxy": [
+      782,
+      688,
+      910,
+      816
+    ],
+    "display_full_size": [
+      1600,
+      1234
+    ],
+    "display_detail_size": [
+      768,
+      768
+    ],
+    "display_resampling": "bicubic for both methods",
+    "encoding": "lossless WebP"
+  },
+  "0467": {
+    "lr_size": [
+      1680,
+      1584
+    ],
+    "output_size": [
+      6720,
+      6336
+    ],
+    "output_crop_xyxy": [
+      3112,
+      4624,
+      3624,
+      5136
+    ],
+    "lr_crop_xyxy": [
+      778,
+      1156,
+      906,
+      1284
+    ],
+    "display_full_size": [
+      1600,
+      1509
+    ],
+    "display_detail_size": [
+      768,
+      768
+    ],
+    "display_resampling": "bicubic for both methods",
+    "encoding": "lossless WebP"
+  }
+}
