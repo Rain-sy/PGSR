@@ -1,12 +1,10 @@
 <div align="center">
 
-# PGSR
-
-### When Latents Forget Pixels: Restoring Fidelity in Diffusion Transformer Super-Resolution
+# When Latents Forget Pixels: Restoring Fidelity in Diffusion Transformer Super-Resolution
 
 **NeurIPS 2026 · Poster**
 
-[Highlights](#highlights) · [News](#news) · [Visual Results](#visual-results) · [Installation](#installation) · [Inference](#inference) · [Training](#training)
+[Paper (arXiv)](https://arxiv.org/abs/2608.09133) · [Method](#method-overview) · [Visual Results](#visual-results) · [Installation](#installation) · [Inference](#inference) · [Training](#training)
 
 </div>
 
@@ -14,14 +12,15 @@ Official implementation of **Pixel-Grounded Super-Resolution (PGSR)**.
 PGSR preserves pixel-level evidence from the low-resolution input and reuses it
 to guide both the diffusion trajectory and VAE decoding, based on FLUX.1-dev.
 
-![PGSR teaser: input-aligned text and structural details compared with PiSA-SR](assets/teaser.png)
+![PGSR teaser: LR input, without pixel guidance, PGSR, and ground truth](assets/teaser.png)
 
-*From left to right: ground truth, LR input, PiSA-SR, and PGSR. Zoomed regions highlight text and fine structural details.*
+*From left to right: LR input, restoration without pixel guidance, PGSR (ours), and ground truth. Zoomed regions highlight text and fine structural details.*
 
 ## News
 
-- **Coming soon:** PGSR checkpoints and the public paper link.
+- **Coming soon:** PGSR checkpoints.
 - **2026-09:** PGSR accepted to **NeurIPS 2026 as a poster**!
+- **2026-08-10:** Our [paper](https://arxiv.org/abs/2608.09133) is available on arXiv.
 - **2026-08-03:** Training and evaluation code organized for release.
 
 ## Highlights
@@ -30,7 +29,18 @@ to guide both the diffusion trajectory and VAE decoding, based on FLUX.1-dev.
 - **Decoder-side grounding:** inject multi-scale pixel features into the frozen VAE decoder.
 - **Sparse attention:** an optional local-window variant, adapted from CLEAR, for high-resolution inference.
 
+## Method Overview
+
+![PGSR pipeline: condition-side trajectory guidance and decoder-side pixel grounding](assets/pipeline.png)
+
+PGSR reuses LR-derived pixel evidence in both the latent conditioning pathway
+and the frozen VAE decoder. See the [paper](https://arxiv.org/abs/2608.09133) for details.
+
 ## Visual Results
+
+### DIV2K super-resolution
+
+![DIV2K 0801 comparison with generative super-resolution methods](assets/div2k-0801-comparison.png)
 
 ### Real-world super-resolution
 
@@ -164,4 +174,11 @@ This implementation builds on [Diffusers](https://github.com/huggingface/diffuse
 
 ## Citation
 
-Citation information will be added with the paper release.
+```bibtex
+@article{shi2026latents,
+  title={When Latents Forget Pixels: Restoring Fidelity in Diffusion Transformer Super-Resolution},
+  author={Shi, Yu and Zhang, Yuyao and Tai, Yu-wing},
+  journal={arXiv preprint arXiv:2608.09133},
+  year={2026}
+}
+```
