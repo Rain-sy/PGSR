@@ -6,7 +6,7 @@
 
 **NeurIPS 2026 · Poster**
 
-[Project Page & Interactive Demo](https://rain-sy.github.io/PGSR/) · [News](#news) · [Installation](#installation) · [Inference](#inference) · [Training](#training)
+[Highlights](#highlights) · [News](#news) · [Visual Results](#visual-results) · [Installation](#installation) · [Inference](#inference) · [Training](#training)
 
 </div>
 
@@ -32,20 +32,15 @@ to guide both the diffusion trajectory and VAE decoding, based on FLUX.1-dev.
 
 ## Visual Results
 
-### Interactive LR / Ours comparisons
-
-**[Open the interactive demo →](https://rain-sy.github.io/PGSR/#results)**
-
-Drag the divider to compare the actual LR input (left) with PGSR (right).
-Two high-resolution examples include full-image and coordinate-matched detail views.
-The demo supports mouse, touch, and keyboard controls. GitHub README previews are static;
-open the project page to interact.
-
-[![Open the draggable LR / PGSR comparison](assets/high-resolution-comparison.png)](https://rain-sy.github.io/PGSR/#results)
-
 ### Real-world super-resolution
 
 ![RealSR comparison with generative super-resolution methods](assets/realsr-comparison.png)
+
+### High-resolution restoration
+
+![High-resolution examples with coordinate-aligned LR and PGSR crops](assets/high-resolution-comparison.png)
+
+*Each example shows the HR reference on the left and matching LR / PGSR crops on the right. The red box marks the shared crop location.*
 
 ## Installation
 
