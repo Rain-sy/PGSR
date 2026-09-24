@@ -1,16 +1,16 @@
 #!/usr/bin/env python
 """
 ======================================================================
-PGSR CLEAR FLUX SR Evaluation - aligned with official Diffusers pipeline
+PGSR Sparse-Attention Evaluation - aligned with official Diffusers pipeline
 ======================================================================
 
-Companion script for train_pgsr_clear.py
+Companion script for train_pgsr_sparse.py
 Automatically detects and loads LoRA adapters when checkpoint contains
 `use_lora=True` and `lora_state_dict`.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=0 python evaluate_pgsr_clear.py \
-        --checkpoint checkpoints/pgsr_clear/best_model.pt \
+    CUDA_VISIBLE_DEVICES=0 python evaluate_pgsr_sparse.py \
+        --checkpoint checkpoints/pgsr_sparse/best_model.pt \
         --hr_dir Data/DIV2K/DIV2K_valid_HR \
         --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
         --iqa_device cuda \
@@ -61,11 +61,11 @@ warnings.filterwarnings("ignore", message=".*shared memory.*")
 
 from diffusers import FlowMatchEulerDiscreteScheduler
 
-# Make CLEAR/attention_processor.py importable when this script is launched
+# Make sparse_attention/attention_processor.py importable when this script is launched
 # from the repo root. CLEAR is optional and only imported when requested.
-_CLEAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CLEAR")
-if os.path.isdir(_CLEAR_DIR) and _CLEAR_DIR not in sys.path:
-    sys.path.insert(0, _CLEAR_DIR)
+_SPARSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sparse_attention")
+if os.path.isdir(_SPARSE_DIR) and _SPARSE_DIR not in sys.path:
+    sys.path.insert(0, _SPARSE_DIR)
 
 try:
     import lpips
@@ -163,7 +163,7 @@ def infer_dataset_name(*candidates):
 # ============================================================================
 
 class PixelFeatureExtractor(nn.Module):
-    """Inference-time extractor mirrored from ``train_pgsr_clear.py``.
+    """Inference-time extractor mirrored from ``train_pgsr_sparse.py``.
 
     Uses the stage-grouped architecture with widened ``s3`` tap (256ch):
       s1: 32ch @ H/2, s2: 64ch @ H/4, s3: 256ch @ H/8.
@@ -205,7 +205,7 @@ class PixelFeatureExtractor(nn.Module):
         )
 
         # Name kept as ``zero_conv`` for checkpoint-key compatibility, but
-        # weights are kaiming-init -- see train_pgsr_clear.py for the
+        # weights are kaiming-init -- see train_pgsr_sparse.py for the
         # dead-gradient explanation.
         self.zero_conv = nn.Conv2d(latent_channels, latent_channels, kernel_size=1)
         nn.init.kaiming_normal_(self.zero_conv.weight, nonlinearity='relu')
@@ -222,7 +222,7 @@ class PixelFeatureExtractor(nn.Module):
 
 
 class DFMAdapter(nn.Module):
-    """Inference-time DFM adapter (mirror of train_pgsr_clear.DFMAdapter).
+    """Inference-time DFM adapter (mirror of train_pgsr_sparse.DFMAdapter).
 
     Residual + zero-conv injection:
         decoder_feat <- decoder_feat + zero_conv(silu(align(pixel_feat)))
@@ -574,7 +574,8 @@ class DualStreamEvaluator(nn.Module):
         self.pixel_weight = pixel_weight
         self.condition_source = 'fused'
         self.vae_posterior = 'sample'
-        self.attention_mode_requested = attention_mode
+        # Keep the checkpoint/runtime representation compatible with old runs.
+        self.attention_mode_requested = 'clear' if attention_mode == 'sparse' else attention_mode
         self.attention_mode = 'full'
         self.clear_ckpt_override = clear_ckpt_override
 
@@ -605,7 +606,7 @@ class DualStreamEvaluator(nn.Module):
 
         # Learnable meta text embedding state (filled in by .load() when the
         # checkpoint sets use_learnable_text_embed=True; e.g. ckpts produced
-        # by train_pgsr.py / train_pgsr_clear.py). Auto-detected from the ckpt; no CLI flag needed.
+        # by train_pgsr.py / train_pgsr_sparse.py). Auto-detected from the ckpt; no CLI flag needed.
         self.use_learnable_text_embed = False
         self.text_embed_format = None
         self.text_embed_tokens = 0
@@ -707,7 +708,7 @@ class DualStreamEvaluator(nn.Module):
             state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
             if any(k.startswith("encoder.") for k in state.keys()):
                 raise RuntimeError(
-                    "[Eval] Unsupported checkpoint: final train_pgsr_clear.py checkpoints "
+                    "[Eval] Unsupported checkpoint: final train_pgsr_sparse.py checkpoints "
                     "must use the stage-grouped pixel_extractor keys, not encoder.*."
                 )
             self.pixel_extractor.load_state_dict(state)
@@ -1064,8 +1065,8 @@ class DualStreamEvaluator(nn.Module):
             )
         except ImportError as e:
             raise ImportError(
-                "[CLEAR] cannot import CLEAR/attention_processor.py. "
-                "Make sure CLEAR/ exists at the repo root."
+                "[CLEAR] cannot import sparse_attention/attention_processor.py. "
+                "Make sure sparse_attention/ exists at the repo root."
             ) from e
 
         device_str = str(self.device)
@@ -1120,8 +1121,8 @@ class DualStreamEvaluator(nn.Module):
             )
         except ImportError as e:
             raise ImportError(
-                "[CLEAR] cannot import CLEAR/attention_processor.py. "
-                "Make sure CLEAR/ exists at the repo root."
+                "[CLEAR] cannot import sparse_attention/attention_processor.py. "
+                "Make sure sparse_attention/ exists at the repo root."
             ) from e
 
         self.use_clear = True
@@ -1722,7 +1723,7 @@ def run_sr_timed(
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='PGSR CLEAR FLUX SR Evaluation')
+    parser = argparse.ArgumentParser(description='PGSR Sparse-Attention FLUX SR Evaluation')
 
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--hr_dir', type=str, default=None,
@@ -1731,13 +1732,13 @@ def main():
     parser.add_argument('--model_name', type=str, default='black-forest-labs/FLUX.1-dev')
     parser.add_argument('--controlnet_name', type=str, default='jasperai/Flux.1-dev-Controlnet-Upscaler')
     parser.add_argument('--attention_mode', type=str, default='auto',
-                        choices=['auto', 'clear', 'full'],
-                        help='auto uses CLEAR when the checkpoint has CLEAR state; '
-                             'clear/full force the attention implementation.')
-    parser.add_argument('--clear_window_size_override', type=int, default=None,
+                        choices=['auto', 'sparse', 'full', 'clear'],
+                        help='auto detects sparse attention from checkpoint state; '
+                             'sparse/full force the implementation (clear is a legacy alias).')
+    parser.add_argument('--sparse_window_size_override', '--clear_window_size_override', dest='clear_window_size_override', type=int, default=None,
                         help='Override CLEAR local window size at evaluation time. '
                              'Only affects --attention_mode=clear; useful for speed ablations.')
-    parser.add_argument('--clear_ckpt', type=str, default=None,
+    parser.add_argument('--sparse_ckpt', '--clear_ckpt', dest='clear_ckpt', type=str, default=None,
                         help='Path to the matching official CLEAR safetensors checkpoint. '
                              'Overrides the path recorded in the PGSR checkpoint.')
     parser.add_argument('--input_scale', type=int, default=4,
@@ -1961,7 +1962,7 @@ def main():
         os.makedirs(os.path.join(output_dir, 'predictions'), exist_ok=True)
 
     print("=" * 70)
-    print("PGSR CLEAR FLUX SR Evaluation")
+    print("PGSR Sparse-Attention FLUX SR Evaluation")
     print("=" * 70)
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Dataset: {args.dataset} (canonical: {dataset_name})")
@@ -2299,7 +2300,7 @@ def main():
 
     results_path = os.path.join(output_dir, 'results.txt')
     with open(results_path, 'w', encoding='utf-8') as f:
-        f.write("PGSR CLEAR FLUX SR Evaluation\n")
+        f.write("PGSR Sparse-Attention FLUX SR Evaluation\n")
         f.write("=" * 60 + "\n")
         f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Checkpoint: {args.checkpoint}\n")

@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 """
-Dual-Stream FLUX SR Evaluation with CLEAR Acceleration
+Dual-Stream FLUX SR Evaluation with Sparse Attention (adapted from CLEAR)
 
-与 train_clear_control_v2.py 配套使用。
+与 train_sparse_control_v2.py 配套使用。
 
 Usage:
-    python evaluate_dual_control_clear_v2.py \
+    python evaluate_dual_control_sparse_v2.py \
         --checkpoint checkpoints/clear_control/xxx/best_model.pt \
         --hr_dir Data/DIV2K/DIV2K_valid_HR \
         --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
@@ -13,6 +13,10 @@ Usage:
 """
 
 import os
+import sys
+
+# Legacy entry point: resolve shared attention code relative to this file.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sparse_attention"))
 import warnings
 
 # 🌟 必须在 import torch 之前设置环境变量
@@ -427,7 +431,7 @@ class CLEAREvaluator:
     def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5):
         """
         简单 Euler 推理（与训练分布一致）
-        从纯噪声出发，与 train_clear_control_v2.py 完全一致
+        从纯噪声出发，与 train_sparse_control_v2.py 完全一致
         """
         B = lr_lat.shape[0]
         device = lr_lat.device

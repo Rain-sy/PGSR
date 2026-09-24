@@ -1,12 +1,46 @@
+<div align="center">
+
 # PGSR
 
-## When Latents Forget Pixels: Restoring Fidelity in Diffusion Transformer Super-Resolution
+### When Latents Forget Pixels: Restoring Fidelity in Diffusion Transformer Super-Resolution
 
-The official implementation of the paper **"When Latents Forget Pixels: Restoring Fidelity in Diffusion Transformer Super-Resolution."**
+**NeurIPS 2026 · Poster**
 
-PGSR preserves pixel-level evidence from the low-resolution input and uses it to guide both the diffusion trajectory and VAE decoding. The implementation is based on FLUX.1-dev and its super-resolution ControlNet.
+[Highlights](#highlights) · [News](#news) · [Visual Results](#visual-results) · [Installation](#installation) · [Inference](#inference) · [Training](#training)
 
-> Paper and pretrained checkpoints will be released soon.
+</div>
+
+Official implementation of **Pixel-Grounded Super-Resolution (PGSR)**.
+PGSR preserves pixel-level evidence from the low-resolution input and reuses it
+to guide both the diffusion trajectory and VAE decoding, based on FLUX.1-dev.
+
+![PGSR teaser: input-aligned text and structural details compared with PiSA-SR](assets/teaser.png)
+
+*From left to right: ground truth, LR input, PiSA-SR, and PGSR. Zoomed regions highlight text and fine structural details.*
+
+## News
+
+- **Coming soon:** PGSR checkpoints and the public paper link.
+- **2026-09:** PGSR accepted to **NeurIPS 2026 as a poster**!
+- **2026-08-03:** Training and evaluation code organized for release.
+
+## Highlights
+
+- **Condition-side guidance:** fuse LR pixel features with the VAE latent condition to guide restoration.
+- **Decoder-side grounding:** inject multi-scale pixel features into the frozen VAE decoder.
+- **Sparse attention:** an optional local-window variant, adapted from CLEAR, for high-resolution inference.
+
+## Visual Results
+
+### Real-world super-resolution
+
+![RealSR comparison with generative super-resolution methods](assets/realsr-comparison.png)
+
+### High-resolution restoration
+
+![High-resolution examples with coordinate-aligned LR and PGSR crops](assets/high-resolution-comparison.png)
+
+*Each example shows the HR reference on the left and matching LR / PGSR crops on the right. The red box marks the shared crop location.*
 
 ## Installation
 
@@ -21,14 +55,10 @@ pip install diffusers==0.36.0 accelerate==0.34.0 transformers==4.57.5 \
   peft==0.18.1 deepspeed lpips scikit-image pyiqa
 ```
 
-## Pretrained Models
-
-- [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev): frozen diffusion transformer and VAE backbone.
-- [Flux.1-dev-Controlnet-Upscaler](https://huggingface.co/jasperai/Flux.1-dev-Controlnet-Upscaler): initialization of the restoration ControlNet.
-- [CLEAR FLUX weights](https://huggingface.co/Huage001/CLEAR): required only by the sparse-attention variant; use the checkpoint matching its window size and downsample factor.
-- PGSR checkpoint: coming soon.
-
-FLUX.1-dev is gated; request access and authenticate with Hugging Face before running the code. Model identifiers can be replaced by local paths through the corresponding command-line arguments. Pass the CLEAR weights to the sparse evaluator with `--clear_ckpt`.
+Request access to [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev)
+and authenticate with Hugging Face before running the code. The default ControlNet
+initialization is [Flux.1-dev-Controlnet-Upscaler](https://huggingface.co/jasperai/Flux.1-dev-Controlnet-Upscaler).
+Model identifiers can be replaced by local paths through the command-line arguments.
 
 ## Data
 
@@ -42,6 +72,10 @@ Place downloaded datasets under `Data/`, or pass their locations directly with `
 
 ## Inference
 
+The examples below require a trained PGSR checkpoint. Public checkpoints are not yet released; use a checkpoint from your own training in the meantime.
+
+### Full attention
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 python evaluate_pgsr.py \
   --checkpoint checkpoints/pgsr/best_model.pt \
@@ -53,6 +87,24 @@ CUDA_VISIBLE_DEVICES=0 python evaluate_pgsr.py \
 ```
 
 Results and metrics are written to `outputs/`. The HR directory is optional when only restored images are needed.
+
+### Sparse attention
+
+Use a matching sparse-attention PGSR checkpoint. The default configuration also
+requires the [official CLEAR initialization weights](https://huggingface.co/Huage001/CLEAR)
+matching the training window size and downsampling factor:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python evaluate_pgsr_sparse.py \
+  --checkpoint checkpoints/pgsr_sparse/best_model.pt \
+  --sparse_ckpt ckpt/clear_local_16_down_4.safetensors \
+  --attention_mode sparse \
+  --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
+  --num_steps 20
+```
+
+`--attention_mode auto` detects the attention configuration stored in the checkpoint.
+Sparse attention uses PyTorch FlexAttention / Triton and requires a compatible CUDA environment.
 
 ## Training
 
@@ -69,7 +121,24 @@ accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
   --scale 4 --resolution 512
 ```
 
-The final entry points are `train_pgsr.py` and `evaluate_pgsr.py`. The corresponding CLEAR sparse-attention variant is provided in `train_pgsr_clear.py` and `evaluate_pgsr_clear.py`.
+For sparse-attention training, use `train_pgsr_sparse.py` with the same data
+arguments and add `--sparse_ckpt ckpt/clear_local_16_down_4.safetensors`.
+Configure the attention pattern with `--sparse_window_size` and `--sparse_down_factor`.
+Training resolution must be divisible by `16 * sparse_down_factor`.
+
+## Repository Guide
+
+| Path | Purpose |
+| --- | --- |
+| `train_pgsr.py` / `evaluate_pgsr.py` | Full-attention training and inference |
+| `train_pgsr_sparse.py` / `evaluate_pgsr_sparse.py` | Sparse-attention training and inference |
+| `sparse_attention/` | Local-window attention implementation and upstream attribution |
+| `configs/` | Distributed-training configuration |
+| `train/` | Earlier research variants; use the root-level entry points for PGSR |
+
+The sparse entry points were renamed from `*_pgsr_clear.py`.
+Legacy `--clear_*` options and checkpoint fields remain supported, so existing
+PGSR sparse checkpoints do not need conversion. See [compatibility notes](sparse_attention/README.md).
 
 ## Acknowledgements
 

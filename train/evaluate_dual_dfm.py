@@ -37,12 +37,12 @@ import torch.nn.functional as F
 
 from diffusers import FlowMatchEulerDiscreteScheduler
 
-# Make CLEAR/attention_processor.py importable after this legacy evaluator was
+# Make sparse_attention/attention_processor.py importable after this legacy evaluator was
 # archived under train/. CLEAR is optional and only imported when requested.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_CLEAR_DIR = os.path.join(_REPO_ROOT, "CLEAR")
-if os.path.isdir(_CLEAR_DIR) and _CLEAR_DIR not in sys.path:
-    sys.path.insert(0, _CLEAR_DIR)
+_SPARSE_DIR = os.path.join(_REPO_ROOT, "sparse_attention")
+if os.path.isdir(_SPARSE_DIR) and _SPARSE_DIR not in sys.path:
+    sys.path.insert(0, _SPARSE_DIR)
 
 try:
     import lpips
@@ -973,8 +973,8 @@ class DualStreamEvaluator(nn.Module):
             )
         except ImportError as e:
             raise ImportError(
-                "[CLEAR] cannot import CLEAR/attention_processor.py. "
-                "Make sure CLEAR/ exists at the repo root."
+                "[CLEAR] cannot import sparse_attention/attention_processor.py. "
+                "Make sure sparse_attention/ exists at the repo root."
             ) from e
 
         device_str = str(self.device)
@@ -1029,8 +1029,8 @@ class DualStreamEvaluator(nn.Module):
             )
         except ImportError as e:
             raise ImportError(
-                "[CLEAR] cannot import CLEAR/attention_processor.py. "
-                "Make sure CLEAR/ exists at the repo root."
+                "[CLEAR] cannot import sparse_attention/attention_processor.py. "
+                "Make sure sparse_attention/ exists at the repo root."
             ) from e
 
         self.use_clear = True

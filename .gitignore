@@ -16,6 +16,8 @@ eval_*/
 .claude/
 
 # Local research and rebuttal workspaces (never publish)
+NeurIPS_2026_Dual_SR/
+tmp/
 rebuttal/
 experiments/
 scripts/

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Dual-Stream FLUX SR ControlNet Training with CLEAR Acceleration
+Dual-Stream FLUX SR ControlNet Training with Sparse Attention (adapted from CLEAR)
 
 修复内容：
 1. ✅ VAE shift_factor：只用 scaling_factor
@@ -12,7 +12,7 @@ Dual-Stream FLUX SR ControlNet Training with CLEAR Acceleration
 Usage:
     accelerate launch --num_processes=8 \
         --gradient_accumulation_steps=8 \
-        train_clear_control.py \
+        train_sparse_control.py \
         --hr_dir Data/DIV2K/DIV2K_train_HR \
         --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
@@ -22,6 +22,10 @@ Usage:
 """
 
 import os
+import sys
+
+# Legacy entry point: resolve shared attention code relative to this file.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sparse_attention"))
 import warnings
 
 # 🌟 必须在 import torch 之前设置

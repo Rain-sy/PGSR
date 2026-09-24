@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Dual-Stream FLUX SR ControlNet Training with CLEAR Acceleration - V2
+Dual-Stream FLUX SR ControlNet Training with Sparse Attention - V2 (adapted from CLEAR)
 
 V2 修复内容：
 1. 🔴 修复推理起点：改用简单 Euler（与训练分布一致）
@@ -10,7 +10,7 @@ V2 修复内容：
 
 Usage:
     accelerate launch --num_processes=8  \
-        train_clear_control_v2.py \
+        train_sparse_control_v2.py \
         --hr_dir Data/DIV2K/DIV2K_train_HR \
         --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
@@ -21,6 +21,10 @@ Usage:
 """
 
 import os
+import sys
+
+# Legacy entry point: resolve shared attention code relative to this file.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sparse_attention"))
 import warnings
 
 # 🌟 必须在 import torch 之前设置

@@ -1,3 +1,4 @@
+"""Sparse local-window attention adapted from CLEAR (Huage001/CLEAR)."""
 import os
 import sys
 import io

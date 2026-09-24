@@ -1,4 +1,5 @@
 # Copyright 2024 Black Forest Labs, The HuggingFace Team and The InstantX Team. All rights reserved.
+# Sparse-attention adaptation from CLEAR: https://github.com/Huage001/CLEAR
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

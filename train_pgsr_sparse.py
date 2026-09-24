@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 ======================================================================
-PGSR + CLEAR Local Attention (DFM + Gated Fusion + LoRA + CLEAR)
+PGSR + Sparse Attention (DFM + Gated Fusion + LoRA)
 ======================================================================
 
 Sparse-attention variant of ``train_pgsr.py``. It retains the complete
@@ -25,7 +25,7 @@ Typical commands (DF2K -> mixed HR corpus):
 
 1) Stage 1: paired bicubic pretraining on DF2K
     accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
-        train_pgsr_clear.py \
+        train_pgsr_sparse.py \
         --hr_dir Data/DF2K_HR \
         --lr_dir Data/DF2K_LR_bicubic_X4 \
         --degrade_mode paired --scale 4 \
@@ -39,12 +39,12 @@ Typical commands (DF2K -> mixed HR corpus):
 
 2) Stage 2: Real-ESRGAN degradation fine-tuning on the mixed HR corpus
     accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
-        train_pgsr_clear.py \
+        train_pgsr_sparse.py \
         --hr_dir Data/Mixed_HR \
         --degrade_mode realesrgan --scale 4 \
         --val_hr_dir Data/RealSR_test/HR \
         --val_lr_dir Data/RealSR_test/LR_X4 \
-        --resume checkpoints/pgsr_clear/<stage1_exp>/best_model.pt \
+        --resume checkpoints/pgsr_sparse/<stage1_exp>/best_model.pt \
         --epochs_mode stage \
         --best_metric lpips --val_calc_lpips --reset_best_on_resume \
         --reset_pixel_gate --reset_text_embed \
@@ -66,7 +66,7 @@ import warnings
 
 # Match the original CLEAR training runtime: these must be set before torch is
 # imported so Triton/Inductor compile the flex-attention kernels with the same
-# tuning policy used by train/train_clear_control_v2.py.
+# tuning policy used by train/train_sparse_control_v2.py.
 os.environ.setdefault("TRITON_NUM_STAGES", "2")
 os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "0")
 os.environ.setdefault("TORCHINDUCTOR_LOG_LEVEL", "ERROR")
@@ -79,11 +79,11 @@ import argparse
 import logging
 import numpy as np
 
-# Make CLEAR/attention_processor.py importable when this script is launched
+# Make sparse_attention/attention_processor.py importable when this script is launched
 # from the repo root.
-_CLEAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CLEAR")
-if os.path.isdir(_CLEAR_DIR) and _CLEAR_DIR not in sys.path:
-    sys.path.insert(0, _CLEAR_DIR)
+_SPARSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sparse_attention")
+if os.path.isdir(_SPARSE_DIR) and _SPARSE_DIR not in sys.path:
+    sys.path.insert(0, _SPARSE_DIR)
 from contextlib import nullcontext
 from datetime import datetime
 from PIL import Image, ImageFilter
@@ -1463,8 +1463,8 @@ class DualStreamFLUXSR(nn.Module):
             )
         except ImportError as e:
             raise ImportError(
-                "[CLEAR] cannot import CLEAR/attention_processor.py. "
-                "Make sure CLEAR/ directory is at the repo root."
+                "[CLEAR] cannot import sparse_attention/attention_processor.py. "
+                "Make sure sparse_attention/ directory is at the repo root."
             ) from e
 
         dtype = torch.bfloat16
@@ -2513,7 +2513,7 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, pixel_weight, streng
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='PGSR + CLEAR FLUX SR Training')
+    parser = argparse.ArgumentParser(description='PGSR + Sparse Attention FLUX SR Training')
 
     # Data
     parser.add_argument('--hr_dir', type=str, required=True)
@@ -2549,35 +2549,35 @@ def main():
     # CLEAR local-window attention. Default ON: replaces FLUX dual-block
     # full self-attention with local window attention for speed at long
     # sequence (typical SR workloads). LoRA stays trainable.
-    parser.add_argument('--use_clear', dest='use_clear', action='store_true', default=True,
+    parser.add_argument('--use_sparse', '--use_clear', dest='use_clear', action='store_true', default=True,
                         help='Enable CLEAR local-window attention on FLUX dual blocks.')
-    parser.add_argument('--no_use_clear', dest='use_clear', action='store_false',
+    parser.add_argument('--no_use_sparse', '--no_use_clear', dest='use_clear', action='store_false',
                         help='Disable CLEAR; use standard FLUX full attention.')
-    parser.add_argument('--clear_window_size', type=int, default=16,
+    parser.add_argument('--sparse_window_size', '--clear_window_size', dest='clear_window_size', type=int, default=16,
                         help='CLEAR local attention window size (in patches).')
-    parser.add_argument('--clear_down_factor', type=int, default=4,
+    parser.add_argument('--sparse_down_factor', '--clear_down_factor', dest='clear_down_factor', type=int, default=4,
                         help='CLEAR K/V downsample factor. 4 = ~3-4x attention speedup.')
-    parser.add_argument('--clear_ckpt', type=str,
+    parser.add_argument('--sparse_ckpt', '--clear_ckpt', dest='clear_ckpt', type=str,
                         default='ckpt/clear_local_16_down_4.safetensors',
                         help='Pretrained CLEAR processor weights (safetensors).')
-    parser.add_argument('--clear_load_attn_weights', dest='clear_load_attn_weights',
+    parser.add_argument('--sparse_load_attn_weights', '--clear_load_attn_weights', dest='clear_load_attn_weights',
                         action='store_true', default=True,
                         help='Load official CLEAR-distilled attention projection weights from --clear_ckpt.')
-    parser.add_argument('--no_clear_load_attn_weights', dest='clear_load_attn_weights',
+    parser.add_argument('--no_sparse_load_attn_weights', '--no_clear_load_attn_weights', dest='clear_load_attn_weights',
                         action='store_false',
                         help='Only swap processors; do not load CLEAR attention projection weights.')
-    parser.add_argument('--clear_apply_single_blocks', dest='clear_apply_single_blocks',
+    parser.add_argument('--sparse_apply_single_blocks', '--clear_apply_single_blocks', dest='clear_apply_single_blocks',
                         action='store_true', default=False,
                         help='Also apply CLEAR processors/weights to FLUX single_transformer_blocks.')
-    parser.add_argument('--no_clear_apply_single_blocks', dest='clear_apply_single_blocks',
+    parser.add_argument('--no_sparse_apply_single_blocks', '--no_clear_apply_single_blocks', dest='clear_apply_single_blocks',
                         action='store_false')
-    parser.add_argument('--train_clear_samplers', dest='train_clear_samplers',
+    parser.add_argument('--train_sparse_samplers', '--train_clear_samplers', dest='train_clear_samplers',
                         action='store_true', default=True,
                         help='Add CLEAR processor (down/up samplers) params to optimizer.')
-    parser.add_argument('--no_train_clear_samplers', dest='train_clear_samplers',
+    parser.add_argument('--no_train_sparse_samplers', '--no_train_clear_samplers', dest='train_clear_samplers',
                         action='store_false',
                         help='Keep CLEAR processor weights frozen.')
-    parser.add_argument('--clear_lr', type=float, default=1e-5,
+    parser.add_argument('--sparse_lr', '--clear_lr', dest='clear_lr', type=float, default=1e-5,
                         help='LR for CLEAR processor params (when trainable).')
 
     # Learnable residual text embedding (always ON; --freeze_text_embed for ablation)
@@ -2668,7 +2668,7 @@ def main():
                              'use when you want to tune DFM without perturbing the diffusion '
                              'backbone (e.g. frozen Stage-2).')
     # Checkpointing
-    parser.add_argument('--save_dir', type=str, default='./checkpoints/pgsr_clear')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints/pgsr_sparse')
     parser.add_argument('--save_interval', type=int, default=10)
     parser.add_argument('--val_interval', type=int, default=1)
     parser.add_argument('--resume', type=str, default=None)
