@@ -36,11 +36,29 @@ to guide both the diffusion trajectory and VAE decoding, based on FLUX.1-dev.
 
 ![RealSR comparison with generative super-resolution methods](assets/realsr-comparison.png)
 
-### High-resolution restoration
+### High-resolution demos
 
-![High-resolution examples with coordinate-aligned LR and PGSR crops](assets/high-resolution-comparison.png)
+**LR input (left) / PGSR (right).** The divider sweeps automatically in these
+README-native previews. Both sides use the same spatial crop from the actual
+input and output; LR is bicubic-enlarged for display without extra blur or sharpening.
 
-*Each example shows the HR reference on the left and matching LR / PGSR crops on the right. The red box marks the shared crop location.*
+**Carved stone · DIV8K 0492 · 4× SR (1680 × 1296 → 6720 × 5184)**
+
+![Animated LR versus PGSR comparison of carved stone](assets/demo-0492.gif)
+
+**Window tracery · DIV8K 0467 · 4× SR (1680 × 1584 → 6720 × 6336)**
+
+![Animated LR versus PGSR comparison of cathedral windows](assets/demo-0467.gif)
+
+<details>
+<summary>Full-image context and display notes</summary>
+
+![HR overview with matched LR and PGSR crops](assets/high-resolution-comparison.png)
+
+GIFs are 256-color web previews, not evaluation images. Crop coordinates and
+display settings are recorded in [assets/demo-crops.json](assets/demo-crops.json).
+
+</details>
 
 ## Installation
 
