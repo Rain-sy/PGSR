@@ -24,6 +24,8 @@ tmp/
 rebuttal/
 experiments/
 scripts/
+tests/
+tools/
 configs/paper_compare/
 external_baselines/
 src/taming-transformers/
