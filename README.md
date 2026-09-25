@@ -8,13 +8,11 @@
 
 </div>
 
-Official implementation of **Pixel-Grounded Super-Resolution (PGSR)**.
-PGSR preserves pixel-level evidence from the low-resolution input and reuses it
-to guide both the diffusion trajectory and VAE decoding, based on FLUX.1-dev.
+Official implementation of **Pixel-Grounded Super-Resolution (PGSR)**, which uses LR pixel evidence to guide diffusion and VAE decoding with FLUX.1-dev.
 
 ![PGSR teaser: LR input, without pixel guidance, PGSR, and ground truth](assets/teaser.png)
 
-*From left to right: LR input, restoration without pixel guidance, PGSR (ours), and ground truth. Zoomed regions highlight text and fine structural details.*
+*Left to right: LR input, without pixel guidance, PGSR (ours), and ground truth.*
 
 ## News
 
@@ -23,18 +21,9 @@ to guide both the diffusion trajectory and VAE decoding, based on FLUX.1-dev.
 - **2026-08-10:** Our [paper](https://arxiv.org/abs/2608.09133) is available on arXiv.
 - **2026-08-03:** Training and evaluation code organized for release.
 
-## Highlights
-
-- **Condition-side guidance:** fuse LR pixel features with the VAE latent condition to guide restoration.
-- **Decoder-side grounding:** inject multi-scale pixel features into the frozen VAE decoder.
-- **Sparse attention:** an optional local-window variant, adapted from CLEAR, for high-resolution inference.
-
 ## Method Overview
 
 ![PGSR pipeline: condition-side trajectory guidance and decoder-side pixel grounding](assets/pipeline.png)
-
-PGSR reuses LR-derived pixel evidence in both the latent conditioning pathway
-and the frozen VAE decoder. See the [paper](https://arxiv.org/abs/2608.09133) for details.
 
 ## Visual Results
 
@@ -48,9 +37,7 @@ and the frozen VAE decoder. See the [paper](https://arxiv.org/abs/2608.09133) fo
 
 ### High-resolution demos
 
-**LR input (left) / PGSR (right).** The divider sweeps automatically in these
-README-native previews. Both sides use the same spatial crop from the actual
-input and output; LR is bicubic-enlarged for display without extra blur or sharpening.
+**LR (left) / PGSR (right)** with an automatically sweeping divider. Crops are spatially aligned; LR is bicubic-enlarged for display.
 
 **Carved stone · DIV8K 0492 · 4× SR (1680 × 1296 → 6720 × 5184)**
 
@@ -72,8 +59,6 @@ display settings are recorded in [assets/demo-crops.json](assets/demo-crops.json
 
 ## Installation
 
-The code was tested with Python 3.11, PyTorch 2.5.1, Diffusers 0.36.0, Accelerate 0.34.0, Transformers 4.57.5, and PEFT 0.18.1.
-
 ```bash
 conda create -n pgsr python=3.11 -y
 conda activate pgsr
@@ -86,11 +71,8 @@ pip install diffusers==0.36.0 accelerate==0.34.0 transformers==4.57.5 \
 Request access to [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev)
 and authenticate with Hugging Face before running the code. The default ControlNet
 initialization is [Flux.1-dev-Controlnet-Upscaler](https://huggingface.co/jasperai/Flux.1-dev-Controlnet-Upscaler).
-Model identifiers can be replaced by local paths through the command-line arguments.
 
 ## Data
-
-The paper uses the following datasets:
 
 - **Stage 1:** DF2K (DIV2K + Flickr2K), with paired bicubic x4 LR-HR images.
 - **Stage 2:** the union of DF2K, LSDIR, FFHQ, and OST. LR inputs are synthesized online with the second-order Real-ESRGAN degradation pipeline.
@@ -100,7 +82,7 @@ Place downloaded datasets under `Data/`, or pass their locations directly with `
 
 ## Inference
 
-The examples below require a trained PGSR checkpoint. Public checkpoints are not yet released; use a checkpoint from your own training in the meantime.
+Use your own trained PGSR checkpoint until public weights are released.
 
 ### Full attention
 
@@ -136,7 +118,7 @@ Sparse attention uses PyTorch FlexAttention / Triton and requires a compatible C
 
 ## Training
 
-PGSR uses two-stage training: paired bicubic pretraining followed by Real-ESRGAN degradation fine-tuning. The complete commands and resume settings are documented at the top of `train_pgsr.py`.
+Stage 1 uses paired bicubic data; Stage 2 uses Real-ESRGAN degradation. See [`train_pgsr.py`](train_pgsr.py) for both stages and resume settings.
 
 ```bash
 accelerate launch --num_processes=8 --gradient_accumulation_steps=8 \
@@ -153,20 +135,6 @@ For sparse-attention training, use `train_pgsr_sparse.py` with the same data
 arguments and add `--sparse_ckpt ckpt/clear_local_16_down_4.safetensors`.
 Configure the attention pattern with `--sparse_window_size` and `--sparse_down_factor`.
 Training resolution must be divisible by `16 * sparse_down_factor`.
-
-## Repository Guide
-
-| Path | Purpose |
-| --- | --- |
-| `train_pgsr.py` / `evaluate_pgsr.py` | Full-attention training and inference |
-| `train_pgsr_sparse.py` / `evaluate_pgsr_sparse.py` | Sparse-attention training and inference |
-| `sparse_attention/` | Local-window attention implementation and upstream attribution |
-| `configs/` | Distributed-training configuration |
-| `train/` | Earlier research variants; use the root-level entry points for PGSR |
-
-The sparse entry points were renamed from `*_pgsr_clear.py`.
-Legacy `--clear_*` options and checkpoint fields remain supported, so existing
-PGSR sparse checkpoints do not need conversion. See [compatibility notes](sparse_attention/README.md).
 
 ## Acknowledgements
 
