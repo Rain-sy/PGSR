@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 
+# Local editor settings (keep on disk, never publish)
+.vscode/
+
 # Checkpoints and Data
 *.pt
 *.pth

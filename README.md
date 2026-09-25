@@ -170,7 +170,7 @@ PGSR sparse checkpoints do not need conversion. See [compatibility notes](sparse
 
 ## Acknowledgements
 
-This implementation builds on [Diffusers](https://github.com/huggingface/diffusers), [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev), the [FLUX ControlNet Upscaler](https://huggingface.co/jasperai/Flux.1-dev-Controlnet-Upscaler), and [CLEAR](https://github.com/Huage001/CLEAR).
+This implementation builds on [Diffusers](https://github.com/huggingface/diffusers), [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev), and the [FLUX ControlNet Upscaler](https://huggingface.co/jasperai/Flux.1-dev-Controlnet-Upscaler).
 
 ## Citation
 
