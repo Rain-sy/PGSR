@@ -7,28 +7,31 @@
   <meta name="description" content="PGSR: When Latents Forget Pixels. Pixel-grounded diffusion transformer super-resolution, NeurIPS 2026. Explore interactive LR/PGSR comparisons.">
   <meta property="og:title" content="When Latents Forget Pixels — PGSR">
   <meta property="og:description" content="Restoring fidelity in diffusion transformer super-resolution. NeurIPS 2026.">
-  <meta property="og:image" content="https://rain-sy.github.io/PGSR/media/teaser.webp">
+  <meta property="og:image" content="https://rain-sy.github.io/projects/PGSR/media/teaser.webp">
   <meta property="og:type" content="website">
-  <link rel="canonical" href="https://rain-sy.github.io/PGSR/">
+  <link rel="canonical" href="https://rain-sy.github.io/projects/PGSR/">
+  <script>
+    if (location.hostname === 'rain-sy.github.io' && /^\/PGSR(?:\/|$)/.test(location.pathname)) {
+      location.replace('https://rain-sy.github.io/projects/PGSR/' + location.search + location.hash);
+    }
+  </script>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
   <script src="script.js" defer></script>
 </head>
 <body>
   <a class="skip" href="#results">Skip to results</a>
-  <header class="nav-wrap">
-    <nav class="nav" aria-label="Main navigation">
-      <a class="wordmark" href="#">PGSR<span class="pixel-mark" aria-hidden="true">▦</span></a>
-      <div><a href="#abstract">Abstract</a><a href="#method">Method</a><a href="#results">Results</a><a href="#citation">Citation</a><a href="https://github.com/Rain-sy/PGSR">Code ↗</a></div>
-    </nav>
-  </header>
   <main>
     <section class="hero container" aria-labelledby="title">
-      <p class="eyebrow">NeurIPS 2026 <span>·</span> Poster</p>
-      <h1 id="title"><span>When Latents Forget Pixels:</span><br>Restoring Fidelity in Diffusion<br class="desktop-break"> Transformer Super-Resolution</h1>
-      <p class="authors">Yu Shi <span>·</span> Yuyao Zhang <span>·</span> Yu-Wing Tai</p>
+      <h1 id="title">When Latents Forget Pixels: Restoring Fidelity in Diffusion Transformer Super-Resolution</h1>
+      <p class="authors">Yu Shi, Yuyao Zhang, Yu-Wing Tai</p>
       <p class="affiliation">Dartmouth College</p>
-      <div class="hero-links"><a class="button primary" href="https://arxiv.org/abs/2608.09133">Read the paper <span>↗</span></a><a class="button" href="https://github.com/Rain-sy/PGSR">View code <span>↗</span></a></div>
+      <p class="venue">NeurIPS 2026 · Poster</p>
+      <div class="hero-links">
+        <a class="button" href="https://arxiv.org/pdf/2608.09133"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2h8l4 4v16H6zM14 2v5h5M9 12h6M9 16h6"/></svg>Paper</a>
+        <a class="button" href="https://arxiv.org/abs/2608.09133"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 3 14 18M19 3 5 21M8 3l8 18"/></svg>arXiv</a>
+        <a class="button" href="https://github.com/Rain-sy/PGSR"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 6-6 6 6 6m8-12 6 6-6 6m-3-15-2 18"/></svg>Code</a>
+      </div>
       <figure class="teaser">
         <a href="media/teaser.webp" class="zoom" data-caption="Pixel grounding preserves input structures. Left to right: LR input, without pixel guidance, PGSR, and ground truth."><img src="media/teaser.webp" width="1800" height="706" alt="Two examples comparing LR input, restoration without pixel guidance, PGSR, and ground truth" fetchpriority="high"></a>
         <figcaption>Left to right: LR input, without pixel guidance, PGSR (ours), and ground truth.</figcaption>
@@ -102,7 +105,7 @@
 }</code></pre><p id="copy-status" role="status" aria-live="polite"></p>
     </section>
   </main>
-  <footer class="container"><span>PGSR · NeurIPS 2026</span><div><a href="https://arxiv.org/abs/2608.09133">Paper ↗</a><a href="https://github.com/Rain-sy/PGSR">Code ↗</a><a href="#">Back to top ↑</a></div></footer>
+  <footer class="container"><span>PGSR · NeurIPS 2026</span><div><a href="https://arxiv.org/pdf/2608.09133">Paper</a><a href="https://arxiv.org/abs/2608.09133">arXiv</a><a href="https://github.com/Rain-sy/PGSR">Code</a></div></footer>
   <dialog id="lightbox" aria-label="Enlarged comparison figure"><button class="close-lightbox" aria-label="Close enlarged figure" autofocus>Close ×</button><img alt=""><p></p></dialog>
 </body>
 </html>

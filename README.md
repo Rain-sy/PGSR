@@ -4,7 +4,7 @@
 
 **NeurIPS 2026 · Poster**
 
-[Paper (arXiv)](https://arxiv.org/abs/2608.09133) · [Project Page](https://rain-sy.github.io/PGSR/) · [Method](#method-overview) · [Visual Results](#visual-results) · [Installation](#installation) · [Inference](#inference) · [Training](#training)
+[Paper (arXiv)](https://arxiv.org/abs/2608.09133) · [Project Page](https://rain-sy.github.io/projects/PGSR/) · [Method](#method-overview) · [Visual Results](#visual-results) · [Installation](#installation) · [Inference](#inference) · [Training](#training)
 
 </div>
 
@@ -39,7 +39,7 @@ Official implementation of **Pixel-Grounded Super-Resolution (PGSR)**, which use
 
 **LR (left) / PGSR (right)** with an automatically sweeping divider. Crops are spatially aligned; LR is bicubic-enlarged for display.
 
-For **manually draggable LR/PGSR comparisons**, visit our [project page](https://rain-sy.github.io/PGSR/#results).
+For **manually draggable LR/PGSR comparisons**, visit our [project page](https://rain-sy.github.io/projects/PGSR/#results).
 
 **Carved stone · DIV8K 0492 · 4× SR (1680 × 1296 → 6720 × 5184)**
 

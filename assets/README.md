@@ -24,7 +24,9 @@ directory contains lossless WebP exports of these figures. The interactive
 0492 and 0467 comparisons use the same source pairs and coordinates in
 `demo-crops.json`, resized with bicubic interpolation to 768 × 768 on both
 sides. The underlying restoration outputs are not regenerated, sharpened,
-or recolored. Only `docs/` is published by GitHub Pages.
+or recolored. The page source is maintained in `docs/` and deployed to
+`projects/PGSR/` in `Rain-sy/Rain-sy.github.io`. The legacy `/PGSR/` URL
+redirects to `/projects/PGSR/`, preserving the section hash.
 
 Additional project-page figures come from the paper appendix:
 - DIV2K: `0834`, `0805`, `0818`, `0848`.
