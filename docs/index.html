@@ -19,7 +19,7 @@
   <header class="nav-wrap">
     <nav class="nav" aria-label="Main navigation">
       <a class="wordmark" href="#">PGSR<span class="pixel-mark" aria-hidden="true">▦</span></a>
-      <div><a href="#results">Results</a><a href="#method">Method</a><a href="#citation">Citation</a><a href="https://github.com/Rain-sy/PGSR">Code ↗</a></div>
+      <div><a href="#abstract">Abstract</a><a href="#method">Method</a><a href="#results">Results</a><a href="#citation">Citation</a><a href="https://github.com/Rain-sy/PGSR">Code ↗</a></div>
     </nav>
   </header>
   <main>
@@ -29,17 +29,27 @@
       <p class="authors">Yu Shi <span>·</span> Yuyao Zhang <span>·</span> Yu-Wing Tai</p>
       <p class="affiliation">Dartmouth College</p>
       <div class="hero-links"><a class="button primary" href="https://arxiv.org/abs/2608.09133">Read the paper <span>↗</span></a><a class="button" href="https://github.com/Rain-sy/PGSR">View code <span>↗</span></a></div>
-      <p class="lede">Generative detail. <em>Grounded in the input.</em></p>
-      <p class="hero-summary">PGSR preserves pixel evidence before VAE compression and brings it back to both the restoration trajectory and the final decoding stage.</p>
       <figure class="teaser">
         <a href="media/teaser.webp" class="zoom" data-caption="Pixel grounding preserves input structures. Left to right: LR input, without pixel guidance, PGSR, and ground truth."><img src="media/teaser.webp" width="1800" height="706" alt="Two examples comparing LR input, restoration without pixel guidance, PGSR, and ground truth" fetchpriority="high"></a>
-        <figcaption>Pixel evidence matters: preserving character strokes and fine structures instead of only generating plausible detail. <span>Click any comparison figure to enlarge.</span></figcaption>
+        <figcaption>Left to right: LR input, without pixel guidance, PGSR (ours), and ground truth.</figcaption>
       </figure>
     </section>
 
+    <section class="container section abstract-section" id="abstract" aria-labelledby="abstract-title">
+      <h2 id="abstract-title">Abstract</h2>
+      <p>Image super-resolution (SR) with large generative models has recently achieved remarkable perceptual quality, yet maintaining fidelity to the LR observation remains challenging. In particular, we observe that diffusion transformers (DiTs) built on latent representations suffer from a critical limitation: the compression bottleneck of the VAE weakens fine-grained spatial information, leading to hallucinated details that are weakly grounded in the input image. In this work, we revisit generative SR from a representation perspective and propose a <strong>pixel-grounded super-resolution (PGSR)</strong> framework that preserves LR-observed pixel evidence before VAE compression and reuses it throughout restoration. Instead of relying solely on the compressed latent condition, PGSR extracts pre-VAE pixel evidence from the upsampled LR image and reuses it at two stages. First, <strong>Condition-Side Trajectory Guidance</strong> fuses LR-derived pixel evidence with the latent LR condition to guide the latent restoration trajectory. Second, <strong>Decoder-Side Pixel Grounding</strong> injects multi-scale pixel features into the frozen VAE decoder to ground the final rendering with LR-observed cues. To efficiently adapt large pretrained DiT models, we keep the latent autoencoder and main flow-matching backbone frozen, and train only lightweight restoration modules. We further study an efficient local-window attention variant for improved high-resolution efficiency and scalability. Extensive experiments demonstrate that PGSR improves the realism–fidelity trade-off and produces more faithful, visually convincing results than existing latent generative SR approaches.</p>
+    </section>
+
+    <section class="method-section" id="method" aria-labelledby="method-title"><div class="container">
+      <h2 id="method-title">Method</h2>
+      <figure class="pipeline"><a class="zoom" href="media/pipeline.webp" data-caption="Overview of the training pipeline of PGSR."><img src="media/pipeline.webp" alt="PGSR training pipeline: LR pixel features guide the latent condition and modulate multiple stages of the frozen VAE decoder" loading="lazy"></a><figcaption>Overview of the training pipeline of PGSR.</figcaption></figure>
+      <p class="method-description">The LR observation is first aligned to the HR grid and encoded into a latent condition. PGSR introduces pixel-grounded evidence at two complementary locations: <strong>Condition-Side Trajectory Guidance</strong> fuses LR-derived pixel evidence with the latent condition to anchor the flow-matching trajectory, while <strong>Decoder-Side Pixel Grounding</strong> injects multi-scale pixel features into the frozen VAE decoder for faithful rendering.</p>
+    </div></section>
+
     <section class="results-section" id="results" aria-labelledby="results-title">
       <div class="container">
-        <div class="section-heading"><div><p class="eyebrow">Look closer</p><h2 id="results-title">High-resolution details,<br><em>anchored to the input.</em></h2></div><p>Drag the divider to compare.<br>LR on the left, PGSR on the right.</p></div>
+        <h2 id="results-title">High-resolution Results</h2>
+        <p class="section-intro centered">Drag to compare: LR (left) and PGSR (right).</p>
         <div class="compare-grid">
           <figure class="compare-card">
             <div class="compare" style="--split:50%">
@@ -60,28 +70,30 @@
             <figcaption><div><h3>Window tracery</h3><span>DIV8K · 0467</span></div><p>4× SR · 1680 × 1584 → 6720 × 6336</p></figcaption>
           </figure>
         </div>
-        <p class="display-note">Spatially aligned crops from actual LR/PGSR pairs. LR is bicubic-enlarged for display; both sides use the same display resizing. These are web previews, not evaluation images. Sliders also support the arrow keys.</p>
-        <details class="context"><summary>View full-image context</summary><a class="zoom" href="media/high-resolution-comparison.webp" data-caption="HR overviews and aligned LR/PGSR crops."><img src="media/high-resolution-comparison.webp" alt="Full HR overviews showing where LR and PGSR crops are located" loading="lazy"></a></details>
+        <p class="display-note">Aligned crops from actual LR/PGSR pairs. LR is bicubic-enlarged for display. Use the divider or arrow keys to compare.</p>
+        <figure class="context"><a class="zoom" href="media/high-resolution-comparison.webp" data-caption="HR overviews and aligned LR/PGSR crops."><img src="media/high-resolution-comparison.webp" alt="Full HR overviews showing where LR and PGSR crops are located" loading="lazy"></a><figcaption>Full-image context with aligned LR and PGSR crops.</figcaption></figure>
       </div>
     </section>
 
     <section class="container section" id="comparisons" aria-labelledby="comparisons-title">
-      <p class="eyebrow">Visual comparisons</p><h2 id="comparisons-title">Fidelity beyond plausible textures.</h2>
-      <p class="section-intro">Representative comparisons with generative super-resolution methods on synthetic and real-world inputs.</p>
-      <figure class="wide-figure"><div class="figure-heading"><h3>DIV2K</h3><span>Synthetic degradation</span></div><a class="zoom" href="media/div2k-0801-comparison.webp" data-caption="DIV2K visual comparison from the PGSR paper."><img src="media/div2k-0801-comparison.webp" alt="DIV2K visual comparison of PGSR and competing super-resolution methods" loading="lazy"></a></figure>
-      <figure class="wide-figure"><div class="figure-heading"><h3>RealSR</h3><span>Real captured degradation</span></div><a class="zoom" href="media/realsr-comparison.webp" data-caption="RealSR visual comparison from the PGSR paper."><img src="media/realsr-comparison.webp" alt="RealSR visual comparison of PGSR and competing super-resolution methods" loading="lazy"></a></figure>
+      <h2 id="comparisons-title">Qualitative Comparisons</h2>
+      <p class="section-intro centered">Results from the paper and supplementary material. Click a figure to enlarge.</p>
+      <h3 class="dataset-heading">DIV2K-Val · Synthetic degradation</h3>
+      <figure class="wide-figure"><a class="zoom" href="media/div2k-0801-comparison.webp" data-caption="DIV2K-Val · 0801"><img src="media/div2k-0801-comparison.webp" alt="DIV2K-Val · 0801: comparison of LR, competing SR methods, PGSR and ground truth" loading="lazy" width="2400" height="737"></a><figcaption>DIV2K-Val · 0801</figcaption></figure>
+      <figure class="wide-figure"><a class="zoom" href="media/div2k-0834-comparison.webp" data-caption="DIV2K-Val · 0834"><img src="media/div2k-0834-comparison.webp" alt="DIV2K-Val · 0834: comparison of LR, competing SR methods, PGSR and ground truth" loading="lazy" width="2400" height="737"></a><figcaption>DIV2K-Val · 0834</figcaption></figure>
+      <figure class="wide-figure"><a class="zoom" href="media/div2k-0805-comparison.webp" data-caption="DIV2K-Val · 0805"><img src="media/div2k-0805-comparison.webp" alt="DIV2K-Val · 0805: comparison of LR, competing SR methods, PGSR and ground truth" loading="lazy" width="2400" height="737"></a><figcaption>DIV2K-Val · 0805</figcaption></figure>
+      <figure class="wide-figure"><a class="zoom" href="media/div2k-0818-comparison.webp" data-caption="DIV2K-Val · 0818"><img src="media/div2k-0818-comparison.webp" alt="DIV2K-Val · 0818: comparison of LR, competing SR methods, PGSR and ground truth" loading="lazy" width="2400" height="737"></a><figcaption>DIV2K-Val · 0818</figcaption></figure>
+      <figure class="wide-figure"><a class="zoom" href="media/div2k-0848-comparison.webp" data-caption="DIV2K-Val · 0848"><img src="media/div2k-0848-comparison.webp" alt="DIV2K-Val · 0848: comparison of LR, competing SR methods, PGSR and ground truth" loading="lazy" width="2400" height="737"></a><figcaption>DIV2K-Val · 0848</figcaption></figure>
+      <h3 class="dataset-heading">RealSR · Real captured degradation</h3>
+      <figure class="wide-figure"><a class="zoom" href="media/realsr-comparison.webp" data-caption="RealSR · Canon 002"><img src="media/realsr-comparison.webp" alt="RealSR · Canon 002: comparison of LR, competing SR methods, PGSR and ground truth" loading="lazy" width="2400" height="737"></a><figcaption>RealSR · Canon 002</figcaption></figure>
+      <figure class="wide-figure"><a class="zoom" href="media/realsr-canon-034-comparison.webp" data-caption="RealSR · Canon 034"><img src="media/realsr-canon-034-comparison.webp" alt="RealSR · Canon 034: comparison of LR, competing SR methods, PGSR and ground truth" loading="lazy" width="2400" height="737"></a><figcaption>RealSR · Canon 034</figcaption></figure>
+      <figure class="wide-figure"><a class="zoom" href="media/realsr-nikon-041-comparison.webp" data-caption="RealSR · Nikon 041"><img src="media/realsr-nikon-041-comparison.webp" alt="RealSR · Nikon 041: comparison of LR, competing SR methods, PGSR and ground truth" loading="lazy" width="2400" height="737"></a><figcaption>RealSR · Nikon 041</figcaption></figure>
+      <figure class="wide-figure"><a class="zoom" href="media/realsr-nikon-044-comparison.webp" data-caption="RealSR · Nikon 044"><img src="media/realsr-nikon-044-comparison.webp" alt="RealSR · Nikon 044: comparison of LR, competing SR methods, PGSR and ground truth" loading="lazy" width="2400" height="737"></a><figcaption>RealSR · Nikon 044</figcaption></figure>
+      <figure class="wide-figure"><a class="zoom" href="media/realsr-nikon-046-comparison.webp" data-caption="RealSR · Nikon 046"><img src="media/realsr-nikon-046-comparison.webp" alt="RealSR · Nikon 046: comparison of LR, competing SR methods, PGSR and ground truth" loading="lazy" width="2400" height="737"></a><figcaption>RealSR · Nikon 046</figcaption></figure>
     </section>
 
-    <section class="method-section" id="method" aria-labelledby="method-title"><div class="container">
-      <p class="eyebrow">The idea</p><h2 id="method-title">Keep the pixels in the picture.</h2>
-      <p class="section-intro">Latent diffusion priors generate convincing images, but VAE compression can weaken fidelity-critical spatial cues. PGSR extracts pixel features from the upsampled LR observation, independently of the pretrained VAE, and reuses them at two stages.</p>
-      <figure class="pipeline"><a class="zoom" href="media/pipeline.webp" data-caption="PGSR: condition-side guidance and decoder-side pixel grounding."><img src="media/pipeline.webp" alt="PGSR pipeline: LR pixel features guide the latent condition and modulate multiple stages of the frozen VAE decoder" loading="lazy"></a></figure>
-      <div class="method-grid"><div><span class="number">01</span><h3>Guide the trajectory</h3><p>Gated residual fusion combines pre-VAE pixel features with the LR latent condition, grounding the restoration trajectory in the observed image.</p></div><div><span class="number">02</span><h3>Ground the rendering</h3><p>Multi-scale Decoder-side Feature Modulation (DFM) injects pixel evidence into the frozen VAE decoder to recover input-aligned detail.</p></div></div>
-      <p class="method-footnote">Built on FLUX.1-dev, with an additional sparse-attention variant for more efficient high-resolution restoration. See the paper for experiments and implementation details.</p>
-    </div></section>
-
     <section class="container section citation-section" id="citation" aria-labelledby="citation-title">
-      <div class="citation-heading"><div><p class="eyebrow">Reference</p><h2 id="citation-title">Citation</h2></div><button id="copy-citation" type="button">Copy BibTeX</button></div>
+      <div class="citation-heading"><h2 id="citation-title">Citation</h2><button id="copy-citation" type="button">Copy BibTeX</button></div>
       <pre><code id="bibtex">@inproceedings{shi2026latents,
   title={When Latents Forget Pixels: Restoring Fidelity in Diffusion Transformer Super-Resolution},
   author={Shi, Yu and Zhang, Yuyao and Tai, Yu-Wing},

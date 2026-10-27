@@ -25,3 +25,11 @@ directory contains lossless WebP exports of these figures. The interactive
 `demo-crops.json`, resized with bicubic interpolation to 768 × 768 on both
 sides. The underlying restoration outputs are not regenerated, sharpened,
 or recolored. Only `docs/` is published by GitHub Pages.
+
+Additional project-page figures come from the paper appendix:
+- DIV2K: `0834`, `0805`, `0818`, `0848`.
+- RealSR: `Canon_034`, `Nikon_041`, `Nikon_044`, `Nikon_046`.
+
+Their source PNGs are under `figures/Results/{DIV2K,RealSR}/` in the local
+manuscript directory. All are exported as lossless WebP with a maximum width
+of 2400 pixels, preserving the original method labels and layouts.
