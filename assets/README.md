@@ -18,3 +18,10 @@ in this directory.
 from actual LR/PGSR pairs.
 Coordinates are in `demo-crops.json`; both sides use bicubic display resizing
 and the same GIF palette. These animations are not draggable widgets.
+
+The independent GitHub Pages project page lives in `docs/`. Its `media/`
+directory contains lossless WebP exports of these figures. The interactive
+0492 and 0467 comparisons use the same source pairs and coordinates in
+`demo-crops.json`, resized with bicubic interpolation to 768 × 768 on both
+sides. The underlying restoration outputs are not regenerated, sharpened,
+or recolored. Only `docs/` is published by GitHub Pages.

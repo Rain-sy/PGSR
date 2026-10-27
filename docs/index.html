@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PGSR — When Latents Forget Pixels</title>
+  <meta name="description" content="PGSR: When Latents Forget Pixels. Pixel-grounded diffusion transformer super-resolution, NeurIPS 2026. Explore interactive LR/PGSR comparisons.">
+  <meta property="og:title" content="When Latents Forget Pixels — PGSR">
+  <meta property="og:description" content="Restoring fidelity in diffusion transformer super-resolution. NeurIPS 2026.">
+  <meta property="og:image" content="https://rain-sy.github.io/PGSR/media/teaser.webp">
+  <meta property="og:type" content="website">
+  <link rel="canonical" href="https://rain-sy.github.io/PGSR/">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#results">Skip to results</a>
+  <header class="nav-wrap">
+    <nav class="nav" aria-label="Main navigation">
+      <a class="wordmark" href="#">PGSR<span class="pixel-mark" aria-hidden="true">▦</span></a>
+      <div><a href="#results">Results</a><a href="#method">Method</a><a href="#citation">Citation</a><a href="https://github.com/Rain-sy/PGSR">Code ↗</a></div>
+    </nav>
+  </header>
+  <main>
+    <section class="hero container" aria-labelledby="title">
+      <p class="eyebrow">NeurIPS 2026 <span>·</span> Poster</p>
+      <h1 id="title"><span>When Latents Forget Pixels:</span><br>Restoring Fidelity in Diffusion<br class="desktop-break"> Transformer Super-Resolution</h1>
+      <p class="authors">Yu Shi <span>·</span> Yuyao Zhang <span>·</span> Yu-Wing Tai</p>
+      <p class="affiliation">Dartmouth College</p>
+      <div class="hero-links"><a class="button primary" href="https://arxiv.org/abs/2608.09133">Read the paper <span>↗</span></a><a class="button" href="https://github.com/Rain-sy/PGSR">View code <span>↗</span></a></div>
+      <p class="lede">Generative detail. <em>Grounded in the input.</em></p>
+      <p class="hero-summary">PGSR preserves pixel evidence before VAE compression and brings it back to both the restoration trajectory and the final decoding stage.</p>
+      <figure class="teaser">
+        <a href="media/teaser.webp" class="zoom" data-caption="Pixel grounding preserves input structures. Left to right: LR input, without pixel guidance, PGSR, and ground truth."><img src="media/teaser.webp" width="1800" height="706" alt="Two examples comparing LR input, restoration without pixel guidance, PGSR, and ground truth" fetchpriority="high"></a>
+        <figcaption>Pixel evidence matters: preserving character strokes and fine structures instead of only generating plausible detail. <span>Click any comparison figure to enlarge.</span></figcaption>
+      </figure>
+    </section>
+
+    <section class="results-section" id="results" aria-labelledby="results-title">
+      <div class="container">
+        <div class="section-heading"><div><p class="eyebrow">Look closer</p><h2 id="results-title">High-resolution details,<br><em>anchored to the input.</em></h2></div><p>Drag the divider to compare.<br>LR on the left, PGSR on the right.</p></div>
+        <div class="compare-grid">
+          <figure class="compare-card">
+            <div class="compare" style="--split:50%">
+              <img class="comparison-ours" src="media/0492-ours.webp" width="768" height="768" alt="PGSR restoration of carved stone detail" loading="lazy">
+              <img class="comparison-lr" src="media/0492-lr.webp" width="768" height="768" alt="Matching bicubic-enlarged LR carved stone detail" loading="lazy">
+              <span class="image-label left">LR input</span><span class="image-label right">PGSR (ours)</span><div class="divider" aria-hidden="true"><span>‹ ›</span></div>
+              <input type="range" min="0" max="100" value="50" aria-label="Carved stone LR and PGSR comparison" aria-valuetext="50% LR visible">
+            </div>
+            <figcaption><div><h3>Carved stone</h3><span>DIV8K · 0492</span></div><p>4× SR · 1680 × 1296 → 6720 × 5184</p></figcaption>
+          </figure>
+          <figure class="compare-card">
+            <div class="compare" style="--split:50%">
+              <img class="comparison-ours" src="media/0467-ours.webp" width="768" height="768" alt="PGSR restoration of window tracery detail" loading="lazy">
+              <img class="comparison-lr" src="media/0467-lr.webp" width="768" height="768" alt="Matching bicubic-enlarged LR window tracery detail" loading="lazy">
+              <span class="image-label left">LR input</span><span class="image-label right">PGSR (ours)</span><div class="divider" aria-hidden="true"><span>‹ ›</span></div>
+              <input type="range" min="0" max="100" value="50" aria-label="Window tracery LR and PGSR comparison" aria-valuetext="50% LR visible">
+            </div>
+            <figcaption><div><h3>Window tracery</h3><span>DIV8K · 0467</span></div><p>4× SR · 1680 × 1584 → 6720 × 6336</p></figcaption>
+          </figure>
+        </div>
+        <p class="display-note">Spatially aligned crops from actual LR/PGSR pairs. LR is bicubic-enlarged for display; both sides use the same display resizing. These are web previews, not evaluation images. Sliders also support the arrow keys.</p>
+        <details class="context"><summary>View full-image context</summary><a class="zoom" href="media/high-resolution-comparison.webp" data-caption="HR overviews and aligned LR/PGSR crops."><img src="media/high-resolution-comparison.webp" alt="Full HR overviews showing where LR and PGSR crops are located" loading="lazy"></a></details>
+      </div>
+    </section>
+
+    <section class="container section" id="comparisons" aria-labelledby="comparisons-title">
+      <p class="eyebrow">Visual comparisons</p><h2 id="comparisons-title">Fidelity beyond plausible textures.</h2>
+      <p class="section-intro">Representative comparisons with generative super-resolution methods on synthetic and real-world inputs.</p>
+      <figure class="wide-figure"><div class="figure-heading"><h3>DIV2K</h3><span>Synthetic degradation</span></div><a class="zoom" href="media/div2k-0801-comparison.webp" data-caption="DIV2K visual comparison from the PGSR paper."><img src="media/div2k-0801-comparison.webp" alt="DIV2K visual comparison of PGSR and competing super-resolution methods" loading="lazy"></a></figure>
+      <figure class="wide-figure"><div class="figure-heading"><h3>RealSR</h3><span>Real captured degradation</span></div><a class="zoom" href="media/realsr-comparison.webp" data-caption="RealSR visual comparison from the PGSR paper."><img src="media/realsr-comparison.webp" alt="RealSR visual comparison of PGSR and competing super-resolution methods" loading="lazy"></a></figure>
+    </section>
+
+    <section class="method-section" id="method" aria-labelledby="method-title"><div class="container">
+      <p class="eyebrow">The idea</p><h2 id="method-title">Keep the pixels in the picture.</h2>
+      <p class="section-intro">Latent diffusion priors generate convincing images, but VAE compression can weaken fidelity-critical spatial cues. PGSR extracts pixel features from the upsampled LR observation, independently of the pretrained VAE, and reuses them at two stages.</p>
+      <figure class="pipeline"><a class="zoom" href="media/pipeline.webp" data-caption="PGSR: condition-side guidance and decoder-side pixel grounding."><img src="media/pipeline.webp" alt="PGSR pipeline: LR pixel features guide the latent condition and modulate multiple stages of the frozen VAE decoder" loading="lazy"></a></figure>
+      <div class="method-grid"><div><span class="number">01</span><h3>Guide the trajectory</h3><p>Gated residual fusion combines pre-VAE pixel features with the LR latent condition, grounding the restoration trajectory in the observed image.</p></div><div><span class="number">02</span><h3>Ground the rendering</h3><p>Multi-scale Decoder-side Feature Modulation (DFM) injects pixel evidence into the frozen VAE decoder to recover input-aligned detail.</p></div></div>
+      <p class="method-footnote">Built on FLUX.1-dev, with an additional sparse-attention variant for more efficient high-resolution restoration. See the paper for experiments and implementation details.</p>
+    </div></section>
+
+    <section class="container section citation-section" id="citation" aria-labelledby="citation-title">
+      <div class="citation-heading"><div><p class="eyebrow">Reference</p><h2 id="citation-title">Citation</h2></div><button id="copy-citation" type="button">Copy BibTeX</button></div>
+      <pre><code id="bibtex">@inproceedings{shi2026latents,
+  title={When Latents Forget Pixels: Restoring Fidelity in Diffusion Transformer Super-Resolution},
+  author={Shi, Yu and Zhang, Yuyao and Tai, Yu-Wing},
+  booktitle={Advances in Neural Information Processing Systems},
+  year={2026}
+}</code></pre><p id="copy-status" role="status" aria-live="polite"></p>
+    </section>
+  </main>
+  <footer class="container"><span>PGSR · NeurIPS 2026</span><div><a href="https://arxiv.org/abs/2608.09133">Paper ↗</a><a href="https://github.com/Rain-sy/PGSR">Code ↗</a><a href="#">Back to top ↑</a></div></footer>
+  <dialog id="lightbox" aria-label="Enlarged comparison figure"><button class="close-lightbox" aria-label="Close enlarged figure" autofocus>Close ×</button><img alt=""><p></p></dialog>
+</body>
+</html>
